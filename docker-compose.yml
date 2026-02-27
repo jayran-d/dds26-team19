@@ -1,5 +1,19 @@
-version: "3"
 services:
+
+  kafka:
+    image: apache/kafka:4.1.1
+    environment:
+      - KAFKA_NODE_ID=1
+      - KAFKA_PROCESS_ROLES=broker,controller
+      - KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+      - KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
 
   gateway:
     image: nginx:1.25-bookworm
@@ -17,11 +31,14 @@ services:
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - USE_KAFKA=true
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
       - order-db
+      - kafka
 
   order-db:
     image: redis:7.2-bookworm
@@ -30,11 +47,15 @@ services:
   stock-service:
     build: ./stock
     image: stock:latest
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - USE_KAFKA=true
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
     depends_on:
       - stock-db
+      - kafka
 
   stock-db:
     image: redis:7.2-bookworm
@@ -43,11 +64,15 @@ services:
   payment-service:
     build: ./payment
     image: user:latest
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - USE_KAFKA=true
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
     depends_on:
       - payment-db
+      - kafka
 
   payment-db:
     image: redis:7.2-bookworm
