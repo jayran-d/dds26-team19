@@ -14,6 +14,12 @@ services:
       - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
       - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
       - KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 15s
 
   gateway:
     image: nginx:1.25-bookworm
@@ -37,8 +43,10 @@ services:
     env_file:
       - env/order_redis.env
     depends_on:
-      - order-db
-      - kafka
+      order-db:
+        condition: service_started
+      kafka:
+        condition: service_healthy
 
   order-db:
     image: redis:7.2-bookworm
@@ -54,8 +62,10 @@ services:
     env_file:
       - env/stock_redis.env
     depends_on:
-      - stock-db
-      - kafka
+      stock-db:
+        condition: service_started
+      kafka:
+        condition: service_healthy
 
   stock-db:
     image: redis:7.2-bookworm
@@ -71,8 +81,10 @@ services:
     env_file:
       - env/payment_redis.env
     depends_on:
-      - payment-db
-      - kafka
+      payment-db:
+        condition: service_started
+      kafka:
+        condition: service_healthy
 
   payment-db:
     image: redis:7.2-bookworm

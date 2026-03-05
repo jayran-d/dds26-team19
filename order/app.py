@@ -10,6 +10,7 @@ from collections import defaultdict
 import redis
 import requests
 from confluent_kafka import Producer, Consumer
+from confluent_kafka.admin import AdminClient, NewTopic
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
@@ -74,11 +75,25 @@ def create_kafka_clients():
     global kafka_available
     if not USE_KAFKA:
         return
-    for _ in range(20):
+    for _ in range(40):
         try:
             kafka_producer = Producer({
                 'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
             })
+            # Probe first — only proceed if broker is reachable.
+            kafka_producer.list_topics(timeout=2)
+            # Ensure all topics exist before subscribing.
+            admin = AdminClient({'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS})
+            topics_to_create = [
+                NewTopic(STOCK_COMMAND_TOPIC, num_partitions=1, replication_factor=1),
+                NewTopic(PAYMENT_COMMAND_TOPIC, num_partitions=1, replication_factor=1),
+                NewTopic(ORDER_REPLY_TOPIC, num_partitions=1, replication_factor=1),
+            ]
+            for f in admin.create_topics(topics_to_create).values():
+                try:
+                    f.result()
+                except Exception:
+                    pass  # topic already exists
             # Use the unique reply topic as the group.id so each worker instance
             # reads independently from its own per-process reply topic.
             kafka_consumer = Consumer({
@@ -88,18 +103,20 @@ def create_kafka_clients():
                 'enable.auto.commit': 'false',
             })
             kafka_consumer.subscribe([ORDER_REPLY_TOPIC])
-            # Force metadata fetch so first reply is not missed.
-            kafka_consumer.poll(0)
             kafka_available = True
             app.logger.info("Kafka order producer/consumer connected")
+            print("[kafka] order producer/consumer connected", flush=True)
             return
         except Exception:
             time.sleep(1)
     kafka_available = False
     app.logger.error("Kafka order clients could not connect after retries")
+    print("[kafka] order clients could not connect after retries", flush=True)
 
 
 def send_kafka_command(topic: str, payload: dict, timeout_seconds: int = 12) -> dict:
+    print("using send_kafka_command")
+    print(USE_KAFKA, kafka_available)
     if not kafka_available or kafka_producer is None or kafka_consumer is None:
         return {"status": "error", "error": "Kafka is not available"}
     correlation_id = str(uuid.uuid4())
@@ -185,6 +202,7 @@ def find_order(order_id: str):
 
 
 def send_post_request(url: str):
+    print(f"using send_post_request for {url}")
     try:
         response = requests.post(url)
     except requests.exceptions.RequestException:
@@ -294,12 +312,11 @@ def checkout(order_id: str):
     return Response("Checkout successful", status=200)
 
 
-create_kafka_clients()
-
-
 if __name__ == '__main__':
+    create_kafka_clients()
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
+    create_kafka_clients()

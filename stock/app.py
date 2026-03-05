@@ -8,6 +8,7 @@ import time
 
 import redis
 from confluent_kafka import Producer, Consumer
+from confluent_kafka.admin import AdminClient, NewTopic
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
@@ -63,11 +64,20 @@ def create_kafka_clients():
     global kafka_consumer
     if not USE_KAFKA:
         return
-    for _ in range(20):
+    for _ in range(40):
         try:
             kafka_producer = Producer({
                 'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
             })
+            # Probe first — only proceed if broker is reachable.
+            kafka_producer.list_topics(timeout=2)
+            # Ensure the command topic exists before subscribing.
+            admin = AdminClient({'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS})
+            for f in admin.create_topics([NewTopic(STOCK_COMMAND_TOPIC, num_partitions=1, replication_factor=1)]).values():
+                try:
+                    f.result()
+                except Exception:
+                    pass  # topic already exists
             kafka_consumer = Consumer({
                 'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
                 'group.id': 'stock-service',
@@ -76,10 +86,12 @@ def create_kafka_clients():
             })
             kafka_consumer.subscribe([STOCK_COMMAND_TOPIC])
             app.logger.info("Kafka stock consumer connected")
+            print("[kafka] stock consumer connected", flush=True)
             return
         except Exception:
             time.sleep(1)
     app.logger.error("Kafka stock consumer could not connect after retries")
+    print("[kafka] stock consumer could not connect after retries", flush=True)
 
 
 def apply_stock_delta(item_id: str, delta: int) -> tuple[bool, str | None, int | None]:
@@ -223,12 +235,11 @@ def remove_stock(item_id: str, amount: int):
     return Response(f"Item: {item_id} stock updated to: {updated_stock}", status=200)
 
 
-start_kafka_consumer_thread()
-
-
 if __name__ == '__main__':
+    start_kafka_consumer_thread()
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
+    start_kafka_consumer_thread()
