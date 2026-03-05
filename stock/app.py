@@ -2,13 +2,11 @@ import logging
 import os
 import atexit
 import uuid
-import json
 import threading
 import time
 
 import redis
-from confluent_kafka import Producer, Consumer
-from confluent_kafka.admin import AdminClient, NewTopic
+from common.kafka_client import KafkaProducerClient, KafkaConsumerClient
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
@@ -25,8 +23,8 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
-kafka_producer: Producer | None = None
-kafka_consumer: Consumer | None = None
+kafka_producer: KafkaProducerClient | None = None
+kafka_consumer: KafkaConsumerClient | None = None
 
 
 def close_connections():
@@ -34,7 +32,7 @@ def close_connections():
     if kafka_consumer is not None:
         kafka_consumer.close()
     if kafka_producer is not None:
-        kafka_producer.flush()
+        kafka_producer.close()
 
 
 atexit.register(close_connections)
@@ -64,34 +62,12 @@ def create_kafka_clients():
     global kafka_consumer
     if not USE_KAFKA:
         return
-    for _ in range(40):
-        try:
-            kafka_producer = Producer({
-                'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
-            })
-            # Probe first — only proceed if broker is reachable.
-            kafka_producer.list_topics(timeout=2)
-            # Ensure the command topic exists before subscribing.
-            admin = AdminClient({'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS})
-            for f in admin.create_topics([NewTopic(STOCK_COMMAND_TOPIC, num_partitions=1, replication_factor=1)]).values():
-                try:
-                    f.result()
-                except Exception:
-                    pass  # topic already exists
-            kafka_consumer = Consumer({
-                'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
-                'group.id': 'stock-service',
-                'auto.offset.reset': 'earliest',
-                'enable.auto.commit': 'true',
-            })
-            kafka_consumer.subscribe([STOCK_COMMAND_TOPIC])
-            app.logger.info("Kafka stock consumer connected")
-            print("[kafka] stock consumer connected", flush=True)
-            return
-        except Exception:
-            time.sleep(1)
-    app.logger.error("Kafka stock consumer could not connect after retries")
-    print("[kafka] stock consumer could not connect after retries", flush=True)
+    # Both constructors block with infinite retry until the broker is reachable.
+    kafka_producer = KafkaProducerClient()
+    kafka_consumer = KafkaConsumerClient(
+        topic=STOCK_COMMAND_TOPIC,
+        group_id="stock-service",
+    )
 
 
 def apply_stock_delta(item_id: str, delta: int) -> tuple[bool, str | None, int | None]:
@@ -112,12 +88,8 @@ def apply_stock_delta(item_id: str, delta: int) -> tuple[bool, str | None, int |
 def publish_reply(reply_topic: str, payload: dict):
     if kafka_producer is None:
         return
-    kafka_producer.produce(
-        reply_topic,
-        value=json.dumps(payload).encode("utf-8"),
-        key=str(payload.get("correlation_id", "")).encode("utf-8")
-    )
-    kafka_producer.flush(timeout=5)
+    kafka_producer.send(reply_topic, payload, key=str(payload.get("correlation_id", "")))
+    kafka_producer.flush()
 
 
 def process_stock_command(command: dict):
@@ -161,13 +133,10 @@ def kafka_consumer_loop():
         return
     while True:
         try:
-            msg = kafka_consumer.poll(timeout=1.0)
-            if msg is None:
+            command = kafka_consumer.poll(timeout=1.0)
+            if command is None:
                 continue
-            if msg.error():
-                app.logger.error(f"Kafka consumer error: {msg.error()}")
-                continue
-            process_stock_command(json.loads(msg.value().decode("utf-8")))
+            process_stock_command(command)
         except Exception as exc:
             app.logger.error(f"Kafka stock command loop error: {exc}")
             time.sleep(1)

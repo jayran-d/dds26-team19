@@ -3,14 +3,12 @@ import os
 import atexit
 import random
 import uuid
-import json
 import time
 from collections import defaultdict
 
 import redis
 import requests
-from confluent_kafka import Producer, Consumer
-from confluent_kafka.admin import AdminClient, NewTopic
+from common.kafka_client import KafkaProducerClient, KafkaConsumerClient
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
@@ -32,8 +30,8 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
-kafka_producer: Producer | None = None
-kafka_consumer: Consumer | None = None
+kafka_producer: KafkaProducerClient | None = None
+kafka_consumer: KafkaConsumerClient | None = None
 kafka_available = False
 
 
@@ -42,7 +40,7 @@ def close_connections():
     if kafka_consumer is not None:
         kafka_consumer.close()
     if kafka_producer is not None:
-        kafka_producer.flush()
+        kafka_producer.close()
 
 
 atexit.register(close_connections)
@@ -75,48 +73,20 @@ def create_kafka_clients():
     global kafka_available
     if not USE_KAFKA:
         return
-    for _ in range(40):
-        try:
-            kafka_producer = Producer({
-                'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
-            })
-            # Probe first — only proceed if broker is reachable.
-            kafka_producer.list_topics(timeout=2)
-            # Ensure all topics exist before subscribing.
-            admin = AdminClient({'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS})
-            topics_to_create = [
-                NewTopic(STOCK_COMMAND_TOPIC, num_partitions=1, replication_factor=1),
-                NewTopic(PAYMENT_COMMAND_TOPIC, num_partitions=1, replication_factor=1),
-                NewTopic(ORDER_REPLY_TOPIC, num_partitions=1, replication_factor=1),
-            ]
-            for f in admin.create_topics(topics_to_create).values():
-                try:
-                    f.result()
-                except Exception:
-                    pass  # topic already exists
-            # Use the unique reply topic as the group.id so each worker instance
-            # reads independently from its own per-process reply topic.
-            kafka_consumer = Consumer({
-                'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
-                'group.id': ORDER_REPLY_TOPIC,
-                'auto.offset.reset': 'earliest',
-                'enable.auto.commit': 'false',
-            })
-            kafka_consumer.subscribe([ORDER_REPLY_TOPIC])
-            kafka_available = True
-            app.logger.info("Kafka order producer/consumer connected")
-            print("[kafka] order producer/consumer connected", flush=True)
-            return
-        except Exception:
-            time.sleep(1)
-    kafka_available = False
-    app.logger.error("Kafka order clients could not connect after retries")
-    print("[kafka] order clients could not connect after retries", flush=True)
+    # Both constructors block with infinite retry until the broker is reachable.
+    # The reply topic is unique per process so each gunicorn worker reads its own replies.
+    kafka_producer = KafkaProducerClient(
+        ensure_topics=[STOCK_COMMAND_TOPIC, PAYMENT_COMMAND_TOPIC, ORDER_REPLY_TOPIC]
+    )
+    kafka_consumer = KafkaConsumerClient(
+        topic=ORDER_REPLY_TOPIC,
+        group_id=ORDER_REPLY_TOPIC,
+        auto_commit=False,
+    )
+    kafka_available = True
 
 
 def send_kafka_command(topic: str, payload: dict, timeout_seconds: int = 12) -> dict:
-    print("using send_kafka_command")
-    print(USE_KAFKA, kafka_available)
     if not kafka_available or kafka_producer is None or kafka_consumer is None:
         return {"status": "error", "error": "Kafka is not available"}
     correlation_id = str(uuid.uuid4())
@@ -125,25 +95,18 @@ def send_kafka_command(topic: str, payload: dict, timeout_seconds: int = 12) -> 
         "reply_to": ORDER_REPLY_TOPIC
     }
     try:
-        kafka_producer.produce(
-            topic,
-            value=json.dumps(command).encode("utf-8"),
-            key=correlation_id.encode("utf-8")
-        )
-        kafka_producer.flush(timeout=5)
+        kafka_producer.send(topic, command, key=correlation_id)
+        kafka_producer.flush()
     except Exception as exc:
         return {"status": "error", "error": f"Kafka send failed: {exc}"}
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         try:
-            msg = kafka_consumer.poll(timeout=0.2)
+            response = kafka_consumer.poll(timeout=0.2)
         except Exception as exc:
             return {"status": "error", "error": f"Kafka receive failed: {exc}"}
-        if msg is None:
+        if response is None:
             continue
-        if msg.error():
-            return {"status": "error", "error": f"Kafka receive error: {msg.error()}"}
-        response: dict = json.loads(msg.value().decode("utf-8"))
         if response.get("correlation_id") == correlation_id:
             return response
     return {"status": "error", "error": f"Kafka response timeout for topic {topic}"}
@@ -202,7 +165,6 @@ def find_order(order_id: str):
 
 
 def send_post_request(url: str):
-    print(f"using send_post_request for {url}")
     try:
         response = requests.post(url)
     except requests.exceptions.RequestException:

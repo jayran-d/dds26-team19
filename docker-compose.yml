@@ -33,7 +33,9 @@ services:
       - payment-service
 
   order-service:
-    build: ./order
+    build:
+      context: .
+      dockerfile: order/Dockerfile
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
@@ -53,7 +55,9 @@ services:
     command: redis-server --requirepass redis --maxmemory 512mb
 
   stock-service:
-    build: ./stock
+    build:
+      context: .
+      dockerfile: stock/Dockerfile
     image: stock:latest
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
@@ -72,7 +76,9 @@ services:
     command: redis-server --requirepass redis --maxmemory 512mb
 
   payment-service:
-    build: ./payment
+    build:
+      context: .
+      dockerfile: payment/Dockerfile
     image: user:latest
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
