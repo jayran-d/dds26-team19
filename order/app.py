@@ -9,7 +9,7 @@ from collections import defaultdict
 
 import redis
 import requests
-from kafka import KafkaConsumer, KafkaProducer
+from confluent_kafka import Producer, Consumer
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
@@ -31,8 +31,8 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
-kafka_producer: KafkaProducer | None = None
-kafka_consumer: KafkaConsumer | None = None
+kafka_producer: Producer | None = None
+kafka_consumer: Consumer | None = None
 kafka_available = False
 
 
@@ -41,7 +41,7 @@ def close_connections():
     if kafka_consumer is not None:
         kafka_consumer.close()
     if kafka_producer is not None:
-        kafka_producer.close()
+        kafka_producer.flush()
 
 
 atexit.register(close_connections)
@@ -76,22 +76,20 @@ def create_kafka_clients():
         return
     for _ in range(20):
         try:
-            kafka_producer = KafkaProducer(
-                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-                value_serializer=lambda value: json.dumps(value).encode("utf-8"),
-                key_serializer=lambda key: key.encode("utf-8") if key else None
-            )
-            # group_id=None makes each worker receive all replies and filter by correlation id.
-            kafka_consumer = KafkaConsumer(
-                ORDER_REPLY_TOPIC,
-                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-                group_id=None,
-                auto_offset_reset="earliest",
-                enable_auto_commit=False,
-                value_deserializer=lambda value: json.loads(value.decode("utf-8"))
-            )
-            # Force initial metadata/assignment fetch so first reply is not missed.
-            kafka_consumer.poll(timeout_ms=0)
+            kafka_producer = Producer({
+                'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
+            })
+            # Use the unique reply topic as the group.id so each worker instance
+            # reads independently from its own per-process reply topic.
+            kafka_consumer = Consumer({
+                'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
+                'group.id': ORDER_REPLY_TOPIC,
+                'auto.offset.reset': 'earliest',
+                'enable.auto.commit': 'false',
+            })
+            kafka_consumer.subscribe([ORDER_REPLY_TOPIC])
+            # Force metadata fetch so first reply is not missed.
+            kafka_consumer.poll(0)
             kafka_available = True
             app.logger.info("Kafka order producer/consumer connected")
             return
@@ -110,20 +108,27 @@ def send_kafka_command(topic: str, payload: dict, timeout_seconds: int = 12) -> 
         "reply_to": ORDER_REPLY_TOPIC
     }
     try:
-        kafka_producer.send(topic, command, key=correlation_id).get(timeout=5)
+        kafka_producer.produce(
+            topic,
+            value=json.dumps(command).encode("utf-8"),
+            key=correlation_id.encode("utf-8")
+        )
+        kafka_producer.flush(timeout=5)
     except Exception as exc:
         return {"status": "error", "error": f"Kafka send failed: {exc}"}
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         try:
-            records = kafka_consumer.poll(timeout_ms=200)
+            msg = kafka_consumer.poll(timeout=0.2)
         except Exception as exc:
             return {"status": "error", "error": f"Kafka receive failed: {exc}"}
-        for topic_records in records.values():
-            for record in topic_records:
-                response: dict = record.value
-                if response.get("correlation_id") == correlation_id:
-                    return response
+        if msg is None:
+            continue
+        if msg.error():
+            return {"status": "error", "error": f"Kafka receive error: {msg.error()}"}
+        response: dict = json.loads(msg.value().decode("utf-8"))
+        if response.get("correlation_id") == correlation_id:
+            return response
     return {"status": "error", "error": f"Kafka response timeout for topic {topic}"}
 
 

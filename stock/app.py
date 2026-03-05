@@ -7,7 +7,7 @@ import threading
 import time
 
 import redis
-from kafka import KafkaConsumer, KafkaProducer
+from confluent_kafka import Producer, Consumer
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
@@ -24,8 +24,8 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
-kafka_producer: KafkaProducer | None = None
-kafka_consumer: KafkaConsumer | None = None
+kafka_producer: Producer | None = None
+kafka_consumer: Consumer | None = None
 
 
 def close_connections():
@@ -33,7 +33,7 @@ def close_connections():
     if kafka_consumer is not None:
         kafka_consumer.close()
     if kafka_producer is not None:
-        kafka_producer.close()
+        kafka_producer.flush()
 
 
 atexit.register(close_connections)
@@ -65,19 +65,16 @@ def create_kafka_clients():
         return
     for _ in range(20):
         try:
-            kafka_producer = KafkaProducer(
-                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-                value_serializer=lambda value: json.dumps(value).encode("utf-8"),
-                key_serializer=lambda key: key.encode("utf-8") if key else None
-            )
-            kafka_consumer = KafkaConsumer(
-                STOCK_COMMAND_TOPIC,
-                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-                group_id="stock-service",
-                auto_offset_reset="earliest",
-                enable_auto_commit=True,
-                value_deserializer=lambda value: json.loads(value.decode("utf-8"))
-            )
+            kafka_producer = Producer({
+                'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
+            })
+            kafka_consumer = Consumer({
+                'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
+                'group.id': 'stock-service',
+                'auto.offset.reset': 'earliest',
+                'enable.auto.commit': 'true',
+            })
+            kafka_consumer.subscribe([STOCK_COMMAND_TOPIC])
             app.logger.info("Kafka stock consumer connected")
             return
         except Exception:
@@ -103,7 +100,12 @@ def apply_stock_delta(item_id: str, delta: int) -> tuple[bool, str | None, int |
 def publish_reply(reply_topic: str, payload: dict):
     if kafka_producer is None:
         return
-    kafka_producer.send(reply_topic, payload, key=str(payload.get("correlation_id", ""))).get(timeout=5)
+    kafka_producer.produce(
+        reply_topic,
+        value=json.dumps(payload).encode("utf-8"),
+        key=str(payload.get("correlation_id", "")).encode("utf-8")
+    )
+    kafka_producer.flush(timeout=5)
 
 
 def process_stock_command(command: dict):
@@ -147,10 +149,13 @@ def kafka_consumer_loop():
         return
     while True:
         try:
-            records = kafka_consumer.poll(timeout_ms=1000)
-            for topic_records in records.values():
-                for record in topic_records:
-                    process_stock_command(record.value)
+            msg = kafka_consumer.poll(timeout=1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                app.logger.error(f"Kafka consumer error: {msg.error()}")
+                continue
+            process_stock_command(json.loads(msg.value().decode("utf-8")))
         except Exception as exc:
             app.logger.error(f"Kafka stock command loop error: {exc}")
             time.sleep(1)
