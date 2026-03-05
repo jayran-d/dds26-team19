@@ -84,10 +84,10 @@ def remove_credit_internal(user_id: str, amount: int) -> tuple[bool, str | None,
     return True, None, user_entry.credit
 
 
-def publish_reply(reply_topic: str, payload: dict):
+def publish_reply(reply_topic: str, payload: dict, reply_partition: int | None = None):
     if kafka_producer is None:
         return
-    kafka_producer.send(reply_topic, payload, key=str(payload.get("correlation_id", "")))
+    kafka_producer.send(reply_topic, payload, key=str(payload.get("correlation_id", "")), partition=reply_partition)
     kafka_producer.flush()
 
 
@@ -95,6 +95,7 @@ def process_payment_command(command: dict):
     action = command.get("action")
     correlation_id = command.get("correlation_id", "")
     reply_topic = command.get("reply_to", "order.replies")
+    reply_partition = command.get("reply_partition")
     user_id = str(command.get("user_id", ""))
     amount_raw = command.get("amount")
     try:
@@ -109,7 +110,7 @@ def process_payment_command(command: dict):
     if amount is None or not user_id:
         response["status"] = "error"
         response["error"] = "Invalid payment command payload"
-        publish_reply(reply_topic, response)
+        publish_reply(reply_topic, response, reply_partition)
         return
     if action == "pay":
         success, error, credit = remove_credit_internal(user_id, amount)
@@ -122,7 +123,7 @@ def process_payment_command(command: dict):
         response["credit"] = credit
     else:
         response["error"] = error
-    publish_reply(reply_topic, response)
+    publish_reply(reply_topic, response, reply_partition)
 
 
 def kafka_consumer_loop():

@@ -20,7 +20,8 @@ REQ_ERROR_STR = "Requests error"
 GATEWAY_URL = os.environ['GATEWAY_URL']
 USE_KAFKA = os.getenv("USE_KAFKA", "false").lower() == "true"
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-ORDER_REPLY_TOPIC = f"order.replies.{os.getpid()}"
+ORDER_REPLY_TOPIC = "order.replies"
+ORDER_REPLY_NUM_PARTITIONS = int(os.getenv("KAFKA_NUM_PARTITIONS", "4"))
 STOCK_COMMAND_TOPIC = "stock.commands"
 PAYMENT_COMMAND_TOPIC = "payment.commands"
 
@@ -33,6 +34,7 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
 kafka_producer: KafkaProducerClient | None = None
 kafka_consumer: KafkaConsumerClient | None = None
 kafka_available = False
+WORKER_PARTITION: int = -1
 
 
 def close_connections():
@@ -71,17 +73,24 @@ def create_kafka_clients():
     global kafka_producer
     global kafka_consumer
     global kafka_available
+    global WORKER_PARTITION
     if not USE_KAFKA:
         return
+    # Atomically claim a partition slot so each gunicorn worker gets a unique
+    # partition of the shared order.replies topic instead of a per-pid topic.
+    slot = int(db.incr("order:worker:slot"))
+    WORKER_PARTITION = (slot - 1) % ORDER_REPLY_NUM_PARTITIONS
+    print(f"[Order] Worker slot={slot}, reply partition={WORKER_PARTITION}", flush=True)
     # Both constructors block with infinite retry until the broker is reachable.
-    # The reply topic is unique per process so each gunicorn worker reads its own replies.
     kafka_producer = KafkaProducerClient(
         ensure_topics=[STOCK_COMMAND_TOPIC, PAYMENT_COMMAND_TOPIC, ORDER_REPLY_TOPIC]
     )
     kafka_consumer = KafkaConsumerClient(
         topic=ORDER_REPLY_TOPIC,
-        group_id=ORDER_REPLY_TOPIC,
+        group_id=f"order-reply-{WORKER_PARTITION}",
         auto_commit=False,
+        auto_offset_reset="latest",
+        partition=WORKER_PARTITION,
     )
     kafka_available = True
 
@@ -92,7 +101,8 @@ def send_kafka_command(topic: str, payload: dict, timeout_seconds: int = 12) -> 
     correlation_id = str(uuid.uuid4())
     command = payload | {
         "correlation_id": correlation_id,
-        "reply_to": ORDER_REPLY_TOPIC
+        "reply_to": ORDER_REPLY_TOPIC,
+        "reply_partition": WORKER_PARTITION,
     }
     try:
         kafka_producer.send(topic, command, key=correlation_id)

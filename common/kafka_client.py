@@ -1,11 +1,13 @@
 import os
 import time
 import json
-from confluent_kafka import Producer, Consumer
+from confluent_kafka import Producer, Consumer, TopicPartition
 from confluent_kafka.admin import AdminClient, NewTopic
 
 
 BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+NUM_PARTITIONS = int(os.getenv("KAFKA_NUM_PARTITIONS", "4"))
+REPLICATION_FACTOR = int(os.getenv("KAFKA_REPLICATION_FACTOR", "1"))
 
 
 def _delivery_report(err, msg):
@@ -41,7 +43,7 @@ class KafkaProducerClient:
                 if self._ensure_topics:
                     admin = AdminClient({"bootstrap.servers": BOOTSTRAP_SERVERS})
                     new_topics = [
-                        NewTopic(t, num_partitions=1, replication_factor=1)
+                        NewTopic(t, num_partitions=NUM_PARTITIONS, replication_factor=REPLICATION_FACTOR)
                         for t in self._ensure_topics
                     ]
                     for f in admin.create_topics(new_topics).values():
@@ -56,14 +58,17 @@ class KafkaProducerClient:
                 print(f"[KafkaProducer] Connection failed: {e} — retrying in 2s", flush=True)
                 time.sleep(2)
 
-    def send(self, topic: str, message: dict, key: str | None = None):
+    def send(self, topic: str, message: dict, key: str | None = None, partition: int | None = None):
         """Produce a JSON message. Non-blocking — call flush() for delivery guarantee."""
-        self._producer.produce(
+        kwargs: dict = dict(
             topic=topic,
             value=json.dumps(message).encode("utf-8"),
             key=key.encode("utf-8") if key else None,
             on_delivery=_delivery_report,
         )
+        if partition is not None:
+            kwargs["partition"] = partition
+        self._producer.produce(**kwargs)
         self._producer.poll(0)
 
     def flush(self, timeout: float = 5.0):
@@ -93,12 +98,16 @@ class KafkaConsumerClient:
         group_id: str,
         auto_commit: bool = True,
         ensure_topics: list[str] | None = None,
+        partition: int | None = None,
+        auto_offset_reset: str = "earliest",
     ):
         self.topic = topic
         self.group_id = group_id
         self._auto_commit = auto_commit
         # Default: ensure the subscribed topic itself exists.
         self._ensure_topics = ensure_topics if ensure_topics is not None else [topic]
+        self._partition = partition
+        self._auto_offset_reset = auto_offset_reset
         self._consumer = None
         self._connect()
 
@@ -112,7 +121,7 @@ class KafkaConsumerClient:
                 if self._ensure_topics:
                     admin = AdminClient({"bootstrap.servers": BOOTSTRAP_SERVERS})
                     new_topics = [
-                        NewTopic(t, num_partitions=1, replication_factor=1)
+                        NewTopic(t, num_partitions=NUM_PARTITIONS, replication_factor=REPLICATION_FACTOR)
                         for t in self._ensure_topics
                     ]
                     for f in admin.create_topics(new_topics).values():
@@ -123,15 +132,22 @@ class KafkaConsumerClient:
                 consumer = Consumer({
                     "bootstrap.servers": BOOTSTRAP_SERVERS,
                     "group.id": self.group_id,
-                    "auto.offset.reset": "earliest",
+                    "auto.offset.reset": self._auto_offset_reset,
                     "enable.auto.commit": "true" if self._auto_commit else "false",
                 })
-                consumer.subscribe([self.topic])
+                if self._partition is not None:
+                    consumer.assign([TopicPartition(self.topic, self._partition)])
+                    print(
+                        f"[KafkaConsumer] Assigned {self.topic}[{self._partition}] (group={self.group_id})",
+                        flush=True,
+                    )
+                else:
+                    consumer.subscribe([self.topic])
+                    print(
+                        f"[KafkaConsumer] Subscribed to {self.topic} (group={self.group_id})",
+                        flush=True,
+                    )
                 self._consumer = consumer
-                print(
-                    f"[KafkaConsumer] Subscribed to {self.topic} (group={self.group_id})",
-                    flush=True,
-                )
                 break
             except Exception as e:
                 print(f"[KafkaConsumer] Connection failed: {e} — retrying in 2s", flush=True)
