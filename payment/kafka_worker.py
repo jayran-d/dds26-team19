@@ -91,7 +91,7 @@ def _consumer_loop() -> None:
             result = _consumer.poll(timeout=1.0)
 
             if result.error:
-                _logger.error(f"[PaymentKafka] Poll error: {result.error}")
+                _logger.info(f"[PaymentKafka] Poll error: {result.error}")
                 time.sleep(1)
                 continue
 
@@ -101,13 +101,13 @@ def _consumer_loop() -> None:
             _route_command(result.msg)
 
         except Exception as exc:
-            _logger.error(f"[PaymentKafka] Consumer loop crashed: {exc}")
+            _logger.info(f"[PaymentKafka] Consumer loop crashed: {exc}")
             time.sleep(1)
 
 
 def _route_command(msg: dict) -> None:
     msg_type = msg.get("type")
-    _logger.debug(
+    _logger.info(
         f"[PaymentKafka] command={msg_type} "
         f"order={msg.get('order_id')} tx={msg.get('tx_id')}"
     )
@@ -118,7 +118,7 @@ def _route_command(msg: dict) -> None:
     elif msg_type == REFUND_PAYMENT:
         _handle_refund_payment(msg)
     else:
-        _logger.warning(f"[PaymentKafka] Unknown command type: {msg_type!r} — dropping")
+        _logger.info(f"[PaymentKafka] Unknown command type: {msg_type!r} — dropping")
 
 
 # ============================================================
@@ -133,7 +133,7 @@ def _handle_process_payment(msg: dict) -> None:
     amount   = payload.get("amount")
 
     if not user_id or amount is None:
-        _logger.error(f"[PaymentKafka] Invalid PROCESS_PAYMENT payload: {msg}")
+        _logger.info(f"[PaymentKafka] Invalid PROCESS_PAYMENT payload: {msg}")
         _producer.publish(PAYMENT_EVENTS_TOPIC, build_payment_failed(tx_id, order_id, "Invalid payment command payload"))
         return
 
@@ -143,10 +143,10 @@ def _handle_process_payment(msg: dict) -> None:
     success, error, _ = remove_credit_internal(user_id, int(amount))
 
     if success:
-        _logger.debug(f"[PaymentKafka] order={order_id} payment success")
+        _logger.info(f"[PaymentKafka] order={order_id} payment success")
         _producer.publish(PAYMENT_EVENTS_TOPIC, build_payment_success(tx_id, order_id))
     else:
-        _logger.debug(f"[PaymentKafka] order={order_id} payment failed: {error}")
+        _logger.info(f"[PaymentKafka] order={order_id} payment failed: {error}")
         _producer.publish(PAYMENT_EVENTS_TOPIC, build_payment_failed(tx_id, order_id, error))
 
 
@@ -158,7 +158,7 @@ def _handle_refund_payment(msg: dict) -> None:
     amount   = payload.get("amount")
 
     if not user_id or amount is None:
-        _logger.error(f"[PaymentKafka] Invalid REFUND_PAYMENT payload: {msg}")
+        _logger.info(f"[PaymentKafka] Invalid REFUND_PAYMENT payload: {msg}")
         return
 
     from app import add_credit_internal
@@ -166,7 +166,7 @@ def _handle_refund_payment(msg: dict) -> None:
     success, error, _ = add_credit_internal(user_id, int(amount))
 
     if success:
-        _logger.debug(f"[PaymentKafka] order={order_id} refund success")
+        _logger.info(f"[PaymentKafka] order={order_id} refund success")
         _producer.publish(PAYMENT_EVENTS_TOPIC, build_payment_refunded(tx_id, order_id))
     else:
-        _logger.error(f"[PaymentKafka] order={order_id} refund failed: {error}")
+        _logger.info(f"[PaymentKafka] order={order_id} refund failed: {error}")

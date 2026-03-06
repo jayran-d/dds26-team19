@@ -90,7 +90,7 @@ def _consumer_loop() -> None:
             result = _consumer.poll(timeout=1.0)
 
             if result.error:
-                _logger.error(f"[StockKafka] Poll error: {result.error}")
+                _logger.info(f"[StockKafka] Poll error: {result.error}")
                 time.sleep(1)
                 continue
 
@@ -100,23 +100,24 @@ def _consumer_loop() -> None:
             _route_command(result.msg)
 
         except Exception as exc:
-            _logger.error(f"[StockKafka] Consumer loop crashed: {exc}")
+            _logger.info(f"[StockKafka] Consumer loop crashed: {exc}")
             time.sleep(1)
 
 
 def _route_command(msg: dict) -> None:
     msg_type = msg.get("type")
-    _logger.debug(
+    _logger.info(
         f"[StockKafka] command={msg_type} "
         f"order={msg.get('order_id')} tx={msg.get('tx_id')}"
     )
 
+    #these are saga type messages but for now we're using it as the default case.
     if msg_type == RESERVE_STOCK:
         _handle_reserve_stock(msg)
     elif msg_type == RELEASE_STOCK:
         _handle_release_stock(msg)
     else:
-        _logger.warning(f"[StockKafka] Unknown command type: {msg_type!r} — dropping")
+        _logger.info(f"[StockKafka] Unknown command type: {msg_type!r} — dropping")
 
 
 # ============================================================
@@ -136,7 +137,7 @@ def _handle_reserve_stock(msg: dict) -> None:
     items    = msg.get("payload", {}).get("items", [])
 
     if not items:
-        _logger.error(f"[StockKafka] RESERVE_STOCK missing items: {msg}")
+        _logger.info(f"[StockKafka] RESERVE_STOCK missing items: {msg}")
         _producer.publish(STOCK_EVENTS_TOPIC, build_stock_reservation_failed(tx_id, order_id, "No items in payload"))
         return
 
@@ -172,7 +173,7 @@ def _handle_reserve_stock(msg: dict) -> None:
             _producer.publish(STOCK_EVENTS_TOPIC, build_stock_reservation_failed(tx_id, order_id, error))
             return
 
-    _logger.debug(f"[StockKafka] order={order_id} stock reserved for {len(items)} item(s)")
+    _logger.info(f"[StockKafka] order={order_id} stock reserved for {len(items)} item(s)")
     _producer.publish(STOCK_EVENTS_TOPIC, build_stock_reserved(tx_id, order_id))
 
 
@@ -185,7 +186,7 @@ def _handle_release_stock(msg: dict) -> None:
     items    = msg.get("payload", {}).get("items", [])
 
     if not items:
-        _logger.error(f"[StockKafka] RELEASE_STOCK missing items: {msg}")
+        _logger.info(f"[StockKafka] RELEASE_STOCK missing items: {msg}")
         return
 
     for entry in items:
@@ -193,9 +194,9 @@ def _handle_release_stock(msg: dict) -> None:
         quantity = int(entry.get("quantity", 0))
         success, error, _ = apply_stock_delta(item_id, quantity)
         if not success:
-            _logger.error(
+            _logger.info(
                 f"[StockKafka] Failed to release stock for item {item_id}: {error}"
             )
 
-    _logger.debug(f"[StockKafka] order={order_id} stock released for {len(items)} item(s)")
+    _logger.info(f"[StockKafka] order={order_id} stock released for {len(items)} item(s)")
     _producer.publish(STOCK_EVENTS_TOPIC, build_stock_released(tx_id, order_id))
