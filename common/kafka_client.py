@@ -1,7 +1,7 @@
 import os
 import time
 import json
-from confluent_kafka import Producer, Consumer, TopicPartition
+from confluent_kafka import Producer, Consumer, KafkaError
 from confluent_kafka.admin import AdminClient, NewTopic
 
 
@@ -15,18 +15,26 @@ def _delivery_report(err, msg):
         print(f"[Kafka] Delivery failed for {msg.topic()}: {err}", flush=True)
 
 
+def _ensure_topics_exist(topics: list[str]):
+    """Create topics if they don't already exist. Shared by producer and consumer init."""
+    admin = AdminClient({"bootstrap.servers": BOOTSTRAP_SERVERS})
+    new_topics = [
+        NewTopic(
+            t, num_partitions=NUM_PARTITIONS, replication_factor=REPLICATION_FACTOR
+        )
+        for t in topics
+    ]
+    for f in admin.create_topics(new_topics).values():
+        try:
+            f.result()
+        except Exception:
+            pass  # topic already exists — fine
+
+
 class KafkaProducerClient:
     """
-    Kafka producer wrapper.
-
-    Blocks at __init__ until the broker is reachable (infinite retry with 2s sleep).
-    Optionally pre-creates topics via AdminClient so consumers never see
-    UNKNOWN_TOPIC_OR_PART on first subscribe.
-
-    NOTE: Producer({'bootstrap.servers': ...}) never throws — the actual TCP
-    connection happens lazily in librdkafka background threads.  list_topics()
-    is the first call that actually probes the broker and throws on failure,
-    which is what makes the retry loop work correctly.
+    Thin producer wrapper. Blocks at init until the broker is reachable.
+    Optionally pre-creates topics so consumers never hit UNKNOWN_TOPIC_OR_PART.
     """
 
     def __init__(self, ensure_topics: list[str] | None = None):
@@ -37,38 +45,34 @@ class KafkaProducerClient:
     def _connect(self):
         while True:
             try:
-                p = Producer({"bootstrap.servers": BOOTSTRAP_SERVERS, "acks": "all"})
-                # Actually probe the broker — list_topics() blocks until connected or timeout.
-                p.list_topics(timeout=3)
+                p = Producer(
+                    {
+                        "bootstrap.servers": BOOTSTRAP_SERVERS,
+                        "acks": "all",
+                        "metadata.request.timeout.ms": "5000",
+                    }
+                )
+                p.list_topics(timeout=3)  # actually probe the broker
                 if self._ensure_topics:
-                    admin = AdminClient({"bootstrap.servers": BOOTSTRAP_SERVERS})
-                    new_topics = [
-                        NewTopic(t, num_partitions=NUM_PARTITIONS, replication_factor=REPLICATION_FACTOR)
-                        for t in self._ensure_topics
-                    ]
-                    for f in admin.create_topics(new_topics).values():
-                        try:
-                            f.result()
-                        except Exception:
-                            pass  # topic already exists
+                    _ensure_topics_exist(self._ensure_topics)
                 self._producer = p
                 print(f"[KafkaProducer] Connected to {BOOTSTRAP_SERVERS}", flush=True)
                 break
             except Exception as e:
-                print(f"[KafkaProducer] Connection failed: {e} — retrying in 2s", flush=True)
+                print(
+                    f"[KafkaProducer] Connection failed: {e} — retrying in 2s",
+                    flush=True,
+                )
                 time.sleep(2)
 
-    def send(self, topic: str, message: dict, key: str | None = None, partition: int | None = None):
-        """Produce a JSON message. Non-blocking — call flush() for delivery guarantee."""
-        kwargs: dict = dict(
+    def send(self, topic: str, message: dict, key: str | None = None):
+        """Produce a JSON message. Kafka decides the partition automatically."""
+        self._producer.produce(
             topic=topic,
             value=json.dumps(message).encode("utf-8"),
             key=key.encode("utf-8") if key else None,
             on_delivery=_delivery_report,
         )
-        if partition is not None:
-            kwargs["partition"] = partition
-        self._producer.produce(**kwargs)
         self._producer.poll(0)
 
     def flush(self, timeout: float = 5.0):
@@ -76,37 +80,54 @@ class KafkaProducerClient:
 
     def close(self):
         self._producer.flush()
+        self._producer = None
+
+
+class PollResult:
+    """
+    Wraps a single poll() outcome. Three possible states:
+      - No message yet  → ok=False, error=None
+      - Good message    → ok=True,  msg=dict
+      - Error           → ok=False, error=str
+    """
+
+    __slots__ = ("msg", "error")
+
+    def __init__(self, msg: dict | None = None, error: str | None = None):
+        self.msg = msg
+        self.error = error
+
+    @property
+    def ok(self) -> bool:
+        return self.msg is not None
+
+    def __repr__(self):
+        if self.error:
+            return f"PollResult(error={self.error!r})"
+        return f"PollResult(msg={self.msg!r})"
 
 
 class KafkaConsumerClient:
     """
-    Kafka consumer wrapper.
+    Thin consumer wrapper. Blocks at init until the broker is reachable.
+    Pre-creates topics before subscribing to avoid UNKNOWN_TOPIC_OR_PART.
 
-    Blocks at __init__ until the broker is reachable (infinite retry with 2s sleep).
-    Pre-creates topic(s) via AdminClient before subscribing to avoid
-    UNKNOWN_TOPIC_OR_PART errors on the first poll.
-
-    NOTE: Consumer({'bootstrap.servers': ...}) and subscribe() never throw even
-    if the broker is unreachable — they succeed silently and only fail later at
-    poll() time.  We therefore probe with a temporary Producer.list_topics()
-    call which does throw, making the retry loop actually trigger.
+    Supports subscribing to multiple topics via the topics parameter.
+    Kafka handles partition assignment automatically via the consumer group.
     """
 
     def __init__(
         self,
-        topic: str,
+        topics: list[str],
         group_id: str,
         auto_commit: bool = True,
         ensure_topics: list[str] | None = None,
-        partition: int | None = None,
         auto_offset_reset: str = "earliest",
     ):
-        self.topic = topic
+        self.topics = topics
         self.group_id = group_id
         self._auto_commit = auto_commit
-        # Default: ensure the subscribed topic itself exists.
-        self._ensure_topics = ensure_topics if ensure_topics is not None else [topic]
-        self._partition = partition
+        self._ensure_topics = ensure_topics if ensure_topics is not None else topics
         self._auto_offset_reset = auto_offset_reset
         self._consumer = None
         self._connect()
@@ -114,58 +135,58 @@ class KafkaConsumerClient:
     def _connect(self):
         while True:
             try:
-                # Consumer() never throws, so probe with a temp Producer instead.
+                # Consumer() never throws — probe with a temp Producer instead.
                 probe = Producer({"bootstrap.servers": BOOTSTRAP_SERVERS})
                 probe.list_topics(timeout=3)
-                # Ensure topics exist before subscribing.
                 if self._ensure_topics:
-                    admin = AdminClient({"bootstrap.servers": BOOTSTRAP_SERVERS})
-                    new_topics = [
-                        NewTopic(t, num_partitions=NUM_PARTITIONS, replication_factor=REPLICATION_FACTOR)
-                        for t in self._ensure_topics
-                    ]
-                    for f in admin.create_topics(new_topics).values():
-                        try:
-                            f.result()
-                        except Exception:
-                            pass  # topic already exists
-                consumer = Consumer({
-                    "bootstrap.servers": BOOTSTRAP_SERVERS,
-                    "group.id": self.group_id,
-                    "auto.offset.reset": self._auto_offset_reset,
-                    "enable.auto.commit": "true" if self._auto_commit else "false",
-                })
-                if self._partition is not None:
-                    consumer.assign([TopicPartition(self.topic, self._partition)])
-                    print(
-                        f"[KafkaConsumer] Assigned {self.topic}[{self._partition}] (group={self.group_id})",
-                        flush=True,
-                    )
-                else:
-                    consumer.subscribe([self.topic])
-                    print(
-                        f"[KafkaConsumer] Subscribed to {self.topic} (group={self.group_id})",
-                        flush=True,
-                    )
+                    _ensure_topics_exist(self._ensure_topics)
+                consumer = Consumer(
+                    {
+                        "bootstrap.servers": BOOTSTRAP_SERVERS,
+                        "group.id": self.group_id,
+                        "auto.offset.reset": self._auto_offset_reset,
+                        "enable.auto.commit": "true" if self._auto_commit else "false",
+                        "session.timeout.ms": "30000",
+                        "max.poll.interval.ms": "300000",
+                    }
+                )
+                consumer.subscribe(self.topics)
+                print(
+                    f"[KafkaConsumer] Subscribed to {self.topics} (group={self.group_id})",
+                    flush=True,
+                )
                 self._consumer = consumer
                 break
             except Exception as e:
-                print(f"[KafkaConsumer] Connection failed: {e} — retrying in 2s", flush=True)
+                print(
+                    f"[KafkaConsumer] Connection failed: {e} — retrying in 2s",
+                    flush=True,
+                )
                 time.sleep(2)
 
-    def poll(self, timeout: float = 1.0) -> dict | None:
-        """Poll for the next message. Returns decoded JSON dict or None."""
+    def poll(self, timeout: float = 1.0) -> PollResult:
         msg = self._consumer.poll(timeout)
         if msg is None:
-            return None
+            return PollResult()
         if msg.error():
-            print(f"[KafkaConsumer] Error on {self.topic}: {msg.error()}", flush=True)
-            return None
+            code = msg.error().code()
+            # EOF and retriable errors (e.g. NOT_COORDINATOR) are non-fatal — ignore silently.
+            if code == KafkaError._PARTITION_EOF or msg.error().retriable():
+                return PollResult()
+            err_str = str(msg.error())
+            print(f"[KafkaConsumer] Error: {err_str}", flush=True)
+            return PollResult(error=err_str)
         try:
-            return json.loads(msg.value().decode("utf-8"))
+            return PollResult(msg=json.loads(msg.value().decode("utf-8")))
         except Exception as e:
-            print(f"[KafkaConsumer] JSON decode error: {e}", flush=True)
-            return None
+            err_str = f"JSON decode error: {e}"
+            print(f"[KafkaConsumer] {err_str}", flush=True)
+            return PollResult(error=err_str)
+
+    def commit(self):
+        """Manually commit offset. Only meaningful when auto_commit=False."""
+        self._consumer.commit(asynchronous=False)
 
     def close(self):
         self._consumer.close()
+        self._consumer = None

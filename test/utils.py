@@ -69,3 +69,15 @@ def status_code_is_success(status_code: int) -> bool:
 
 def status_code_is_failure(status_code: int) -> bool:
     return 400 <= status_code < 500
+
+
+########################################################################################################################
+#   KAFKA STATUS CHECKS
+########################################################################################################################
+def get_order_status(order_id):
+    response = requests.get(f"{ORDER_URL}/orders/status/{order_id}")
+    return response.json()
+
+def find_order(order_id):
+    response = requests.get(f"{ORDER_URL}/orders/find/{order_id}")
+    return response.json()
