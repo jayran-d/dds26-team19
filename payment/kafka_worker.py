@@ -76,9 +76,9 @@ def close_kafka() -> None:
 # INTERNAL HELPERS
 # ============================================================
 
-def _publish(message: dict) -> None:
-    _producer.send(PAYMENT_EVENTS_TOPIC, message)
-    _producer.flush()
+# def _publish(message: dict) -> None:
+#     _producer.send(PAYMENT_EVENTS_TOPIC, message)
+#     _producer.flush()
 
 
 # ============================================================
@@ -112,6 +112,7 @@ def _route_command(msg: dict) -> None:
         f"order={msg.get('order_id')} tx={msg.get('tx_id')}"
     )
 
+    #these are saga type messages but for now we're using it as the default case.
     if msg_type == PROCESS_PAYMENT:
         _handle_process_payment(msg)
     elif msg_type == REFUND_PAYMENT:
@@ -133,7 +134,7 @@ def _handle_process_payment(msg: dict) -> None:
 
     if not user_id or amount is None:
         _logger.error(f"[PaymentKafka] Invalid PROCESS_PAYMENT payload: {msg}")
-        _publish(build_payment_failed(tx_id, order_id, "Invalid payment command payload"))
+        _producer.publish(PAYMENT_EVENTS_TOPIC, build_payment_failed(tx_id, order_id, "Invalid payment command payload"))
         return
 
     # Import here to avoid circular imports with app.py
@@ -143,10 +144,10 @@ def _handle_process_payment(msg: dict) -> None:
 
     if success:
         _logger.debug(f"[PaymentKafka] order={order_id} payment success")
-        _publish(build_payment_success(tx_id, order_id))
+        _producer.publish(PAYMENT_EVENTS_TOPIC, build_payment_success(tx_id, order_id))
     else:
         _logger.debug(f"[PaymentKafka] order={order_id} payment failed: {error}")
-        _publish(build_payment_failed(tx_id, order_id, error))
+        _producer.publish(PAYMENT_EVENTS_TOPIC, build_payment_failed(tx_id, order_id, error))
 
 
 def _handle_refund_payment(msg: dict) -> None:
@@ -166,6 +167,6 @@ def _handle_refund_payment(msg: dict) -> None:
 
     if success:
         _logger.debug(f"[PaymentKafka] order={order_id} refund success")
-        _publish(build_payment_refunded(tx_id, order_id))
+        _producer.publish(PAYMENT_EVENTS_TOPIC, build_payment_refunded(tx_id, order_id))
     else:
         _logger.error(f"[PaymentKafka] order={order_id} refund failed: {error}")

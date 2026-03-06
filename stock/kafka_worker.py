@@ -73,16 +73,13 @@ def close_kafka() -> None:
     if _producer is not None:
         _producer.close()
 
-
 # ============================================================
 # INTERNAL HELPERS
 # ============================================================
 
-def _publish(message: dict) -> None:
-    _producer.send(STOCK_EVENTS_TOPIC, message)
-    _producer.flush()
-
-
+# def _publish(message: dict) -> None:
+#     _producer.send(STOCK_EVENTS_TOPIC, message)
+#     _producer.flush()
 # ============================================================
 # CONSUMER LOOP
 # ============================================================
@@ -140,7 +137,7 @@ def _handle_reserve_stock(msg: dict) -> None:
 
     if not items:
         _logger.error(f"[StockKafka] RESERVE_STOCK missing items: {msg}")
-        _publish(build_stock_reservation_failed(tx_id, order_id, "No items in payload"))
+        _producer.publish(STOCK_EVENTS_TOPIC, build_stock_reservation_failed(tx_id, order_id, "No items in payload"))
         return
 
     # ── Validate all items first ───────────────────────────────────────────────
@@ -149,18 +146,18 @@ def _handle_reserve_stock(msg: dict) -> None:
         quantity = entry.get("quantity")
 
         if not item_id or quantity is None:
-            _publish(build_stock_reservation_failed(tx_id, order_id, "Invalid item payload"))
+            _producer.publish(STOCK_EVENTS_TOPIC, build_stock_reservation_failed(tx_id, order_id, "Invalid item payload"))
             return
 
         item = get_item_from_db(item_id)
         if item is None:
-            _publish(build_stock_reservation_failed(
+            _producer.publish(STOCK_EVENTS_TOPIC, build_stock_reservation_failed(
                 tx_id, order_id, f"Item {item_id} not found"
             ))
             return
 
         if item.stock < int(quantity):
-            _publish(build_stock_reservation_failed(
+            _producer.publish(STOCK_EVENTS_TOPIC, build_stock_reservation_failed(
                 tx_id, order_id, f"Insufficient stock for item {item_id}"
             ))
             return
@@ -172,11 +169,11 @@ def _handle_reserve_stock(msg: dict) -> None:
         success, error, _ = apply_stock_delta(item_id, -quantity)
         if not success:
             # Extremely unlikely here since we just validated, but handle it anyway.
-            _publish(build_stock_reservation_failed(tx_id, order_id, error))
+            _producer.publish(STOCK_EVENTS_TOPIC, build_stock_reservation_failed(tx_id, order_id, error))
             return
 
     _logger.debug(f"[StockKafka] order={order_id} stock reserved for {len(items)} item(s)")
-    _publish(build_stock_reserved(tx_id, order_id))
+    _producer.publish(STOCK_EVENTS_TOPIC, build_stock_reserved(tx_id, order_id))
 
 
 def _handle_release_stock(msg: dict) -> None:
@@ -201,4 +198,4 @@ def _handle_release_stock(msg: dict) -> None:
             )
 
     _logger.debug(f"[StockKafka] order={order_id} stock released for {len(items)} item(s)")
-    _publish(build_stock_released(tx_id, order_id))
+    _producer.publish(STOCK_EVENTS_TOPIC, build_stock_released(tx_id, order_id))

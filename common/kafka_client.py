@@ -78,6 +78,10 @@ class KafkaProducerClient:
     def flush(self, timeout: float = 5.0):
         self._producer.flush(timeout)
 
+    def publish(self, topic: str, message: dict) -> None:
+        self.send(topic, message)
+        self.flush()
+
     def close(self):
         self._producer.flush()
         self._producer = None
