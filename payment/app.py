@@ -4,26 +4,29 @@ import atexit
 import uuid
 
 import redis
+from kafka_worker import init_kafka, close_kafka
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
 DB_ERROR_STR = "DB error"
 
-
 app = Flask("payment-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+db: redis.Redis = redis.Redis(
+    host=os.environ['REDIS_HOST'],
+    port=int(os.environ['REDIS_PORT']),
+    password=os.environ['REDIS_PASSWORD'],
+    db=int(os.environ['REDIS_DB']),
+)
 
 
-def close_db_connection():
+def close_connections():
     db.close()
+    close_kafka()
 
 
-atexit.register(close_db_connection)
+atexit.register(close_connections)
 
 
 class UserValue(Struct):
@@ -32,17 +35,46 @@ class UserValue(Struct):
 
 def get_user_from_db(user_id: str) -> UserValue | None:
     try:
-        # get serialized data
         entry: bytes = db.get(user_id)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
     entry: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
     if entry is None:
-        # if user does not exist in the database; abort
         abort(400, f"User: {user_id} not found!")
     return entry
 
+
+# ── Business logic (also called directly by kafka_worker) ─────────────────────
+
+def remove_credit_internal(user_id: str, amount: int) -> tuple[bool, str | None, int | None]:
+    try:
+        user_entry = get_user_from_db(user_id)
+    except Exception as exc:
+        return False, getattr(exc, "description", str(exc)), None
+    user_entry.credit -= amount
+    if user_entry.credit < 0:
+        return False, f"User: {user_id} credit cannot get reduced below zero!", None
+    try:
+        db.set(user_id, msgpack.encode(user_entry))
+    except redis.exceptions.RedisError:
+        return False, DB_ERROR_STR, None
+    return True, None, user_entry.credit
+
+
+def add_credit_internal(user_id: str, amount: int) -> tuple[bool, str | None, int | None]:
+    try:
+        user_entry = get_user_from_db(user_id)
+    except Exception as exc:
+        return False, getattr(exc, "description", str(exc)), None
+    user_entry.credit += amount
+    try:
+        db.set(user_id, msgpack.encode(user_entry))
+    except redis.exceptions.RedisError:
+        return False, DB_ERROR_STR, None
+    return True, None, user_entry.credit
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.post('/create_user')
 def create_user():
@@ -59,8 +91,9 @@ def create_user():
 def batch_init_users(n: int, starting_money: int):
     n = int(n)
     starting_money = int(starting_money)
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=starting_money))
-                                  for i in range(n)}
+    kv_pairs: dict[str, bytes] = {
+        f"{i}": msgpack.encode(UserValue(credit=starting_money)) for i in range(n)
+    }
     try:
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
@@ -71,44 +104,33 @@ def batch_init_users(n: int, starting_money: int):
 @app.get('/find_user/<user_id>')
 def find_user(user_id: str):
     user_entry: UserValue = get_user_from_db(user_id)
-    return jsonify(
-        {
-            "user_id": user_id,
-            "credit": user_entry.credit
-        }
-    )
+    return jsonify({"user_id": user_id, "credit": user_entry.credit})
 
 
 @app.post('/add_funds/<user_id>/<amount>')
 def add_credit(user_id: str, amount: int):
-    user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
-    user_entry.credit += int(amount)
-    try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+    success, error, updated_credit = add_credit_internal(user_id, int(amount))
+    if not success:
+        abort(400, error)
+    return Response(f"User: {user_id} credit updated to: {updated_credit}", status=200)
 
 
 @app.post('/pay/<user_id>/<amount>')
 def remove_credit(user_id: str, amount: int):
     app.logger.debug(f"Removing {amount} credit from user: {user_id}")
-    user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
-    user_entry.credit -= int(amount)
-    if user_entry.credit < 0:
-        abort(400, f"User: {user_id} credit cannot get reduced below zero!")
-    try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+    success, error, updated_credit = remove_credit_internal(user_id, int(amount))
+    if not success:
+        abort(400, error)
+    return Response(f"User: {user_id} credit updated to: {updated_credit}", status=200)
 
+
+# ── Startup ────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
+    init_kafka(app.logger)
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
+    init_kafka(app.logger)
