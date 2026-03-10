@@ -53,7 +53,7 @@ def init_kafka(logger, db) -> None:
         return
 
     _logger = logger
-    _db = _db
+    _db = db
 
     _producer = KafkaProducerClient(ensure_topics=ALL_TOPICS)
     _consumer = KafkaConsumerClient(

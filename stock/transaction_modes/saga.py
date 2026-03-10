@@ -22,6 +22,7 @@ from msgspec import msgpack
 from common.messages import (
     RESERVE_STOCK,
     RELEASE_STOCK,
+    STOCK_EVENTS_TOPIC,
     build_stock_reserved,
     build_stock_reservation_failed,
     build_stock_released,
@@ -169,7 +170,7 @@ def _handle_reserve_stock(
 
     # ── Step 6: publish reply ──────────────────────────────────────────────────
     reply = build_stock_reserved(tx_id, order_id)
-    publish(reply)
+    publish(STOCK_EVENTS_TOPIC, reply)
     logger.debug(f"[StockSaga] RESERVE_STOCK success tx={tx_id} order={order_id}")
 
     # ── Step 7: mark replied ───────────────────────────────────────────────────
@@ -255,7 +256,7 @@ def _handle_release_stock(
 
     # ── Step 6: publish reply ──────────────────────────────────────────────────
     reply = build_stock_released(tx_id, order_id)
-    publish(reply)
+    publish(STOCK_EVENTS_TOPIC,reply)
     logger.debug(f"[StockSaga] RELEASE_STOCK done tx={tx_id} order={order_id}")
 
     # ── Step 7: mark replied ───────────────────────────────────────────────────
@@ -286,7 +287,7 @@ def _fail(
         response_payload={"reason": reason},
     )
     reply = build_stock_reservation_failed(tx_id, order_id, reason)
-    publish(reply)
+    publish(STOCK_EVENTS_TOPIC, reply)
     logger.debug(f"[StockSaga] RESERVE_STOCK failed tx={tx_id}: {reason}")
     stock_ledger.mark_replied(db, tx_id, action_type)
 
@@ -303,4 +304,4 @@ def _republish(
     event_type = entry.get("response_event_type")
     payload = entry.get("response_payload", {})
     msg = build_message(tx_id, order_id, event_type, payload)
-    publish(msg)
+    publish(STOCK_EVENTS_TOPIC, msg)

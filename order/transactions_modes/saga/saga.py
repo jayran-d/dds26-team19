@@ -33,7 +33,7 @@ import uuid
 import redis as redis_module
 from msgspec import msgpack
 
-import saga_record
+from . import saga_record
 from common.messages import (
     SagaOrderStatus,
     STOCK_RESERVED,
@@ -236,11 +236,13 @@ def saga_on_payment_success(record, msg, db, logger):
             f"[Saga] PAYMENT_SUCCESS in unexpected state={record['state']} tx={tx_id}"
         )
         return
+    
+    from app import OrderValue
 
     # Mark order as paid in Redis
     raw = db.get(order_id)
     if raw:
-        order_entry = msgpack.decode(raw)
+        order_entry = msgpack.decode(raw, type=OrderValue)
         # OrderValue is a msgspec struct — rebuild with paid=True
         updated = order_entry.__class__(
             user_id=order_entry.user_id,
