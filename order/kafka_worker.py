@@ -21,7 +21,13 @@ import time
 import redis as redis_module
 
 from transactions_modes.simple import simple_route_order, simple_start_checkout
-from transactions_modes.saga.saga import saga_route_order, saga_start_checkout
+from transactions_modes.saga.saga import (
+    saga_route_order,
+    saga_start_checkout,
+    recover as saga_recover,
+    check_timeouts as saga_check_timeouts,
+)
+
 from transactions_modes.two_pc import _2pc_route_order, _2pc_start_checkout
 
 from common.kafka_client import KafkaProducerClient, KafkaConsumerClient
@@ -29,6 +35,7 @@ from common.messages import ALL_TOPICS, STOCK_EVENTS_TOPIC, PAYMENT_EVENTS_TOPIC
 
 USE_KAFKA = os.getenv("USE_KAFKA", "false").lower() == "true"
 TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "simple")  # "simple" | "saga" | "2pc"
+TIMEOUT_SCAN_INTERVAL_SECONDS = 5
 
 # ── Module-level state ─────────────────────────────────────────────────────────
 _producer: KafkaProducerClient | None = None
@@ -36,6 +43,7 @@ _consumer: KafkaConsumerClient | None = None
 _db: redis_module.Redis | None = None
 _available: bool = False
 _logger = None
+
 
 
 # ============================================================
@@ -67,8 +75,14 @@ def init_kafka(logger, db: redis_module.Redis) -> None:
 
     _available = True
 
-    thread = threading.Thread(target=_event_loop, daemon=True)
-    thread.start()
+    if TRANSACTION_MODE == "saga":
+        saga_recover(_db, _producer.publish, _logger)
+
+        timeout_thread = threading.Thread(target=_timeout_loop, daemon=True)
+        timeout_thread.start()
+
+    event_thread = threading.Thread(target=_event_loop, daemon=True)
+    event_thread.start()
     logger.info(f"[OrderKafka] Event loop started (mode={TRANSACTION_MODE})")
 
 
@@ -132,6 +146,14 @@ def _event_loop() -> None:
         except Exception as exc:
             _logger.error(f"[OrderKafka] Event loop crashed: {exc}")
             time.sleep(1)
+
+def _timeout_loop() -> None:
+    while _available and TRANSACTION_MODE == "saga":
+        try:
+            saga_check_timeouts(_db, _producer.publish, _logger)
+        except Exception as exc:
+            _logger.error(f"[OrderKafka] Timeout loop crashed: {exc}")
+        time.sleep(TIMEOUT_SCAN_INTERVAL_SECONDS)
 
 
 def _route_event(msg: dict) -> None:

@@ -11,6 +11,9 @@ Each handler follows the same ledger pattern as stock/saga.py.
 """
 
 import redis as redis_module
+from msgspec import msgpack
+import json
+import time
 
 from common.messages import (
     PROCESS_PAYMENT,
@@ -44,78 +47,63 @@ def saga_route_payment(msg: dict, db: redis_module.Redis, publish, logger) -> No
 # ============================================================
 
 def _handle_process_payment(
-    msg:     dict,
-    db:      redis_module.Redis,
+    msg: dict,
+    db: redis_module.Redis,
     publish,
     logger,
 ) -> None:
-    from app import remove_credit_internal
-
-    tx_id    = msg.get("tx_id")
+    tx_id = msg.get("tx_id")
     order_id = msg.get("order_id")
-    payload  = msg.get("payload", {})
-    user_id  = str(payload.get("user_id", ""))
-    amount   = payload.get("amount")
+    payload = msg.get("payload", {})
+    user_id = str(payload.get("user_id", ""))
+    amount = payload.get("amount")
 
-    # ── Step 1: check ledger ───────────────────────────────────────────────────
     entry = payment_ledger.get_entry(db, tx_id, PROCESS_PAYMENT)
 
     if entry:
         state = entry.get("local_state")
         if state == LedgerState.REPLIED:
-            logger.info(f"[PaymentSaga] PROCESS_PAYMENT duplicate (replied) tx={tx_id} — re-emitting")
-            _republish(entry, tx_id, order_id, publish)
+            logger.debug(f"[PaymentSaga] PROCESS_PAYMENT duplicate (replied) tx={tx_id}")
+            _republish(entry, publish)
             return
         if state == LedgerState.APPLIED:
-            logger.info(f"[PaymentSaga] PROCESS_PAYMENT duplicate (applied) tx={tx_id} — republishing")
-            _republish(entry, tx_id, order_id, publish)
+            logger.debug(f"[PaymentSaga] PROCESS_PAYMENT duplicate (applied) tx={tx_id}")
+            _republish(entry, publish)
             payment_ledger.mark_replied(db, tx_id, PROCESS_PAYMENT)
             return
 
-    # ── Step 2: validate payload ───────────────────────────────────────────────
     if not user_id or amount is None:
         logger.error(f"[PaymentSaga] Invalid PROCESS_PAYMENT payload: {msg}")
         return
 
-    # ── Step 3: create ledger entry (received) ─────────────────────────────────
     if not entry:
-        payment_ledger.create_entry(
-            db          = db,
-            tx_id       = tx_id,
-            action_type = PROCESS_PAYMENT,
-            business_snapshot = {"user_id": user_id, "amount": int(amount)},
+        created = payment_ledger.create_entry(
+            db=db,
+            tx_id=tx_id,
+            action_type=PROCESS_PAYMENT,
+            business_snapshot={"user_id": user_id, "amount": int(amount)},
         )
+        if not created:
+            entry = payment_ledger.get_entry(db, tx_id, PROCESS_PAYMENT)
+            if not entry:
+                logger.error(f"[PaymentSaga] Failed to create/read PROCESS_PAYMENT ledger tx={tx_id}")
+                return
 
-    # ── Step 4: apply business effect ─────────────────────────────────────────
-    success, error, _ = remove_credit_internal(user_id, int(amount))
+    try:
+        reply, result = _apply_process_payment_atomically(
+            db=db,
+            tx_id=tx_id,
+            order_id=order_id,
+            user_id=user_id,
+            amount=int(amount),
+        )
+    except RuntimeError as exc:
+        logger.error(f"[PaymentSaga] PROCESS_PAYMENT atomic apply failed tx={tx_id}: {exc}")
+        return
 
-    if success:
-        response_event_type = "PAYMENT_SUCCESS"
-        response_payload    = {}
-        reply               = build_payment_success(tx_id, order_id)
-        result              = "success"
-    else:
-        response_event_type = "PAYMENT_FAILED"
-        response_payload    = {"reason": error}
-        reply               = build_payment_failed(tx_id, order_id, error)
-        result              = "failure"
-
-    # ── Step 5: mark applied ───────────────────────────────────────────────────
-    payment_ledger.mark_applied(
-        db                  = db,
-        tx_id               = tx_id,
-        action_type         = PROCESS_PAYMENT,
-        result              = result,
-        response_event_type = response_event_type,
-        response_payload    = response_payload,
-    )
-
-    # ── Step 6: publish reply ──────────────────────────────────────────────────
     publish(PAYMENT_EVENTS_TOPIC, reply)
-    logger.info(f"[PaymentSaga] PROCESS_PAYMENT {result} tx={tx_id} order={order_id}")
-
-    # ── Step 7: mark replied ───────────────────────────────────────────────────
     payment_ledger.mark_replied(db, tx_id, PROCESS_PAYMENT)
+    logger.debug(f"[PaymentSaga] PROCESS_PAYMENT {result} tx={tx_id} order={order_id}")
 
 
 # ============================================================
@@ -123,31 +111,28 @@ def _handle_process_payment(
 # ============================================================
 
 def _handle_refund_payment(
-    msg:     dict,
-    db:      redis_module.Redis,
+    msg: dict,
+    db: redis_module.Redis,
     publish,
     logger,
 ) -> None:
-    from app import add_credit_internal
-
-    tx_id    = msg.get("tx_id")
+    tx_id = msg.get("tx_id")
     order_id = msg.get("order_id")
-    payload  = msg.get("payload", {})
-    user_id  = str(payload.get("user_id", ""))
-    amount   = payload.get("amount")
+    payload = msg.get("payload", {})
+    user_id = str(payload.get("user_id", ""))
+    amount = payload.get("amount")
 
-    # ── Step 1: check ledger ───────────────────────────────────────────────────
     entry = payment_ledger.get_entry(db, tx_id, REFUND_PAYMENT)
 
     if entry:
         state = entry.get("local_state")
         if state == LedgerState.REPLIED:
-            logger.info(f"[PaymentSaga] REFUND_PAYMENT duplicate (replied) tx={tx_id} — re-emitting")
-            _republish(entry, tx_id, order_id, publish)
+            logger.debug(f"[PaymentSaga] REFUND_PAYMENT duplicate (replied) tx={tx_id}")
+            _republish(entry, publish)
             return
         if state == LedgerState.APPLIED:
-            logger.info(f"[PaymentSaga] REFUND_PAYMENT duplicate (applied) tx={tx_id} — republishing")
-            _republish(entry, tx_id, order_id, publish)
+            logger.debug(f"[PaymentSaga] REFUND_PAYMENT duplicate (applied) tx={tx_id}")
+            _republish(entry, publish)
             payment_ledger.mark_replied(db, tx_id, REFUND_PAYMENT)
             return
 
@@ -155,48 +140,35 @@ def _handle_refund_payment(
         logger.error(f"[PaymentSaga] Invalid REFUND_PAYMENT payload: {msg}")
         return
 
-    # ── Step 2: check whether PROCESS_PAYMENT ever succeeded ──────────────────
-    # If payment never succeeded, refund is a no-op — but we still reply.
-    pay_entry       = payment_ledger.get_entry(db, tx_id, PROCESS_PAYMENT)
-    pay_succeeded   = (
-        pay_entry is not None
-        and pay_entry.get("result") == "success"
-    )
-
-    # ── Step 3: create ledger entry ───────────────────────────────────────────
     if not entry:
-        payment_ledger.create_entry(
-            db          = db,
-            tx_id       = tx_id,
-            action_type = REFUND_PAYMENT,
-            business_snapshot = {"user_id": user_id, "amount": int(amount)},
+        created = payment_ledger.create_entry(
+            db=db,
+            tx_id=tx_id,
+            action_type=REFUND_PAYMENT,
+            business_snapshot={"user_id": user_id, "amount": int(amount)},
         )
+        if not created:
+            entry = payment_ledger.get_entry(db, tx_id, REFUND_PAYMENT)
+            if not entry:
+                logger.error(f"[PaymentSaga] Failed to create/read REFUND_PAYMENT ledger tx={tx_id}")
+                return
 
-    # ── Step 4: apply refund only if payment actually happened ────────────────
-    if pay_succeeded:
-        success, error, _ = add_credit_internal(user_id, int(amount))
-        if not success:
-            logger.error(f"[PaymentSaga] Refund failed for user {user_id}: {error}")
-    else:
-        logger.info(f"[PaymentSaga] REFUND_PAYMENT tx={tx_id} — payment never succeeded, no-op")
+    try:
+        reply, _ = _apply_refund_payment_atomically(
+            db=db,
+            tx_id=tx_id,
+            order_id=order_id,
+            user_id=user_id,
+            amount=int(amount),
+        )
+    except RuntimeError as exc:
+        logger.error(f"[PaymentSaga] REFUND_PAYMENT atomic apply failed tx={tx_id}: {exc}")
+        return
 
-    # ── Step 5: mark applied ───────────────────────────────────────────────────
-    payment_ledger.mark_applied(
-        db                  = db,
-        tx_id               = tx_id,
-        action_type         = REFUND_PAYMENT,
-        result              = "success",
-        response_event_type = "PAYMENT_REFUNDED",
-        response_payload    = {},
-    )
-
-    # ── Step 6: publish reply ──────────────────────────────────────────────────
-    reply = build_payment_refunded(tx_id, order_id)
-    publish(PAYMENT_EVENTS_TOPIC,reply)
-    logger.info(f"[PaymentSaga] REFUND_PAYMENT done tx={tx_id} order={order_id}")
-
-    # ── Step 7: mark replied ───────────────────────────────────────────────────
+    publish(PAYMENT_EVENTS_TOPIC, reply)
     payment_ledger.mark_replied(db, tx_id, REFUND_PAYMENT)
+    logger.debug(f"[PaymentSaga] REFUND_PAYMENT done tx={tx_id} order={order_id}")
+
 
 
 # ============================================================
@@ -205,7 +177,144 @@ def _handle_refund_payment(
 
 def _republish(entry: dict, tx_id: str, order_id: str, publish) -> None:
     """Rebuild and re-publish the stored reply event from the ledger entry."""
-    event_type = entry.get("response_event_type")
-    payload    = entry.get("response_payload", {})
-    msg = build_message(tx_id, order_id, event_type, payload)
-    publish(PAYMENT_EVENTS_TOPIC, msg)
+    reply_message = entry.get("reply_message")
+    if reply_message:
+        publish(PAYMENT_EVENTS_TOPIC, reply_message)
+        
+def _build_applied_entry(entry: dict, result: str, reply_message: dict) -> dict:
+    updated = dict(entry)
+    updated["local_state"] = LedgerState.APPLIED
+    updated["result"] = result
+    updated["reply_message"] = reply_message
+    updated["updated_at_ms"] = int(time.time() * 1000)
+    return updated
+
+
+def _apply_process_payment_atomically(
+    db: redis_module.Redis,
+    tx_id: str,
+    order_id: str,
+    user_id: str,
+    amount: int,
+) -> tuple[dict, str]:
+    from app import UserValue
+
+    ledger_key = f"payment:ledger:{tx_id}:{PROCESS_PAYMENT}"
+
+    while True:
+        pipe = db.pipeline()
+        try:
+            pipe.watch(ledger_key, user_id)
+
+            raw_entry = pipe.get(ledger_key)
+            if not raw_entry:
+                pipe.unwatch()
+                raise RuntimeError(f"Missing PROCESS_PAYMENT ledger entry for tx={tx_id}")
+
+            entry = json.loads(raw_entry)
+            state = entry.get("local_state")
+            if state in (LedgerState.APPLIED, LedgerState.REPLIED):
+                pipe.unwatch()
+                return entry["reply_message"], entry.get("result", "failure")
+
+            raw_user = pipe.get(user_id)
+            if not raw_user:
+                reply = build_payment_failed(tx_id, order_id, f"User: {user_id} not found!")
+                updated_entry = _build_applied_entry(entry, "failure", reply)
+
+                pipe.multi()
+                pipe.set(ledger_key, json.dumps(updated_entry), ex=payment_ledger.LEDGER_TTL_SECONDS)
+                pipe.execute()
+                return reply, "failure"
+
+            user_entry = msgpack.decode(raw_user, type=UserValue)
+            new_credit = user_entry.credit - amount
+
+            if new_credit < 0:
+                reply = build_payment_failed(
+                    tx_id,
+                    order_id,
+                    f"User: {user_id} credit cannot get reduced below zero!",
+                )
+                updated_entry = _build_applied_entry(entry, "failure", reply)
+
+                pipe.multi()
+                pipe.set(ledger_key, json.dumps(updated_entry), ex=payment_ledger.LEDGER_TTL_SECONDS)
+                pipe.execute()
+                return reply, "failure"
+
+            updated_user = UserValue(credit=new_credit)
+            reply = build_payment_success(tx_id, order_id)
+            updated_entry = _build_applied_entry(entry, "success", reply)
+
+            pipe.multi()
+            pipe.set(user_id, msgpack.encode(updated_user))
+            pipe.set(ledger_key, json.dumps(updated_entry), ex=payment_ledger.LEDGER_TTL_SECONDS)
+            pipe.execute()
+            return reply, "success"
+
+        except redis_module.exceptions.WatchError:
+            continue
+        finally:
+            pipe.reset()
+
+
+def _apply_refund_payment_atomically(
+    db: redis_module.Redis,
+    tx_id: str,
+    order_id: str,
+    user_id: str,
+    amount: int,
+) -> tuple[dict, str]:
+    from app import UserValue
+
+    refund_key = f"payment:ledger:{tx_id}:{REFUND_PAYMENT}"
+    payment_key = f"payment:ledger:{tx_id}:{PROCESS_PAYMENT}"
+
+    while True:
+        pipe = db.pipeline()
+        try:
+            pipe.watch(refund_key, payment_key, user_id)
+
+            raw_refund = pipe.get(refund_key)
+            if not raw_refund:
+                pipe.unwatch()
+                raise RuntimeError(f"Missing REFUND_PAYMENT ledger entry for tx={tx_id}")
+
+            refund_entry = json.loads(raw_refund)
+            refund_state = refund_entry.get("local_state")
+            if refund_state in (LedgerState.APPLIED, LedgerState.REPLIED):
+                pipe.unwatch()
+                return refund_entry["reply_message"], refund_entry.get("result", "success")
+
+            raw_payment = pipe.get(payment_key)
+            payment_entry = json.loads(raw_payment) if raw_payment else None
+            payment_succeeded = payment_entry is not None and payment_entry.get("result") == "success"
+
+            reply = build_payment_refunded(tx_id, order_id)
+            updated_refund = _build_applied_entry(refund_entry, "success", reply)
+
+            if not payment_succeeded:
+                pipe.multi()
+                pipe.set(refund_key, json.dumps(updated_refund), ex=payment_ledger.LEDGER_TTL_SECONDS)
+                pipe.execute()
+                return reply, "success"
+
+            raw_user = pipe.get(user_id)
+            if not raw_user:
+                pipe.unwatch()
+                raise RuntimeError(f"Missing user {user_id} during refund for tx={tx_id}")
+
+            user_entry = msgpack.decode(raw_user, type=UserValue)
+            updated_user = UserValue(credit=user_entry.credit + amount)
+
+            pipe.multi()
+            pipe.set(user_id, msgpack.encode(updated_user))
+            pipe.set(refund_key, json.dumps(updated_refund), ex=payment_ledger.LEDGER_TTL_SECONDS)
+            pipe.execute()
+            return reply, "success"
+
+        except redis_module.exceptions.WatchError:
+            continue
+        finally:
+            pipe.reset()

@@ -21,7 +21,11 @@ from common.kafka_client import KafkaProducerClient, KafkaConsumerClient
 from common.messages import (
     ALL_TOPICS,
     PAYMENT_COMMANDS_TOPIC,
+    PAYMENT_EVENTS_TOPIC,
 )
+
+import ledger as payment_ledger
+
 
 from transactions_modes.simple import simple_route_payment
 from transactions_modes.saga import saga_route_payment
@@ -66,9 +70,12 @@ def init_kafka(logger, db) -> None:
         ensure_topics=ALL_TOPICS,
     )
 
+    _replay_unreplied_entries()
+
     thread = threading.Thread(target=_consumer_loop, daemon=True)
     thread.start()
     logger.info("[PaymentKafka] Consumer thread started")
+
 
 
 def close_kafka() -> None:
@@ -126,3 +133,23 @@ def _route_command(msg: dict) -> None:
     elif TRANSACTION_MODE == "2pc":
         _2pc_route_payment(msg)
 
+def _replay_unreplied_entries() -> None:
+    if TRANSACTION_MODE != "saga" or _db is None or _producer is None:
+        return
+
+    entries = payment_ledger.get_unreplied_entries(_db)
+    if not entries:
+        return
+
+    _logger.info(f"[PaymentKafka] Replaying {len(entries)} unreplied payment ledger entries")
+
+    for entry in entries:
+        reply_message = entry.get("reply_message")
+        if not reply_message:
+            _logger.warning(
+                f"[PaymentKafka] Missing reply_message in ledger tx={entry.get('tx_id')} action={entry.get('action_type')}"
+            )
+            continue
+
+        _producer.publish(PAYMENT_EVENTS_TOPIC, reply_message)
+        payment_ledger.mark_replied(_db, entry["tx_id"], entry["action_type"])

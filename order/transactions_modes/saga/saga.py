@@ -129,33 +129,33 @@ def saga_route_order(
     tx_id = msg.get("tx_id")
     order_id = msg.get("order_id")
 
-    # ── Dedup: drop exact duplicate Kafka messages ─────────────────────────────
+    if not message_id or not tx_id or not order_id:
+        logger.warning(f"[Saga] malformed event: {msg}")
+        return
+
     if saga_record.is_seen(db, message_id):
-        logger.info(f"[Saga] duplicate message_id={message_id} — dropping")
+        logger.debug(f"[Saga] duplicate message_id={message_id} — dropping")
         return
-    saga_record.mark_seen(db, message_id)
 
-    # ── Stale check: drop events from old transaction attempts ─────────────────
     if saga_record.is_stale(db, order_id, tx_id):
-        logger.info(f"[Saga] stale tx_id={tx_id} for order={order_id} — dropping")
+        logger.debug(f"[Saga] stale tx_id={tx_id} for order={order_id} — dropping")
+        saga_record.mark_seen(db, message_id)
         return
 
-    # ── Load Saga record ───────────────────────────────────────────────────────
     record = saga_record.get(db, tx_id)
     if not record:
-        logger.info(f"[Saga] no record found for tx_id={tx_id} — dropping")
+        logger.warning(f"[Saga] no record found for tx_id={tx_id} — dropping")
         return
 
     state = record.get("state")
 
-    # ── Ignore events that arrive in terminal states ───────────────────────────
     if state in (SagaOrderStatus.COMPLETED, SagaOrderStatus.FAILED):
-        logger.info(
+        logger.debug(
             f"[Saga] event {msg_type} arrived in terminal state={state} — dropping"
         )
+        saga_record.mark_seen(db, message_id)
         return
 
-    # ── Dispatch ───────────────────────────────────────────────────────────────
     if msg_type == STOCK_RESERVED:
         saga_on_stock_reserved(record, msg, db, publish, logger)
     elif msg_type == STOCK_RESERVATION_FAILED:
@@ -167,7 +167,10 @@ def saga_route_order(
     elif msg_type == PAYMENT_FAILED:
         saga_on_payment_failed(record, msg, db, publish, logger)
     else:
-        logger.info(f"[Saga] unknown event type={msg_type} — dropping")
+        logger.warning(f"[Saga] unknown event type={msg_type} — dropping")
+        return
+
+    saga_record.mark_seen(db, message_id)
 
 
 # ============================================================

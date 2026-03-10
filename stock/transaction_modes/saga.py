@@ -15,7 +15,8 @@ Each handler follows the ledger pattern:
 """
 
 from collections import defaultdict
-
+import json
+import time
 import redis as redis_module
 from msgspec import msgpack
 
@@ -58,123 +59,52 @@ def _handle_reserve_stock(
     publish,
     logger,
 ) -> None:
-    
-    from app import apply_stock_delta, get_item_from_db
-
     tx_id = msg.get("tx_id")
     order_id = msg.get("order_id")
     items = msg.get("payload", {}).get("items", [])
 
-    # ── Step 1: check ledger ───────────────────────────────────────────────────
     entry = stock_ledger.get_entry(db, tx_id, RESERVE_STOCK)
 
     if entry:
         state = entry.get("local_state")
-
         if state == LedgerState.REPLIED:
-            # Already fully handled — re-emit stored reply and return.
-            logger.info(
-                f"[StockSaga] RESERVE_STOCK duplicate (replied) tx={tx_id} — re-emitting"
-            )
-            _republish(entry, tx_id, order_id, publish)
+            logger.debug(f"[StockSaga] RESERVE_STOCK duplicate (replied) tx={tx_id}")
+            _republish(entry, publish)
             return
-
         if state == LedgerState.APPLIED:
-            # Applied but reply was lost — publish stored reply and mark replied.
-            logger.info(
-                f"[StockSaga] RESERVE_STOCK duplicate (applied) tx={tx_id} — republishing reply"
-            )
-            _republish(entry, tx_id, order_id, publish)
+            logger.debug(f"[StockSaga] RESERVE_STOCK duplicate (applied) tx={tx_id}")
+            _republish(entry, publish)
             stock_ledger.mark_replied(db, tx_id, RESERVE_STOCK)
             return
 
-        # state == received: a previous attempt started but didn't finish.
-        # Fall through and reprocess — the NX guard means we won't double-create.
-
-    # ── Step 2: create ledger entry (received) ─────────────────────────────────
     if not entry:
-        stock_ledger.create_entry(
+        created = stock_ledger.create_entry(
             db=db,
             tx_id=tx_id,
             action_type=RESERVE_STOCK,
             business_snapshot={"items": items},
         )
+        if not created:
+            entry = stock_ledger.get_entry(db, tx_id, RESERVE_STOCK)
+            if not entry:
+                logger.error(f"[StockSaga] Failed to create/read RESERVE_STOCK ledger tx={tx_id}")
+                return
 
-    if not items:
-        _fail(
-            db, tx_id, order_id, RESERVE_STOCK, "No items in payload", publish, logger
+    try:
+        reply, result = _reserve_stock_atomically(
+            db=db,
+            tx_id=tx_id,
+            order_id=order_id,
+            items=items,
         )
+    except RuntimeError as exc:
+        logger.error(f"[StockSaga] RESERVE_STOCK atomic apply failed tx={tx_id}: {exc}")
         return
 
-    # ── Step 3: validate all items (all-or-nothing) ────────────────────────────
-    for item_entry in items:
-        item_id = str(item_entry.get("item_id", ""))
-        quantity = item_entry.get("quantity")
-
-        if not item_id or quantity is None:
-            _fail(
-                db,
-                tx_id,
-                order_id,
-                RESERVE_STOCK,
-                "Invalid item payload",
-                publish,
-                logger,
-            )
-            return
-
-        item = get_item_from_db(item_id)
-        if item is None:
-            _fail(
-                db,
-                tx_id,
-                order_id,
-                RESERVE_STOCK,
-                f"Item {item_id} not found",
-                publish,
-                logger,
-            )
-            return
-
-        if item.stock < int(quantity):
-            _fail(
-                db,
-                tx_id,
-                order_id,
-                RESERVE_STOCK,
-                f"Insufficient stock for item {item_id} (have {item.stock}, need {quantity})",
-                publish,
-                logger,
-            )
-            return
-
-    # ── Step 4: subtract all items ─────────────────────────────────────────────
-    for item_entry in items:
-        item_id = str(item_entry.get("item_id"))
-        quantity = int(item_entry.get("quantity"))
-        success, error, _ = apply_stock_delta(item_id, -quantity)
-        if not success:
-            # Extremely unlikely — we just validated. Treat as failure.
-            _fail(db, tx_id, order_id, RESERVE_STOCK, error, publish, logger)
-            return
-
-    # ── Step 5: mark applied ───────────────────────────────────────────────────
-    stock_ledger.mark_applied(
-        db=db,
-        tx_id=tx_id,
-        action_type=RESERVE_STOCK,
-        result="success",
-        response_event_type="STOCK_RESERVED",
-        response_payload={},
-    )
-
-    # ── Step 6: publish reply ──────────────────────────────────────────────────
-    reply = build_stock_reserved(tx_id, order_id)
     publish(STOCK_EVENTS_TOPIC, reply)
-    logger.info(f"[StockSaga] RESERVE_STOCK success tx={tx_id} order={order_id}")
-
-    # ── Step 7: mark replied ───────────────────────────────────────────────────
     stock_ledger.mark_replied(db, tx_id, RESERVE_STOCK)
+    logger.debug(f"[StockSaga] RESERVE_STOCK {result} tx={tx_id} order={order_id}")
+
 
 
 # ============================================================
@@ -188,109 +118,56 @@ def _handle_release_stock(
     publish,
     logger,
 ) -> None:
-    from app import apply_stock_delta
-
     tx_id = msg.get("tx_id")
     order_id = msg.get("order_id")
     items = msg.get("payload", {}).get("items", [])
 
-    # ── Step 1: check ledger ───────────────────────────────────────────────────
     entry = stock_ledger.get_entry(db, tx_id, RELEASE_STOCK)
 
     if entry:
         state = entry.get("local_state")
         if state == LedgerState.REPLIED:
-            logger.info(
-                f"[StockSaga] RELEASE_STOCK duplicate (replied) tx={tx_id} — re-emitting"
-            )
-            _republish(entry, tx_id, order_id, publish)
+            logger.debug(f"[StockSaga] RELEASE_STOCK duplicate (replied) tx={tx_id}")
+            _republish(entry, publish)
             return
         if state == LedgerState.APPLIED:
-            logger.info(
-                f"[StockSaga] RELEASE_STOCK duplicate (applied) tx={tx_id} — republishing"
-            )
-            _republish(entry, tx_id, order_id, publish)
+            logger.debug(f"[StockSaga] RELEASE_STOCK duplicate (applied) tx={tx_id}")
+            _republish(entry, publish)
             stock_ledger.mark_replied(db, tx_id, RELEASE_STOCK)
             return
 
-    # ── Step 2: check whether RESERVE_STOCK ever succeeded ────────────────────
-    # If stock was never reserved, compensation is a no-op — but we still reply.
-    reserve_entry = stock_ledger.get_entry(db, tx_id, RESERVE_STOCK)
-    reserve_succeeded = (
-        reserve_entry is not None and reserve_entry.get("result") == "success"
-    )
-
-    # ── Step 3: create ledger entry ───────────────────────────────────────────
     if not entry:
-        stock_ledger.create_entry(
+        created = stock_ledger.create_entry(
             db=db,
             tx_id=tx_id,
             action_type=RELEASE_STOCK,
             business_snapshot={"items": items},
         )
+        if not created:
+            entry = stock_ledger.get_entry(db, tx_id, RELEASE_STOCK)
+            if not entry:
+                logger.error(f"[StockSaga] Failed to create/read RELEASE_STOCK ledger tx={tx_id}")
+                return
 
-    # ── Step 4: restore stock only if it was actually reserved ────────────────
-    if reserve_succeeded:
-        for item_entry in items:
-            item_id = str(item_entry.get("item_id", ""))
-            quantity = int(item_entry.get("quantity", 0))
-            success, error, _ = apply_stock_delta(item_id, quantity)
-            if not success:
-                logger.error(
-                    f"[StockSaga] Failed to release stock for item {item_id}: {error}"
-                )
-    else:
-        logger.info(
-            f"[StockSaga] RELEASE_STOCK tx={tx_id} — stock was never reserved, no-op"
+    try:
+        reply, _ = _release_stock_atomically(
+            db=db,
+            tx_id=tx_id,
+            order_id=order_id,
+            items=items,
         )
+    except RuntimeError as exc:
+        logger.error(f"[StockSaga] RELEASE_STOCK atomic apply failed tx={tx_id}: {exc}")
+        return
 
-    # ── Step 5: mark applied ───────────────────────────────────────────────────
-    stock_ledger.mark_applied(
-        db=db,
-        tx_id=tx_id,
-        action_type=RELEASE_STOCK,
-        result="success",
-        response_event_type="STOCK_RELEASED",
-        response_payload={},
-    )
-
-    # ── Step 6: publish reply ──────────────────────────────────────────────────
-    reply = build_stock_released(tx_id, order_id)
-    publish(STOCK_EVENTS_TOPIC,reply)
-    logger.info(f"[StockSaga] RELEASE_STOCK done tx={tx_id} order={order_id}")
-
-    # ── Step 7: mark replied ───────────────────────────────────────────────────
+    publish(STOCK_EVENTS_TOPIC, reply)
     stock_ledger.mark_replied(db, tx_id, RELEASE_STOCK)
+    logger.debug(f"[StockSaga] RELEASE_STOCK done tx={tx_id} order={order_id}")
 
 
 # ============================================================
 # INTERNAL HELPERS
 # ============================================================
-
-
-def _fail(
-    db: redis_module.Redis,
-    tx_id: str,
-    order_id: str,
-    action_type: str,
-    reason: str,
-    publish,
-    logger,
-) -> None:
-    """Mark ledger applied (failure) and publish STOCK_RESERVATION_FAILED."""
-    stock_ledger.mark_applied(
-        db=db,
-        tx_id=tx_id,
-        action_type=action_type,
-        result="failure",
-        response_event_type="STOCK_RESERVATION_FAILED",
-        response_payload={"reason": reason},
-    )
-    reply = build_stock_reservation_failed(tx_id, order_id, reason)
-    publish(STOCK_EVENTS_TOPIC, reply)
-    logger.info(f"[StockSaga] RESERVE_STOCK failed tx={tx_id}: {reason}")
-    stock_ledger.mark_replied(db, tx_id, action_type)
-
 
 def _republish(
     entry: dict,
@@ -299,9 +176,183 @@ def _republish(
     publish,
 ) -> None:
     """Rebuild and re-publish the stored reply event from the ledger entry."""
-    from common.messages import build_message
+    reply_message = entry.get("reply_message")
+    if reply_message:
+        publish(STOCK_EVENTS_TOPIC, reply_message)
 
-    event_type = entry.get("response_event_type")
-    payload = entry.get("response_payload", {})
-    msg = build_message(tx_id, order_id, event_type, payload)
-    publish(STOCK_EVENTS_TOPIC, msg)
+def _build_applied_entry(entry: dict, result: str, reply_message: dict) -> dict:
+    updated = dict(entry)
+    updated["local_state"] = LedgerState.APPLIED
+    updated["result"] = result
+    updated["reply_message"] = reply_message
+    updated["updated_at_ms"] = int(time.time() * 1000)
+    return updated
+
+
+def _reserve_stock_atomically(
+    db: redis_module.Redis,
+    tx_id: str,
+    order_id: str,
+    items: list[dict],
+) -> tuple[dict, str]:
+    from app import StockValue
+
+    ledger_key = f"stock:ledger:{tx_id}:{RESERVE_STOCK}"
+    item_ids = sorted({str(item.get('item_id', '')) for item in items if item.get("item_id") is not None})
+
+    while True:
+        pipe = db.pipeline()
+        try:
+            pipe.watch(ledger_key, *item_ids)
+
+            raw_entry = pipe.get(ledger_key)
+            if not raw_entry:
+                pipe.unwatch()
+                raise RuntimeError(f"Missing RESERVE_STOCK ledger entry for tx={tx_id}")
+
+            entry = json.loads(raw_entry)
+            state = entry.get("local_state")
+            if state in (LedgerState.APPLIED, LedgerState.REPLIED):
+                pipe.unwatch()
+                return entry["reply_message"], entry.get("result", "failure")
+
+            if not items:
+                reply = build_stock_reservation_failed(tx_id, order_id, "No items in payload")
+                updated_entry = _build_applied_entry(entry, "failure", reply)
+
+                pipe.multi()
+                pipe.set(ledger_key, json.dumps(updated_entry), ex=stock_ledger.LEDGER_TTL_SECONDS)
+                pipe.execute()
+                return reply, "failure"
+
+            updated_items = {}
+
+            for item_entry in items:
+                item_id = str(item_entry.get("item_id", ""))
+                quantity = item_entry.get("quantity")
+
+                if not item_id or quantity is None:
+                    reply = build_stock_reservation_failed(tx_id, order_id, "Invalid item payload")
+                    updated_entry = _build_applied_entry(entry, "failure", reply)
+
+                    pipe.multi()
+                    pipe.set(ledger_key, json.dumps(updated_entry), ex=stock_ledger.LEDGER_TTL_SECONDS)
+                    pipe.execute()
+                    return reply, "failure"
+
+                raw_item = pipe.get(item_id)
+                if not raw_item:
+                    reply = build_stock_reservation_failed(tx_id, order_id, f"Item {item_id} not found")
+                    updated_entry = _build_applied_entry(entry, "failure", reply)
+
+                    pipe.multi()
+                    pipe.set(ledger_key, json.dumps(updated_entry), ex=stock_ledger.LEDGER_TTL_SECONDS)
+                    pipe.execute()
+                    return reply, "failure"
+
+                stock_entry = msgpack.decode(raw_item, type=StockValue)
+                quantity = int(quantity)
+
+                if stock_entry.stock < quantity:
+                    reply = build_stock_reservation_failed(
+                        tx_id,
+                        order_id,
+                        f"Insufficient stock for item {item_id} (have {stock_entry.stock}, need {quantity})",
+                    )
+                    updated_entry = _build_applied_entry(entry, "failure", reply)
+
+                    pipe.multi()
+                    pipe.set(ledger_key, json.dumps(updated_entry), ex=stock_ledger.LEDGER_TTL_SECONDS)
+                    pipe.execute()
+                    return reply, "failure"
+
+                updated_items[item_id] = StockValue(
+                    stock=stock_entry.stock - quantity,
+                    price=stock_entry.price,
+                )
+
+            reply = build_stock_reserved(tx_id, order_id)
+            updated_entry = _build_applied_entry(entry, "success", reply)
+
+            pipe.multi()
+            for item_id, updated_item in updated_items.items():
+                pipe.set(item_id, msgpack.encode(updated_item))
+            pipe.set(ledger_key, json.dumps(updated_entry), ex=stock_ledger.LEDGER_TTL_SECONDS)
+            pipe.execute()
+            return reply, "success"
+
+        except redis_module.exceptions.WatchError:
+            continue
+        finally:
+            pipe.reset()
+
+
+def _release_stock_atomically(
+    db: redis_module.Redis,
+    tx_id: str,
+    order_id: str,
+    items: list[dict],
+) -> tuple[dict, str]:
+    from app import StockValue
+
+    release_key = f"stock:ledger:{tx_id}:{RELEASE_STOCK}"
+    reserve_key = f"stock:ledger:{tx_id}:{RESERVE_STOCK}"
+    item_ids = sorted({str(item.get('item_id', '')) for item in items if item.get("item_id") is not None})
+
+    while True:
+        pipe = db.pipeline()
+        try:
+            pipe.watch(release_key, reserve_key, *item_ids)
+
+            raw_release = pipe.get(release_key)
+            if not raw_release:
+                pipe.unwatch()
+                raise RuntimeError(f"Missing RELEASE_STOCK ledger entry for tx={tx_id}")
+
+            release_entry = json.loads(raw_release)
+            release_state = release_entry.get("local_state")
+            if release_state in (LedgerState.APPLIED, LedgerState.REPLIED):
+                pipe.unwatch()
+                return release_entry["reply_message"], release_entry.get("result", "success")
+
+            raw_reserve = pipe.get(reserve_key)
+            reserve_entry = json.loads(raw_reserve) if raw_reserve else None
+            reserve_succeeded = reserve_entry is not None and reserve_entry.get("result") == "success"
+
+            reply = build_stock_released(tx_id, order_id)
+            updated_release = _build_applied_entry(release_entry, "success", reply)
+
+            if not reserve_succeeded:
+                pipe.multi()
+                pipe.set(release_key, json.dumps(updated_release), ex=stock_ledger.LEDGER_TTL_SECONDS)
+                pipe.execute()
+                return reply, "success"
+
+            updated_items = {}
+
+            for item_entry in items:
+                item_id = str(item_entry.get("item_id", ""))
+                quantity = int(item_entry.get("quantity", 0))
+
+                raw_item = pipe.get(item_id)
+                if not raw_item:
+                    pipe.unwatch()
+                    raise RuntimeError(f"Missing item {item_id} during RELEASE_STOCK for tx={tx_id}")
+
+                stock_entry = msgpack.decode(raw_item, type=StockValue)
+                updated_items[item_id] = StockValue(
+                    stock=stock_entry.stock + quantity,
+                    price=stock_entry.price,
+                )
+
+            pipe.multi()
+            for item_id, updated_item in updated_items.items():
+                pipe.set(item_id, msgpack.encode(updated_item))
+            pipe.set(release_key, json.dumps(updated_release), ex=stock_ledger.LEDGER_TTL_SECONDS)
+            pipe.execute()
+            return reply, "success"
+
+        except redis_module.exceptions.WatchError:
+            continue
+        finally:
+            pipe.reset()
