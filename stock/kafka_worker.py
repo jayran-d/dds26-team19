@@ -17,6 +17,8 @@ import os
 import time
 import threading
 
+import redis as redis_module
+
 from common.kafka_client import KafkaProducerClient, KafkaConsumerClient
 from common.messages import (
     ALL_TOPICS,
@@ -34,23 +36,24 @@ TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "simple")  # "simple" | "saga" 
 _producer: KafkaProducerClient | None = None
 _consumer: KafkaConsumerClient | None = None
 _logger = None
-
+_db: redis_module.Redis | None = None
 
 # ============================================================
 # INIT / TEARDOWN
 # ============================================================
 
-def init_kafka(logger) -> None:
+def init_kafka(logger, db) -> None:
     """
     Initialise Kafka clients and start the background consumer thread.
     Does nothing if USE_KAFKA=false.
     """
-    global _producer, _consumer, _logger
+    global _producer, _consumer, _logger, _db
 
     if not USE_KAFKA:
         return
 
     _logger = logger
+    _db = _db
 
     _producer = KafkaProducerClient(ensure_topics=ALL_TOPICS)
     _consumer = KafkaConsumerClient(
@@ -115,6 +118,6 @@ def _route_event(msg: dict) -> None:
     if TRANSACTION_MODE == "simple":
         simple_route_stock(_producer, _logger, msg)
     elif TRANSACTION_MODE == "saga":
-        saga_route_stock(_producer, _logger, msg)
+        saga_route_stock(msg, _db, _producer.publish, _logger)
     elif TRANSACTION_MODE == "2pc":
         _2pc_route_stock(_producer, _logger, msg)

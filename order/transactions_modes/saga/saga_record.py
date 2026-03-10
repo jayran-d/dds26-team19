@@ -31,20 +31,32 @@ from common.messages import SagaOrderStatus
 
 # ── TTLs ───────────────────────────────────────────────────────────────────────
 
-SAGA_RECORD_TTL  = 86400   # 24 hours
-SEEN_EVENT_TTL   = 86400   # 24 hours
-TIMEOUT_SECONDS  = 30      # how long to wait for a reply before recovery acts
+SAGA_RECORD_TTL = 86400  # 24 hours
+SEEN_EVENT_TTL = 86400  # 24 hours
+TIMEOUT_SECONDS = 30  # how long to wait for a reply before recovery acts
 
 
 # ── Key helpers ────────────────────────────────────────────────────────────────
 
+
 def _record_key(tx_id: str) -> str:
-    return f"saga:{tx_id}"
+    # Stores the full Saga record (state, flags, timing, etc.) for one transaction.
+    # Keyed by tx_id because one order can have multiple transaction attempts.
+    # Example: saga:tx-aaa
+    return f"saga:record:{tx_id}"
+
 
 def _seen_key(message_id: str) -> str:
+    # Tracks which Kafka message_ids have already been processed.
+    # Used to drop exact duplicate messages re-delivered by Kafka.
+    # Example: saga:seen:msg-uuid-123
     return f"saga:seen:{message_id}"
 
+
 def _active_key(order_id: str) -> str:
+    # Maps an order_id to its currently active tx_id.
+    # Used by is_stale() to detect events from old/abandoned transaction attempts.
+    # Example: saga:active:order-456  →  "tx-aaa"
     return f"saga:active:{order_id}"
 
 
@@ -52,13 +64,14 @@ def _active_key(order_id: str) -> str:
 # CREATE
 # ============================================================
 
+
 def create(
-    db:       redis_module.Redis,
-    tx_id:    str,
+    db: redis_module.Redis,
+    tx_id: str,
     order_id: str,
-    user_id:  str,
-    amount:   int,
-    items:    list,
+    user_id: str,
+    amount: int,
+    items: list,
 ) -> bool:
     """
     Create a new Saga record in state=pending.
@@ -68,31 +81,26 @@ def create(
     """
     now = int(time.time() * 1000)
     record = {
-        "tx_id":                      tx_id,
-        "order_id":                   order_id,
-        "state":                      SagaOrderStatus.PENDING,
-
+        "tx_id": tx_id,
+        "order_id": order_id,
+        "state": SagaOrderStatus.PENDING,
         # Transaction data — needed to build commands on recovery
-        "user_id":                    user_id,
-        "amount":                     amount,
-        "items":                      items,
-
+        "user_id": user_id,
+        "amount": amount,
+        "items": items,
         # What the orchestrator last did / is waiting for
-        "last_command_type":          None,
-        "awaiting_event_type":        None,
-
+        "last_command_type": None,
+        "awaiting_event_type": None,
         # Compensation flags — set to True once a step succeeds
         # so recovery knows whether to release/refund
-        "needs_stock_compensation":   False,
+        "needs_stock_compensation": False,
         "needs_payment_compensation": False,
-
         # Failure info for debugging
-        "failure_reason":             None,
-
+        "failure_reason": None,
         # Timing
-        "started_at_ms":              now,
-        "updated_at_ms":              now,
-        "timeout_at_ms":              now + TIMEOUT_SECONDS * 1000,
+        "started_at_ms": now,
+        "updated_at_ms": now,
+        "timeout_at_ms": now + TIMEOUT_SECONDS * 1000,
     }
     try:
         db.set(_record_key(tx_id), json.dumps(record), ex=SAGA_RECORD_TTL)
@@ -106,6 +114,7 @@ def create(
 # ============================================================
 # READ
 # ============================================================
+
 
 def get(db: redis_module.Redis, tx_id: str) -> dict | None:
     """Return the Saga record for tx_id, or None if not found."""
@@ -132,13 +141,9 @@ def get_all_active(db: redis_module.Redis) -> list[dict]:
     """
     terminal = {SagaOrderStatus.COMPLETED, SagaOrderStatus.FAILED}
     try:
-        keys = db.keys("saga:*")
+        keys = db.keys("saga:record:*")
         records = []
         for key in keys:
-            key_str = key.decode() if isinstance(key, bytes) else key
-            # skip seen: and active: keys
-            if not key_str.startswith("saga:") or ":" in key_str[5:]:
-                continue
             raw = db.get(key)
             if not raw:
                 continue
@@ -150,20 +155,22 @@ def get_all_active(db: redis_module.Redis) -> list[dict]:
         return []
 
 
+
 # ============================================================
 # UPDATE STATE
 # ============================================================
 
+
 def transition(
-    db:                    redis_module.Redis,
-    tx_id:                 str,
-    new_state:             str,
-    last_command_type:     str  | None = None,
-    awaiting_event_type:   str  | None = None,
-    needs_stock_comp:      bool | None = None,
-    needs_payment_comp:    bool | None = None,
-    failure_reason:        str  | None = None,
-    reset_timeout:         bool        = True,
+    db: redis_module.Redis,
+    tx_id: str,
+    new_state: str,
+    last_command_type: str | None = None,
+    awaiting_event_type: str | None = None,
+    needs_stock_comp: bool | None = None,
+    needs_payment_comp: bool | None = None,
+    failure_reason: str | None = None,
+    reset_timeout: bool = True,
 ) -> bool:
     """
     Update the Saga record state and optional fields atomically.
@@ -179,7 +186,7 @@ def transition(
             return False
         record = json.loads(raw)
 
-        record["state"]        = new_state
+        record["state"] = new_state
         record["updated_at_ms"] = int(time.time() * 1000)
 
         if last_command_type is not None:
@@ -205,6 +212,7 @@ def transition(
 # EVENT DEDUPLICATION
 # ============================================================
 
+
 def is_seen(db: redis_module.Redis, message_id: str) -> bool:
     """Return True if this message_id has already been processed."""
     try:
@@ -223,7 +231,24 @@ def mark_seen(db: redis_module.Redis, message_id: str) -> None:
 
 # ============================================================
 # STALE TX CHECK
+# Example:
+# Scenario 1 — Checkout called twice on the same order
+# POST /orders/checkout/order-123   ← first attempt
+#   → generates tx_id = "tx-aaa"
+#   → publishes RESERVE_STOCK with tx_id="tx-aaa"
+#   → order stuck in reserving_stock (maybe stock service was slow)
+
+# POST /orders/checkout/order-123   ← second attempt (client retried)
+#   → generates tx_id = "tx-bbb"
+#   → publishes RESERVE_STOCK with tx_id="tx-bbb"
+#   → active tx_id for order-123 is now "tx-bbb"
+
+# stock service finally replies with STOCK_RESERVED, tx_id="tx-aaa"
+#   → order service receives it
+#   → is_stale() checks: active tx_id for order-123 = "tx-bbb" ≠ "tx-aaa"
+#   → drop it
 # ============================================================
+
 
 def is_stale(db: redis_module.Redis, order_id: str, tx_id: str) -> bool:
     """
@@ -238,6 +263,7 @@ def is_stale(db: redis_module.Redis, order_id: str, tx_id: str) -> bool:
 # TIMEOUT CHECK
 # ============================================================
 
+
 def get_timed_out(db: redis_module.Redis) -> list[dict]:
     """
     Return all non-terminal Saga records whose timeout_at_ms has passed.
@@ -246,12 +272,9 @@ def get_timed_out(db: redis_module.Redis) -> list[dict]:
     now = int(time.time() * 1000)
     terminal = {SagaOrderStatus.COMPLETED, SagaOrderStatus.FAILED}
     try:
-        keys = db.keys("saga:*")
+        keys = db.keys("saga:record:*")
         timed_out = []
         for key in keys:
-            key_str = key.decode() if isinstance(key, bytes) else key
-            if not key_str.startswith("saga:") or ":" in key_str[5:]:
-                continue
             raw = db.get(key)
             if not raw:
                 continue

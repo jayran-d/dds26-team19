@@ -15,6 +15,7 @@ import redis as redis_module
 from common.messages import (
     PROCESS_PAYMENT,
     REFUND_PAYMENT,
+    PAYMENT_EVENTS_TOPIC,
     build_payment_success,
     build_payment_failed,
     build_payment_refunded,
@@ -110,7 +111,7 @@ def _handle_process_payment(
     )
 
     # ── Step 6: publish reply ──────────────────────────────────────────────────
-    publish(reply)
+    publish(PAYMENT_EVENTS_TOPIC, reply)
     logger.debug(f"[PaymentSaga] PROCESS_PAYMENT {result} tx={tx_id} order={order_id}")
 
     # ── Step 7: mark replied ───────────────────────────────────────────────────
@@ -191,7 +192,7 @@ def _handle_refund_payment(
 
     # ── Step 6: publish reply ──────────────────────────────────────────────────
     reply = build_payment_refunded(tx_id, order_id)
-    publish(reply)
+    publish(PAYMENT_EVENTS_TOPIC,reply)
     logger.debug(f"[PaymentSaga] REFUND_PAYMENT done tx={tx_id} order={order_id}")
 
     # ── Step 7: mark replied ───────────────────────────────────────────────────
@@ -207,4 +208,4 @@ def _republish(entry: dict, tx_id: str, order_id: str, publish) -> None:
     event_type = entry.get("response_event_type")
     payload    = entry.get("response_payload", {})
     msg = build_message(tx_id, order_id, event_type, payload)
-    publish(msg)
+    publish(PAYMENT_EVENTS_TOPIC, msg)
