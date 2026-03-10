@@ -23,9 +23,9 @@ from common.messages import (
     STOCK_COMMANDS_TOPIC,
 )
 
-from stock.transaction_modes.saga import saga_route_stock
-from stock.transaction_modes.simple import simple_route_stock
-from stock.transaction_modes.two_pc import _2pc_route_stock
+from transaction_modes.saga import saga_route_stock
+from transaction_modes.simple import simple_route_stock
+from transaction_modes.two_pc import _2pc_route_stock
 
 USE_KAFKA = os.getenv("USE_KAFKA", "false").lower() == "true"
 TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "simple")  # "simple" | "saga" | "2pc"

@@ -7,7 +7,7 @@ def _2pc_start_checkout(order_id: str, order_entry) -> None:
     pass
 
 
-def _2pc_route(msg: dict, msg_type: str) -> None:
+def _2pc_route_order(msg: dict, msg_type: str) -> None:
     pass
 
     # handlers = {

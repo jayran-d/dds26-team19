@@ -21,9 +21,9 @@ from common.messages import (
     PAYMENT_COMMANDS_TOPIC,
 )
 
-from payment.transactions_modes.simple import simple_route_payment
-from payment.transactions_modes.saga import saga_route_payment
-from payment.transactions_modes.two_pc import _2pc_route_payment
+from transactions_modes.simple import simple_route_payment
+from transactions_modes.saga import saga_route_payment
+from transactions_modes.two_pc import _2pc_route_payment
 
 USE_KAFKA = os.getenv("USE_KAFKA", "false").lower() == "true"
 TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "simple")  # "simple" | "saga" | "2pc"
