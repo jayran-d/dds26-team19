@@ -54,7 +54,7 @@ def simple_start_checkout(
     logger.debug(f"[Simple] order={order_id} tx={tx_id} RESERVE_STOCK published")
 
 
-def simple_route(
+def simple_route_order(
     producer: KafkaProducerClient,
     db: redis_module.Redis,
     logger,

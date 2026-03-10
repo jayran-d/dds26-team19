@@ -26,7 +26,7 @@ def saga_start_checkout(order_id: str, order_entry) -> None:
     # _logger.debug(f"[Saga] order={order_id} tx={tx_id} RESERVE_STOCK published")
 
 
-def saga_route(msg: dict, msg_type: str) -> None:
+def saga_route_order(msg: dict, msg_type: str) -> None:
     pass
 
     # handlers = {
