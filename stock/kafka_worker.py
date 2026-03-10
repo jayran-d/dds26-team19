@@ -117,4 +117,4 @@ def _route_event(msg: dict) -> None:
     elif TRANSACTION_MODE == "saga":
         saga_route_stock(_producer, _logger, msg)
     elif TRANSACTION_MODE == "2pc":
-        _2pc_route_stock(msg, msg_type)
+        _2pc_route_stock(_producer, _logger, msg)

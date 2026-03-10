@@ -119,4 +119,4 @@ def _route_command(msg: dict) -> None:
     elif TRANSACTION_MODE == "saga":
         saga_route_payment(_producer, _logger, msg, msg_type)
     elif TRANSACTION_MODE == "2pc":
-        _2pc_route_payment(msg)
+        _2pc_route_order(_producer, _db, _logger, msg, msg_type)
