@@ -19,9 +19,9 @@ import threading
 import time
 
 import redis as redis_module
-from transactions_modes.simple import simple_start_checkout, simple_route
-from order.transactions_modes.saga.saga import saga_start_checkout, saga_route
-from transactions_modes.two_pc import _2pc_start_checkout, _2pc_route
+from transactions_modes.simple import simple_route_order, simple_start_checkout
+from order.transactions_modes.saga.saga import saga_route_order, saga_start_checkout
+from transactions_modes.two_pc import _2pc_route_order, _2pc_start_checkout
 
 from common.kafka_client import KafkaProducerClient, KafkaConsumerClient
 from common.messages import ALL_TOPICS, STOCK_EVENTS_TOPIC, PAYMENT_EVENTS_TOPIC
@@ -142,8 +142,8 @@ def _route_event(msg: dict) -> None:
     )
 
     if TRANSACTION_MODE == "simple":
-        simple_route(_producer, _db, _logger, msg, msg_type)
+        simple_route_order(_producer, _logger, msg)
     elif TRANSACTION_MODE == "saga":
-        saga_route(_logger, msg, msg_type)
+        saga_route_order(_logger, msg)
     elif TRANSACTION_MODE == "2pc":
-        _2pc_route(msg, msg_type)
+        _2pc_route_order(msg)

@@ -28,7 +28,7 @@ from ledger import LedgerState
 # PUBLIC ROUTE
 # ============================================================
 
-def route(msg: dict, db: redis_module.Redis, publish, logger) -> None:
+def saga_route_payment(msg: dict, db: redis_module.Redis, publish, logger) -> None:
     msg_type = msg.get("type")
     if msg_type == PROCESS_PAYMENT:
         _handle_process_payment(msg, db, publish, logger)

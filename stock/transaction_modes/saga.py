@@ -36,7 +36,7 @@ from ledger import LedgerState
 # ============================================================
 
 
-def route(msg: dict, db: redis_module.Redis, publish, logger) -> None:
+def saga_route_stock(msg: dict, db: redis_module.Redis, publish, logger) -> None:
     msg_type = msg.get("type")
     if msg_type == RESERVE_STOCK:
         _handle_reserve_stock(msg, db, publish, logger)
