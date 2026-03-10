@@ -71,7 +71,7 @@ def apply_stock_delta(item_id: str, delta: int) -> tuple[bool, str | None, int |
 @app.post('/item/create/<price>')
 def create_item(price: int):
     key = str(uuid.uuid4())
-    app.logger.debug(f"Item: {key} created")
+    app.logger.info(f"Item: {key} created")
     value = msgpack.encode(StockValue(stock=0, price=int(price)))
     try:
         db.set(key, value)
@@ -115,7 +115,7 @@ def remove_stock(item_id: str, amount: int):
     success, error, updated_stock = apply_stock_delta(item_id, -int(amount))
     if not success:
         abort(400, error)
-    app.logger.debug(f"Item: {item_id} stock updated to: {updated_stock}")
+    app.logger.info(f"Item: {item_id} stock updated to: {updated_stock}")
     return Response(f"Item: {item_id} stock updated to: {updated_stock}", status=200)
 
 

@@ -44,7 +44,7 @@ def saga_route_stock(msg: dict, db: redis_module.Redis, publish, logger) -> None
     elif msg_type == RELEASE_STOCK:
         _handle_release_stock(msg, db, publish, logger)
     else:
-        logger.warning(f"[StockSaga] Unknown command type: {msg_type!r} — dropping")
+        logger.info(f"[StockSaga] Unknown command type: {msg_type!r} — dropping")
 
 
 # ============================================================
@@ -171,7 +171,7 @@ def _handle_reserve_stock(
     # ── Step 6: publish reply ──────────────────────────────────────────────────
     reply = build_stock_reserved(tx_id, order_id)
     publish(STOCK_EVENTS_TOPIC, reply)
-    logger.debug(f"[StockSaga] RESERVE_STOCK success tx={tx_id} order={order_id}")
+    logger.info(f"[StockSaga] RESERVE_STOCK success tx={tx_id} order={order_id}")
 
     # ── Step 7: mark replied ───────────────────────────────────────────────────
     stock_ledger.mark_replied(db, tx_id, RESERVE_STOCK)
@@ -200,13 +200,13 @@ def _handle_release_stock(
     if entry:
         state = entry.get("local_state")
         if state == LedgerState.REPLIED:
-            logger.debug(
+            logger.info(
                 f"[StockSaga] RELEASE_STOCK duplicate (replied) tx={tx_id} — re-emitting"
             )
             _republish(entry, tx_id, order_id, publish)
             return
         if state == LedgerState.APPLIED:
-            logger.debug(
+            logger.info(
                 f"[StockSaga] RELEASE_STOCK duplicate (applied) tx={tx_id} — republishing"
             )
             _republish(entry, tx_id, order_id, publish)
@@ -240,7 +240,7 @@ def _handle_release_stock(
                     f"[StockSaga] Failed to release stock for item {item_id}: {error}"
                 )
     else:
-        logger.debug(
+        logger.info(
             f"[StockSaga] RELEASE_STOCK tx={tx_id} — stock was never reserved, no-op"
         )
 
@@ -257,7 +257,7 @@ def _handle_release_stock(
     # ── Step 6: publish reply ──────────────────────────────────────────────────
     reply = build_stock_released(tx_id, order_id)
     publish(STOCK_EVENTS_TOPIC,reply)
-    logger.debug(f"[StockSaga] RELEASE_STOCK done tx={tx_id} order={order_id}")
+    logger.info(f"[StockSaga] RELEASE_STOCK done tx={tx_id} order={order_id}")
 
     # ── Step 7: mark replied ───────────────────────────────────────────────────
     stock_ledger.mark_replied(db, tx_id, RELEASE_STOCK)
@@ -288,7 +288,7 @@ def _fail(
     )
     reply = build_stock_reservation_failed(tx_id, order_id, reason)
     publish(STOCK_EVENTS_TOPIC, reply)
-    logger.debug(f"[StockSaga] RESERVE_STOCK failed tx={tx_id}: {reason}")
+    logger.info(f"[StockSaga] RESERVE_STOCK failed tx={tx_id}: {reason}")
     stock_ledger.mark_replied(db, tx_id, action_type)
 
 

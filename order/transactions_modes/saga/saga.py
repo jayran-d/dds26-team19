@@ -131,26 +131,26 @@ def saga_route_order(
 
     # ── Dedup: drop exact duplicate Kafka messages ─────────────────────────────
     if saga_record.is_seen(db, message_id):
-        logger.debug(f"[Saga] duplicate message_id={message_id} — dropping")
+        logger.info(f"[Saga] duplicate message_id={message_id} — dropping")
         return
     saga_record.mark_seen(db, message_id)
 
     # ── Stale check: drop events from old transaction attempts ─────────────────
     if saga_record.is_stale(db, order_id, tx_id):
-        logger.debug(f"[Saga] stale tx_id={tx_id} for order={order_id} — dropping")
+        logger.info(f"[Saga] stale tx_id={tx_id} for order={order_id} — dropping")
         return
 
     # ── Load Saga record ───────────────────────────────────────────────────────
     record = saga_record.get(db, tx_id)
     if not record:
-        logger.warning(f"[Saga] no record found for tx_id={tx_id} — dropping")
+        logger.info(f"[Saga] no record found for tx_id={tx_id} — dropping")
         return
 
     state = record.get("state")
 
     # ── Ignore events that arrive in terminal states ───────────────────────────
     if state in (SagaOrderStatus.COMPLETED, SagaOrderStatus.FAILED):
-        logger.debug(
+        logger.info(
             f"[Saga] event {msg_type} arrived in terminal state={state} — dropping"
         )
         return
@@ -167,7 +167,7 @@ def saga_route_order(
     elif msg_type == PAYMENT_FAILED:
         saga_on_payment_failed(record, msg, db, publish, logger)
     else:
-        logger.warning(f"[Saga] unknown event type={msg_type} — dropping")
+        logger.info(f"[Saga] unknown event type={msg_type} — dropping")
 
 
 # ============================================================
@@ -182,7 +182,7 @@ def saga_on_stock_reserved(record, msg, db, publish, logger):
     amount = record["amount"]
 
     if record["state"] != SagaOrderStatus.RESERVING_STOCK:
-        logger.warning(
+        logger.info(
             f"[Saga] STOCK_RESERVED in unexpected state={record['state']} tx={tx_id}"
         )
         return
@@ -210,7 +210,7 @@ def saga_on_stock_reservation_failed(record, msg, db, logger):
     reason = msg.get("payload", {}).get("reason", "unknown")
 
     if record["state"] != SagaOrderStatus.RESERVING_STOCK:
-        logger.warning(
+        logger.info(
             f"[Saga] STOCK_RESERVATION_FAILED in unexpected state={record['state']} tx={tx_id}"
         )
         return
@@ -268,7 +268,7 @@ def saga_on_payment_failed(record, msg, db, publish, logger):
     reason = msg.get("payload", {}).get("reason", "unknown")
 
     if record["state"] != SagaOrderStatus.PROCESSING_PAYMENT:
-        logger.warning(
+        logger.info(
             f"[Saga] PAYMENT_FAILED in unexpected state={record['state']} tx={tx_id}"
         )
         return
@@ -296,7 +296,7 @@ def saga_on_stock_released(record, msg, db, logger):
     order_id = record["order_id"]
 
     if record["state"] != SagaOrderStatus.COMPENSATING:
-        logger.warning(
+        logger.info(
             f"[Saga] STOCK_RELEASED in unexpected state={record['state']} tx={tx_id}"
         )
         return
@@ -374,7 +374,7 @@ def check_timeouts(db: redis_module.Redis, publish, logger) -> None:
         tx_id = record["tx_id"]
         order_id = record["order_id"]
         state = record["state"]
-        logger.warning(
+        logger.info(
             f"[Saga] timeout detected tx={tx_id} order={order_id} state={state}"
         )
 

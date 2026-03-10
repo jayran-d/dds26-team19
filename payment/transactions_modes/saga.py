@@ -36,7 +36,7 @@ def saga_route_payment(msg: dict, db: redis_module.Redis, publish, logger) -> No
     elif msg_type == REFUND_PAYMENT:
         _handle_refund_payment(msg, db, publish, logger)
     else:
-        logger.warning(f"[PaymentSaga] Unknown command type: {msg_type!r} — dropping")
+        logger.info(f"[PaymentSaga] Unknown command type: {msg_type!r} — dropping")
 
 
 # ============================================================
@@ -63,11 +63,11 @@ def _handle_process_payment(
     if entry:
         state = entry.get("local_state")
         if state == LedgerState.REPLIED:
-            logger.debug(f"[PaymentSaga] PROCESS_PAYMENT duplicate (replied) tx={tx_id} — re-emitting")
+            logger.info(f"[PaymentSaga] PROCESS_PAYMENT duplicate (replied) tx={tx_id} — re-emitting")
             _republish(entry, tx_id, order_id, publish)
             return
         if state == LedgerState.APPLIED:
-            logger.debug(f"[PaymentSaga] PROCESS_PAYMENT duplicate (applied) tx={tx_id} — republishing")
+            logger.info(f"[PaymentSaga] PROCESS_PAYMENT duplicate (applied) tx={tx_id} — republishing")
             _republish(entry, tx_id, order_id, publish)
             payment_ledger.mark_replied(db, tx_id, PROCESS_PAYMENT)
             return
@@ -112,7 +112,7 @@ def _handle_process_payment(
 
     # ── Step 6: publish reply ──────────────────────────────────────────────────
     publish(PAYMENT_EVENTS_TOPIC, reply)
-    logger.debug(f"[PaymentSaga] PROCESS_PAYMENT {result} tx={tx_id} order={order_id}")
+    logger.info(f"[PaymentSaga] PROCESS_PAYMENT {result} tx={tx_id} order={order_id}")
 
     # ── Step 7: mark replied ───────────────────────────────────────────────────
     payment_ledger.mark_replied(db, tx_id, PROCESS_PAYMENT)
@@ -142,11 +142,11 @@ def _handle_refund_payment(
     if entry:
         state = entry.get("local_state")
         if state == LedgerState.REPLIED:
-            logger.debug(f"[PaymentSaga] REFUND_PAYMENT duplicate (replied) tx={tx_id} — re-emitting")
+            logger.info(f"[PaymentSaga] REFUND_PAYMENT duplicate (replied) tx={tx_id} — re-emitting")
             _republish(entry, tx_id, order_id, publish)
             return
         if state == LedgerState.APPLIED:
-            logger.debug(f"[PaymentSaga] REFUND_PAYMENT duplicate (applied) tx={tx_id} — republishing")
+            logger.info(f"[PaymentSaga] REFUND_PAYMENT duplicate (applied) tx={tx_id} — republishing")
             _republish(entry, tx_id, order_id, publish)
             payment_ledger.mark_replied(db, tx_id, REFUND_PAYMENT)
             return
@@ -178,7 +178,7 @@ def _handle_refund_payment(
         if not success:
             logger.error(f"[PaymentSaga] Refund failed for user {user_id}: {error}")
     else:
-        logger.debug(f"[PaymentSaga] REFUND_PAYMENT tx={tx_id} — payment never succeeded, no-op")
+        logger.info(f"[PaymentSaga] REFUND_PAYMENT tx={tx_id} — payment never succeeded, no-op")
 
     # ── Step 5: mark applied ───────────────────────────────────────────────────
     payment_ledger.mark_applied(
@@ -193,7 +193,7 @@ def _handle_refund_payment(
     # ── Step 6: publish reply ──────────────────────────────────────────────────
     reply = build_payment_refunded(tx_id, order_id)
     publish(PAYMENT_EVENTS_TOPIC,reply)
-    logger.debug(f"[PaymentSaga] REFUND_PAYMENT done tx={tx_id} order={order_id}")
+    logger.info(f"[PaymentSaga] REFUND_PAYMENT done tx={tx_id} order={order_id}")
 
     # ── Step 7: mark replied ───────────────────────────────────────────────────
     payment_ledger.mark_replied(db, tx_id, REFUND_PAYMENT)
