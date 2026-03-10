@@ -62,7 +62,9 @@ def init_kafka(logger, db) -> None:
     _consumer = KafkaConsumerClient(
         topics=[STOCK_COMMANDS_TOPIC],
         group_id="stock-service",
-        auto_commit=True,
+        # Disable Kafka auto-acknowledgement.
+        # We only want to commit after local Saga handling is durable.
+        auto_commit=False,
         auto_offset_reset="earliest",
         ensure_topics=ALL_TOPICS,
     )
@@ -106,7 +108,12 @@ def _consumer_loop() -> None:
 
             _route_event(result.msg)
 
+            # Commit only after the stock Saga handler finished.
+            # At that point the ledger/business state must already be durable.
+            _consumer.commit()
+
         except Exception as exc:
+            # No commit on failure: let Kafka redeliver.
             _logger.info(f"[StockKafka] Consumer loop crashed: {exc}")
             time.sleep(1)
 

@@ -65,7 +65,9 @@ def init_kafka(logger, db) -> None:
     _consumer = KafkaConsumerClient(
         topics=[PAYMENT_COMMANDS_TOPIC],
         group_id="payment-service",
-        auto_commit=True,
+        # Manual commit is required for Saga durability:
+        # Kafka must not acknowledge a command before we have durably handled it.
+        auto_commit=False,
         auto_offset_reset="earliest",
         ensure_topics=ALL_TOPICS,
     )
@@ -114,7 +116,15 @@ def _consumer_loop() -> None:
 
             _route_command(result.msg)
 
+            # Only acknowledge Kafka after the handler returned successfully.
+            # In Saga mode this means the participant has already durably written
+            # its ledger/business state, so a crash after this point is recoverable.
+            _consumer.commit()
+
         except Exception as exc:
+            # Intentionally do NOT commit here.
+            # If we crashed before durable handling completed, we want Kafka
+            # to redeliver the command after restart.
             _logger.info(f"[PaymentKafka] Consumer loop crashed: {exc}")
             time.sleep(1)
 

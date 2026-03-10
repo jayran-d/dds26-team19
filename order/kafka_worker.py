@@ -68,7 +68,9 @@ def init_kafka(logger, db: redis_module.Redis) -> None:
     _consumer = KafkaConsumerClient(
         topics=[STOCK_EVENTS_TOPIC, PAYMENT_EVENTS_TOPIC],
         group_id="order-service",
-        auto_commit=True,
+        # The order service also needs manual commits.
+        # It must not ack an event before the Saga record is durably advanced.
+        auto_commit=False,
         auto_offset_reset="earliest",
         ensure_topics=ALL_TOPICS,
     )
@@ -143,7 +145,17 @@ def _event_loop() -> None:
 
             _route_event(result.msg)
 
+            # Commit only after Saga event handling returned successfully.
+            # By this point the order service should already have:
+            # 1. durably updated the Saga record,
+            # 2. published the next command if needed,
+            # 3. marked the incoming event as seen.
+            _consumer.commit()
+
         except Exception as exc:
+            # No commit here.
+            # If we fail before the Saga state is durably advanced, Kafka should
+            # redeliver the event and let the orchestrator try again.
             _logger.error(f"[OrderKafka] Event loop crashed: {exc}")
             time.sleep(1)
 
