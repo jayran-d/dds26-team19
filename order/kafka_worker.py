@@ -106,23 +106,30 @@ def is_available() -> bool:
 # ============================================================
 
 
-def start_checkout(order_id: str, order_entry) -> None:
+def start_checkout(order_id: str, order_entry):
     """
     Kick off a checkout transaction.
-    Delegates to simple, saga, or 2PC based on TRANSACTION_MODE.
-    Raises RuntimeError if Kafka is unavailable.
+
+    Returns a small result dict so the HTTP route can distinguish:
+    - new checkout started
+    - checkout already in progress
+    - error
     """
     if not _available or _producer is None:
         raise RuntimeError("Kafka is not available")
 
     if TRANSACTION_MODE == "simple":
         simple_start_checkout(_producer, _db, _logger, order_id, order_entry)
-    elif TRANSACTION_MODE == "saga":
-        saga_start_checkout(_producer.publish, _db, _logger, order_id, order_entry)
-    elif TRANSACTION_MODE == "2pc":
+        return {"started": True, "reason": "started"}
+
+    if TRANSACTION_MODE == "saga":
+        return saga_start_checkout(_producer.publish, _db, _logger, order_id, order_entry)
+
+    if TRANSACTION_MODE == "2pc":
         _2pc_start_checkout(_producer, _db, _logger, order_id, order_entry)
-    else:
-        raise RuntimeError(f"Unknown TRANSACTION_MODE: {TRANSACTION_MODE}")
+        return {"started": True, "reason": "started"}
+
+    raise RuntimeError(f"Unknown TRANSACTION_MODE: {TRANSACTION_MODE}")
 
 
 # ============================================================
