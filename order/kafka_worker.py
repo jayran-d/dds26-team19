@@ -102,7 +102,7 @@ def start_checkout(order_id: str, order_entry) -> None:
     if TRANSACTION_MODE == "simple":
         simple_start_checkout(_producer, _db, _logger, order_id, order_entry)
     elif TRANSACTION_MODE == "saga":
-        saga_start_checkout(_producer, _db, _logger, order_id, order_entry)
+        saga_start_checkout(_producer.publish, _db, _logger, order_id, order_entry)
     elif TRANSACTION_MODE == "2pc":
         _2pc_start_checkout(_producer, _db, _logger, order_id, order_entry)
     else:
@@ -145,6 +145,6 @@ def _route_event(msg: dict) -> None:
     if TRANSACTION_MODE == "simple":
         simple_route_order(_producer, _db, _logger, msg, msg_type)
     elif TRANSACTION_MODE == "saga":
-        saga_route_order(msg, msg_type)
+        saga_route_order(msg, _db, _producer.publish, _logger)
     elif TRANSACTION_MODE == "2pc":
-        _2pc_route_order(msg, msg_type)
+        _2pc_route_order(msg)
