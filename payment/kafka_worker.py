@@ -25,8 +25,6 @@ from common.messages import (
 )
 
 import ledger as payment_ledger
-
-
 from transactions_modes.simple import simple_route_payment
 from transactions_modes.saga import saga_route_payment
 from transactions_modes.two_pc import _2pc_route_payment

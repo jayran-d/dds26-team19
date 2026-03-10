@@ -29,12 +29,21 @@ def _ensure_topics_exist(topics: list[str]):
             f.result()
         except Exception:
             pass  # topic already exists — fine
-
+        
+class KafkaPublishError(RuntimeError):
+    """Raised when a Kafka publish did not complete successfully."""
 
 class KafkaProducerClient:
     """
     Thin producer wrapper. Blocks at init until the broker is reachable.
     Optionally pre-creates topics so consumers never hit UNKNOWN_TOPIC_OR_PART.
+
+    Important distinction:
+    - send(...)    = low-level async enqueue
+    - publish(...) = synchronous "wait until delivery success/failure is known"
+
+    Saga code should use publish(...), because correctness depends on knowing
+    whether the command/event really left the service or not.
     """
 
     def __init__(self, ensure_topics: list[str] | None = None):
@@ -66,7 +75,11 @@ class KafkaProducerClient:
                 time.sleep(2)
 
     def send(self, topic: str, message: dict, key: str | None = None):
-        """Produce a JSON message. Kafka decides the partition automatically."""
+        """
+        Low-level async produce.
+        This only queues the message locally in librdkafka and does NOT guarantee
+        broker delivery yet. Keep this as a utility, but Saga paths should prefer publish().
+        """
         self._producer.produce(
             topic=topic,
             value=json.dumps(message).encode("utf-8"),
@@ -75,16 +88,83 @@ class KafkaProducerClient:
         )
         self._producer.poll(0)
 
-    def flush(self, timeout: float = 5.0):
-        self._producer.flush(timeout)
+    def flush(self, timeout: float = 5.0) -> int:
+        """
+        Flush pending producer work.
 
-    def publish(self, topic: str, message: dict) -> None:
-        self.send(topic, message)
-        self.flush()
+        Returns:
+            number of messages still waiting after the timeout.
+            0 means everything currently queued got processed.
+        """
+        return self._producer.flush(timeout)
+
+    def publish(
+        self,
+        topic: str,
+        message: dict,
+        key: str | None = None,
+        timeout: float = 5.0,
+    ) -> None:
+        """
+        Synchronous publish used by the Saga code.
+
+        Why the callback + flush pattern exists:
+        - confluent-kafka is asynchronous internally
+        - produce(...) only queues the message locally
+        - the delivery callback runs later when poll()/flush() drives the client
+        - callback exceptions do not naturally bubble into this function call
+
+        So we store the callback outcome in a small mutable holder, then flush,
+        then inspect that holder and raise if delivery failed or timed out.
+        """
+        delivery = {
+            "done": False,
+            "error": None,
+        }
+
+        def on_delivery(err, msg):
+            delivery["done"] = True
+            delivery["error"] = err
+
+        try:
+            self._producer.produce(
+                topic=topic,
+                value=json.dumps(message).encode("utf-8"),
+                key=key.encode("utf-8") if key else None,
+                on_delivery=on_delivery,
+            )
+        except Exception as exc:
+            raise KafkaPublishError(
+                f"Failed to enqueue Kafka message for topic={topic}: {exc}"
+            ) from exc
+
+        # Let librdkafka start processing immediately.
+        self._producer.poll(0)
+
+        # flush() drives delivery callbacks and waits up to timeout seconds.
+        # It returns how many messages are still pending afterwards.
+        remaining = self._producer.flush(timeout)
+
+        if remaining > 0:
+            raise KafkaPublishError(
+                f"Timed out waiting for Kafka delivery on topic={topic}; "
+                f"{remaining} message(s) still pending"
+            )
+
+        if delivery["error"] is not None:
+            raise KafkaPublishError(
+                f"Kafka delivery failed for topic={topic}: {delivery['error']}"
+            )
+
+        if not delivery["done"]:
+            raise KafkaPublishError(
+                f"Kafka publish finished without a delivery callback for topic={topic}"
+            )
 
     def close(self):
         self._producer.flush()
         self._producer = None
+
 
 
 class PollResult:
