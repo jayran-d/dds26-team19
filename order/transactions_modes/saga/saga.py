@@ -33,7 +33,7 @@ import uuid
 import redis as redis_module
 from msgspec import msgpack
 
-import saga_record
+from . import saga_record
 from common.messages import (
     SagaOrderStatus,
     STOCK_RESERVED,

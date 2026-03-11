@@ -22,7 +22,7 @@ import redis as redis_module
 
 from transactions_modes.simple import simple_route_order, simple_start_checkout
 from transactions_modes.saga.saga import saga_route_order, saga_start_checkout
-from transactions_modes.two_pc import _2pc_route_order, _2pc_start_checkout
+from transactions_modes.two_pc import _2pc_route_order, _2pc_start_checkout, recover_incomplete_2pc
 
 from common.kafka_client import KafkaProducerClient, KafkaConsumerClient
 from common.messages import ALL_TOPICS, STOCK_EVENTS_TOPIC, PAYMENT_EVENTS_TOPIC
@@ -66,6 +66,9 @@ def init_kafka(logger, db: redis_module.Redis) -> None:
     )
 
     _available = True
+
+    if TRANSACTION_MODE == "2pc":
+        recover_incomplete_2pc(_db, _producer, _logger)
 
     thread = threading.Thread(target=_event_loop, daemon=True)
     thread.start()

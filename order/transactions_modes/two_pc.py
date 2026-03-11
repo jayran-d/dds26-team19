@@ -1,39 +1,157 @@
 import uuid
 import redis as redis_module
-from common.messages import (
-    PAYMENT_ABORTED,
-    PAYMENT_COMMITTED,
-    PAYMENT_PREPARE_FAILED,
-    PAYMENT_PREPARED,
-    STOCK_ABORTED,
-    STOCK_COMMANDS_TOPIC,
-    PAYMENT_COMMANDS_TOPIC,
-    STOCK_COMMITTED,
-    STOCK_PREPARE_FAILED,
-    STOCK_PREPARED,
-    # Saga stock events
-    STOCK_RESERVED,
-    STOCK_RESERVATION_FAILED,
-    STOCK_RELEASED,
-    # Saga payment events
-    PAYMENT_SUCCESS,
-    PAYMENT_FAILED,
-    # 2PC
-    PREPARE_PAYMENT,
-    PREPARE_STOCK,
-    # builders
-    build_reserve_stock,
-    build_prepare_stock,
-    build_prepare_payment,
-    build_process_payment,
-)
+from common.messages import *
 
-from redis_helpers import get_order, set_status
+from redis_helpers import get_order, set_status, _2pc_key
 from common.kafka_client import KafkaProducerClient
 
-# ============================================================
-# 2PC
-# ============================================================
+# Internal Redis Order Hash looks like:
+#     db.hset(_2pc_key(order_id), mapping={
+#         "stock_state": STOCK_UNKNOWN,
+#         "payment_state": PAYMENT_UNKNOWN,
+#         "decision": DECISION_NONE,
+#         "stock_commit_state": STOCK_NOT_COMMITTED,
+#         "payment_commit_state": PAYMENT_NOT_COMMITTED,
+#     })
+
+# This checks whether a COMMIT or ABORT should be sent. In case one of the participant's hasn't answered, it does nothing.
+def _evaluate_2pc(producer, db, logger, order_id):
+
+    state = db.hgetall(_2pc_key(order_id))
+
+    stock_state = state[b"stock_state"].decode()
+    payment_state = state[b"payment_state"].decode()
+    decision = state[b"decision"].decode()
+
+    if decision != DECISION_NONE:
+        return
+
+    # Abort rule
+
+    if stock_state == STOCK_FAILED or payment_state == PAYMENT_FAILED:
+
+        logger.info(f"[Order2PC] order={order_id} ABORT")
+
+        producer.publish(STOCK_COMMANDS_TOPIC, build_abort_stock(db.get(f"order:{order_id}:tx_id").decode(), order_id))
+        producer.publish(PAYMENT_COMMANDS_TOPIC, build_abort_payment(db.get(f"order:{order_id}:tx_id").decode(), order_id))
+        db.hset(_2pc_key(order_id), "decision", DECISION_ABORT)
+        set_status(logger, db, order_id, "FAILED")
+        return
+
+    # COMMIT RULE
+    if stock_state == STOCK_READY and payment_state == PAYMENT_READY:
+        logger.info(f"[Order2PC] order={order_id} COMMIT")
+        db.hset(_2pc_key(order_id), "decision", DECISION_COMMIT)
+        tx_id = db.get(f"order:{order_id}:tx_id").decode()
+        producer.publish(STOCK_COMMANDS_TOPIC, build_commit_stock(tx_id, order_id))
+        producer.publish(PAYMENT_COMMANDS_TOPIC, build_commit_payment(tx_id, order_id))
+
+def handle_2pc_event(producer, db, logger, msg, participant_key: str, participant_ready_value: str, failure_value: str):
+    """
+    Generic handler for a 2PC participant event (prepared or failed).
+
+    Args:
+        producer: Kafka producer
+        db: Redis client
+        logger: logger
+        msg: incoming Kafka message
+        participant_key: Redis hash key for this participant (e.g., 'stock_state', 'payment_state')
+        participant_ready_value: value to set if participant is ready (e.g., STOCK_READY)
+        failure_value: value to set if participant failed (e.g., STOCK_FAILED)
+    """
+    order_id = msg.get("order_id")
+    tx_id = msg.get("tx_id")
+    if not order_id or not tx_id:
+        logger.info(f"[Order2PC] Missing order_id or tx_id in message: {msg}")
+        return
+
+    event_type = msg.get("type")
+    # Determine state based on event type
+    if event_type in (STOCK_PREPARED, PAYMENT_PREPARED):
+        db.hset(_2pc_key(order_id), participant_key, participant_ready_value)
+        logger.info(f"[Order2PC] order={order_id} {event_type}. READY")
+    elif event_type in (STOCK_PREPARE_FAILED, PAYMENT_PREPARE_FAILED):
+        db.hset(_2pc_key(order_id), participant_key, failure_value)
+        logger.info(f"[Order2PC] order={order_id} {event_type}. FAILED")
+    else:
+        logger.info(f"[Order2PC] Unknown event type: {event_type} for order={order_id}")
+        return
+
+    _evaluate_2pc(producer, db, logger, order_id)
+
+def handle_2pc_commit_confirmation(db, logger, msg, participant_commit_key, commit_value):
+    order_id = msg.get("order_id")
+    if not order_id:
+        logger.warning(f"[Order2PC] Missing order_id in commit message: {msg}")
+        return
+
+    db.hset(_2pc_key(order_id), participant_commit_key, commit_value)
+    logger.info(f"[Order2PC] order={order_id} {msg.get('type')}")
+    # Check if both participants committed to mark COMPLETED
+    state = db.hgetall(_2pc_key(order_id))
+    if (state[b"stock_commit_state"].decode() == STOCK_COMMIT_CONFIRMED and
+        state[b"payment_commit_state"].decode() == PAYMENT_COMMIT_CONFIRMED):
+        set_status(logger, db, order_id, "COMPLETED")
+
+# def recover_incomplete_2pc(db, producer, logger):
+#     """ OLD!!!!!!!
+#     Scan Redis for in-progress 2PC transactions and resume them. 
+#     """
+#     # Can change this to maybe only check for orders with DECISION_NONE, and only reevaluate these
+#     # instead of all orders. We would have to change the PUBLISH msg to come first, and after set the decision in redis
+#     for key in db.scan_iter("order:*:2pcstate"):
+#         state = db.hgetall(key)
+#         order_id = key.decode().split(":")[1]  # order:{order_id}:2pcstate
+#         decision = state.get(b"decision", b"DECISION_NONE").decode()
+#         tx_id = db.get(f"order:{order_id}:tx_id")
+#         if not tx_id:
+#             logger.warning(f"[Order2PC-Recover] order={order_id} missing tx_id, skipping")
+#             continue
+#         tx_id = tx_id.decode()
+#         stock_state = state.get(b"stock_state", b"STOCK_UNKNOWN").decode()
+#         payment_state = state.get(b"payment_state", b"PAYMENT_UNKNOWN").decode()
+
+#         if decision == DECISION_NONE:
+#             logger.info(f"[Order2PC-Recover] order={order_id} in-doubt, evaluating...")
+#             _evaluate_2pc(producer, db, logger, order_id)
+
+#         elif decision == DECISION_COMMIT:
+#             logger.info(f"[Order2PC-Recover] order={order_id} DECISION_COMMIT, resending commits")
+#             # resend commit messages using builders
+#             producer.publish(STOCK_COMMANDS_TOPIC, build_commit_stock(tx_id, order_id))
+#             producer.publish(PAYMENT_COMMANDS_TOPIC, build_commit_payment(tx_id, order_id))
+
+#         elif decision == DECISION_ABORT:
+#             logger.info(f"[Order2PC-Recover] order={order_id} DECISION_ABORT, resending aborts")
+#             # resend abort messages using builders
+#             producer.publish(STOCK_COMMANDS_TOPIC, build_abort_stock(tx_id, order_id))
+#             producer.publish(PAYMENT_COMMANDS_TOPIC, build_abort_payment(tx_id, order_id))
+#     return
+
+def recover_incomplete_2pc(db, producer, logger):
+    """
+    Scan Redis only for 2PC transactions with decision=DECISION_NONE and resume them.
+    This avoids scanning all orders, improving performance.
+    """
+
+    for key in db.scan_iter("order:*:2pcstate"):
+        # Check decision directly
+        decision_bytes = db.hget(key, "decision")
+        decision = decision_bytes.decode() if decision_bytes else DECISION_NONE
+
+        if decision != DECISION_NONE:
+            # skip all transactions already decided
+            continue
+
+        order_id = key.decode().split(":")[1]  # order:{order_id}:2pcstate
+        tx_id_bytes = db.get(f"order:{order_id}:tx_id")
+        if not tx_id_bytes:
+            logger.info(f"[Order2PC-Recover] order={order_id} missing tx_id, skipping")
+            continue
+        tx_id = tx_id_bytes.decode()
+
+        logger.info(f"[Order2PC-Recover] order={order_id} in-doubt, evaluating...")
+        _evaluate_2pc(producer, db, logger, order_id)
 
 def _2pc_start_checkout( 
     producer: KafkaProducerClient,
@@ -56,6 +174,14 @@ def _2pc_start_checkout(
     tx_id = str(uuid.uuid4())
     db.set(f"order:{order_id}:tx_id", tx_id)
 
+    db.hset(_2pc_key(order_id), mapping={
+        "stock_state": STOCK_UNKNOWN,
+        "payment_state": PAYMENT_UNKNOWN,
+        "decision": DECISION_NONE,
+        "stock_commit_state": STOCK_NOT_COMMITTED,
+        "payment_commit_state": PAYMENT_NOT_COMMITTED,
+    })
+
     prepare_stock_msg = build_prepare_stock(tx_id=tx_id, order_id=order_id, items=items)
     producer.publish(STOCK_COMMANDS_TOPIC, prepare_stock_msg)
     logger.info(f"[Order2PC] order={order_id} tx={tx_id} PREPARE_STOCK published")
@@ -77,7 +203,6 @@ def _2pc_route_order(producer: KafkaProducerClient,
     logger,
     msg: dict,
     msg_type: str,) -> None:
-    pass
 
     handlers = {
         STOCK_PREPARED:        _2pc_on_stock_prepared,
@@ -96,41 +221,83 @@ def _2pc_route_order(producer: KafkaProducerClient,
         logger.info(f"[Route-Order2PC] Unknown event type: {msg_type!r} — dropping")
 
 
-def _2pc_on_stock_prepared(msg: dict) -> None:
-    # TODO: if payment also prepared → send COMMIT to both; else wait
-    pass
+# ── 2PC Event Handlers ────────────────
+
+# -------- Stock --------
+def _2pc_on_stock_prepared(producer, db, logger, msg):
+    handle_2pc_event(producer, db, logger, msg, participant_key="stock_state",
+                     participant_ready_value=STOCK_READY, failure_value=STOCK_FAILED)
+
+def _2pc_on_stock_prepare_failed(producer, db, logger, msg):
+    handle_2pc_event(producer, db, logger, msg, participant_key="stock_state",
+                     participant_ready_value=STOCK_READY, failure_value=STOCK_FAILED)
+
+def _2pc_on_stock_committed(producer, db, logger, msg):
+    handle_2pc_commit_confirmation(db, logger, msg, participant_commit_key="stock_commit_state",
+                                   commit_value=STOCK_COMMIT_CONFIRMED)
+
+def _2pc_on_stock_aborted(producer, db, logger, msg):
+    handle_2pc_commit_confirmation(db, logger, msg, participant_commit_key="stock_commit_state",
+                                   commit_value=STOCK_ABORTED)
+
+# -------- Payment --------
+def _2pc_on_payment_prepared(producer, db, logger, msg):
+    handle_2pc_event(producer, db, logger, msg, participant_key="payment_state",
+                     participant_ready_value=PAYMENT_READY, failure_value=PAYMENT_FAILED)
+
+def _2pc_on_payment_prepare_failed(producer, db, logger, msg):
+    handle_2pc_event(producer, db, logger, msg, participant_key="payment_state",
+                     participant_ready_value=PAYMENT_READY, failure_value=PAYMENT_FAILED)
+
+def _2pc_on_payment_committed(producer, db, logger, msg):
+    handle_2pc_commit_confirmation(db, logger, msg, participant_commit_key="payment_commit_state",
+                                   commit_value=PAYMENT_COMMIT_CONFIRMED)
+
+def _2pc_on_payment_aborted(producer, db, logger, msg):
+    handle_2pc_commit_confirmation(db, logger, msg, participant_commit_key="payment_commit_state",
+                                   commit_value=PAYMENT_ABORTED)
+
+# def _2pc_on_stock_prepared(producer, db, logger, msg):
+#     order_id = msg.get("order_id")
+#     tx_id = msg.get("tx_id")
+#     if not order_id or not tx_id:
+#         logger.warning(f"[Order2PC] Missing order_id or tx_id in message: {msg}")
+#         return
+
+#     db.hset(_2pc_key(order_id), "stock_state", STOCK_READY)
+#     logger.info(f"[Order2PC] order={order_id} {STOCK_PREPARED}")
+#     _evaluate_2pc(producer, db, logger, order_id)
+
+# def _2pc_on_stock_prepare_failed(msg: dict) -> None:
+#     # TODO: send ABORT_STOCK, set status = FAILED
+#     pass
 
 
-def _2pc_on_stock_prepare_failed(msg: dict) -> None:
-    # TODO: send ABORT_STOCK, set status = FAILED
-    pass
+# def _2pc_on_stock_committed(msg: dict) -> None:
+#     # TODO: if payment also committed → set status = COMPLETED
+#     pass
 
 
-def _2pc_on_stock_committed(msg: dict) -> None:
-    # TODO: if payment also committed → set status = COMPLETED
-    pass
+# def _2pc_on_stock_aborted(msg: dict) -> None:
+#     # TODO: set status = FAILED
+#     pass
 
 
-def _2pc_on_stock_aborted(msg: dict) -> None:
-    # TODO: set status = FAILED
-    pass
+# def _2pc_on_payment_prepared(msg: dict) -> None:
+#     # TODO: if stock also prepared → send COMMIT to both; else wait
+#     pass
 
 
-def _2pc_on_payment_prepared(msg: dict) -> None:
-    # TODO: if stock also prepared → send COMMIT to both; else wait
-    pass
+# def _2pc_on_payment_prepare_failed(msg: dict) -> None:
+#     # TODO: send ABORT_PAYMENT + ABORT_STOCK if needed, set status = FAILED
+#     pass
 
 
-def _2pc_on_payment_prepare_failed(msg: dict) -> None:
-    # TODO: send ABORT_PAYMENT + ABORT_STOCK if needed, set status = FAILED
-    pass
+# def _2pc_on_payment_committed(msg: dict) -> None:
+#     # TODO: if stock also committed → set status = COMPLETED
+#     pass
 
 
-def _2pc_on_payment_committed(msg: dict) -> None:
-    # TODO: if stock also committed → set status = COMPLETED
-    pass
-
-
-def _2pc_on_payment_aborted(msg: dict) -> None:
-    # TODO: set status = FAILED
-    pass
+# def _2pc_on_payment_aborted(msg: dict) -> None:
+#     # TODO: set status = FAILED
+#     pass
