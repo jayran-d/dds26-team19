@@ -78,6 +78,9 @@ def init_kafka(logger, db: redis_module.Redis) -> None:
     _available = True
 
     if TRANSACTION_MODE == "saga":
+        # Recover before the event loop starts consuming new events. That keeps
+        # startup deterministic: first restore in-flight intent, then process
+        # whatever Kafka redelivers afterwards.
         saga_recover(_db, _producer.publish, _logger)
 
         timeout_thread = threading.Thread(target=_timeout_loop, daemon=True)
@@ -169,6 +172,8 @@ def _event_loop() -> None:
 def _timeout_loop() -> None:
     while _available and TRANSACTION_MODE == "saga":
         try:
+            # Timeouts are handled centrally by the orchestrator. Participants
+            # stay simpler: they only need durable local handling + replay.
             saga_check_timeouts(_db, _producer.publish, _logger)
         except Exception as exc:
             _logger.error(f"[OrderKafka] Timeout loop crashed: {exc}")

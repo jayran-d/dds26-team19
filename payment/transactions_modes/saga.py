@@ -102,6 +102,8 @@ def _handle_process_payment(
         return
 
     publish(PAYMENT_EVENTS_TOPIC, reply)
+    # Only mark replied after the publish returned successfully. If publish
+    # fails here, startup replay still sees APPLIED and can re-emit the event.
     payment_ledger.mark_replied(db, tx_id, PROCESS_PAYMENT)
     logger.info(f"[PaymentSaga] PROCESS_PAYMENT {result} tx={tx_id} order={order_id}")
 
@@ -166,6 +168,8 @@ def _handle_refund_payment(
         return
 
     publish(PAYMENT_EVENTS_TOPIC, reply)
+    # Same rule as PROCESS_PAYMENT: a missing REPLIED marker after restart means
+    # "business effect committed, reply still needs to be sent".
     payment_ledger.mark_replied(db, tx_id, REFUND_PAYMENT)
     logger.info(f"[PaymentSaga] REFUND_PAYMENT done tx={tx_id} order={order_id}")
 
@@ -204,6 +208,9 @@ def _apply_process_payment_atomically(
     while True:
         pipe = db.pipeline()
         try:
+            # WATCH gives us optimistic concurrency control over both the
+            # business key and the ledger key. If another worker changes one of
+            # them before EXEC, Redis raises WatchError and we retry safely.
             pipe.watch(ledger_key, user_id)
 
             raw_entry = pipe.get(ledger_key)
@@ -247,6 +254,9 @@ def _apply_process_payment_atomically(
             reply = build_payment_success(tx_id, order_id)
             updated_entry = _build_applied_entry(entry, "success", reply)
 
+            # MULTI/EXEC makes the local charge and the ledger "applied" state
+            # one atomic Redis step. After EXEC, recovery can trust that both
+            # either happened together or not at all.
             pipe.multi()
             pipe.set(user_id, msgpack.encode(updated_user))
             pipe.set(ledger_key, json.dumps(updated_entry), ex=payment_ledger.LEDGER_TTL_SECONDS)
@@ -274,6 +284,8 @@ def _apply_refund_payment_atomically(
     while True:
         pipe = db.pipeline()
         try:
+            # Refund logic depends on both the original payment outcome and the
+            # current user balance, so all three keys participate in the watch.
             pipe.watch(refund_key, payment_key, user_id)
 
             raw_refund = pipe.get(refund_key)
@@ -295,6 +307,9 @@ def _apply_refund_payment_atomically(
             updated_refund = _build_applied_entry(refund_entry, "success", reply)
 
             if not payment_succeeded:
+                # Compensation is idempotent: if the original charge never
+                # succeeded, the refund becomes a no-op but is still recorded
+                # as applied/replied so future retries do not loop forever.
                 pipe.multi()
                 pipe.set(refund_key, json.dumps(updated_refund), ex=payment_ledger.LEDGER_TTL_SECONDS)
                 pipe.execute()
@@ -308,6 +323,8 @@ def _apply_refund_payment_atomically(
             user_entry = msgpack.decode(raw_user, type=UserValue)
             updated_user = UserValue(credit=user_entry.credit + amount)
 
+            # The actual refund and the refund-ledger transition must commit
+            # together for restart recovery to remain deterministic.
             pipe.multi()
             pipe.set(user_id, msgpack.encode(updated_user))
             pipe.set(refund_key, json.dumps(updated_refund), ex=payment_ledger.LEDGER_TTL_SECONDS)

@@ -108,7 +108,8 @@ def saga_start_checkout(
         logger.error(f"[Saga] failed to create Saga record for order={order_id}")
         return {"started": False, "reason": "error"}
 
-    # This is just a convenience pointer for observability / debugging.
+    # This pointer is redundant with the full saga record, but very convenient
+    # for tests, debugging, and tracing one order through the system.
     db.set(f"order:{order_id}:tx_id", tx_id)
     _set_status(db, order_id, SagaOrderStatus.RESERVING_STOCK)
 
@@ -150,6 +151,8 @@ def saga_route_order(
         return
 
     if saga_record.is_stale(db, order_id, tx_id):
+        # A later checkout attempt for the same order may already own a newer
+        # tx_id. Old events must be ignored so they cannot advance the wrong saga.
         logger.debug(f"[Saga] stale tx_id={tx_id} for order={order_id} — dropping")
         saga_record.mark_seen(db, message_id)
         return
@@ -182,6 +185,8 @@ def saga_route_order(
         logger.warning(f"[Saga] unknown event type={msg_type} — dropping")
         return
 
+    # Mark the event as processed only after the transition/publish logic
+    # finished. If we crash first, Kafka redelivery is still allowed.
     saga_record.mark_seen(db, message_id)
 
 
@@ -260,6 +265,8 @@ def saga_on_payment_success(record, msg, db, logger):
 
     raw = db.get(order_id)
     if raw:
+        # The order row is user-facing state. We only flip it to paid after the
+        # payment success event arrives, not when the command is sent.
         order_entry = msgpack.decode(raw, type=OrderValue)
         updated = order_entry.__class__(
             user_id=order_entry.user_id,
@@ -297,7 +304,9 @@ def saga_on_payment_failed(record, msg, db, publish, logger):
 
     items = record.get("items", [])
 
-    # Transition to compensating BEFORE publishing RELEASE_STOCK
+    # Persist the intent to compensate before publishing RELEASE_STOCK. If we
+    # crash after the state change but before the publish, startup recovery and
+    # timeout replay both know which command still has to be sent.
     saga_record.transition(
         db=db,
         tx_id=tx_id,
@@ -405,7 +414,8 @@ def check_timeouts(db: redis_module.Redis, publish, logger) -> None:
             f"[Saga] timeout detected tx={tx_id} order={order_id} state={state}"
         )
 
-        # Reset timeout before replaying so we don't spam every check cycle
+        # Reset the deadline before replaying so one slow participant does not
+        # cause the same command to be re-sent on every scanner iteration.
         saga_record.transition(
             db=db,
             tx_id=tx_id,
