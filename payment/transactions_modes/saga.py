@@ -103,7 +103,7 @@ def _handle_process_payment(
 
     publish(PAYMENT_EVENTS_TOPIC, reply)
     payment_ledger.mark_replied(db, tx_id, PROCESS_PAYMENT)
-    logger.debug(f"[PaymentSaga] PROCESS_PAYMENT {result} tx={tx_id} order={order_id}")
+    logger.info(f"[PaymentSaga] PROCESS_PAYMENT {result} tx={tx_id} order={order_id}")
 
 
 # ============================================================
@@ -167,7 +167,7 @@ def _handle_refund_payment(
 
     publish(PAYMENT_EVENTS_TOPIC, reply)
     payment_ledger.mark_replied(db, tx_id, REFUND_PAYMENT)
-    logger.debug(f"[PaymentSaga] REFUND_PAYMENT done tx={tx_id} order={order_id}")
+    logger.info(f"[PaymentSaga] REFUND_PAYMENT done tx={tx_id} order={order_id}")
 
 
 
@@ -175,8 +175,8 @@ def _handle_refund_payment(
 # INTERNAL HELPERS
 # ============================================================
 
-def _republish(entry: dict, tx_id: str, order_id: str, publish) -> None:
-    """Rebuild and re-publish the stored reply event from the ledger entry."""
+def _republish(entry: dict, publish) -> None:
+    """Re-publish the stored reply event saved in the ledger entry."""
     reply_message = entry.get("reply_message")
     if reply_message:
         publish(PAYMENT_EVENTS_TOPIC, reply_message)

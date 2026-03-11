@@ -103,7 +103,7 @@ def _handle_reserve_stock(
 
     publish(STOCK_EVENTS_TOPIC, reply)
     stock_ledger.mark_replied(db, tx_id, RESERVE_STOCK)
-    logger.debug(f"[StockSaga] RESERVE_STOCK {result} tx={tx_id} order={order_id}")
+    logger.info(f"[StockSaga] RESERVE_STOCK {result} tx={tx_id} order={order_id}")
 
 
 
@@ -162,20 +162,15 @@ def _handle_release_stock(
 
     publish(STOCK_EVENTS_TOPIC, reply)
     stock_ledger.mark_replied(db, tx_id, RELEASE_STOCK)
-    logger.debug(f"[StockSaga] RELEASE_STOCK done tx={tx_id} order={order_id}")
+    logger.info(f"[StockSaga] RELEASE_STOCK done tx={tx_id} order={order_id}")
 
 
 # ============================================================
 # INTERNAL HELPERS
 # ============================================================
 
-def _republish(
-    entry: dict,
-    tx_id: str,
-    order_id: str,
-    publish,
-) -> None:
-    """Rebuild and re-publish the stored reply event from the ledger entry."""
+def _republish(entry: dict, publish) -> None:
+    """Re-publish the stored reply event saved in the ledger entry."""
     reply_message = entry.get("reply_message")
     if reply_message:
         publish(STOCK_EVENTS_TOPIC, reply_message)
