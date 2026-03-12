@@ -117,7 +117,7 @@ def add_credit(user_id: str, amount: int):
 
 @app.post('/pay/<user_id>/<amount>')
 def remove_credit(user_id: str, amount: int):
-    app.logger.debug(f"Removing {amount} credit from user: {user_id}")
+    app.logger.info(f"Removing {amount} credit from user: {user_id}")
     success, error, updated_credit = remove_credit_internal(user_id, int(amount))
     if not success:
         abort(400, error)
@@ -133,4 +133,4 @@ else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
-    init_kafka(app.logger)
+    init_kafka(app.logger, db)

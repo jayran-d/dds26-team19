@@ -59,9 +59,7 @@ ALL_TOPICS = [
 class SagaOrderStatus:
     PENDING = "pending"  # checkout not yet called
     RESERVING_STOCK = "reserving_stock"  # RESERVE_STOCK sent, awaiting stock.events
-    PROCESSING_PAYMENT = (
-        "processing_payment"  # PROCESS_PAYMENT sent, awaiting payment.events
-    )
+    PROCESSING_PAYMENT = "processing_payment"  # PROCESS_PAYMENT sent, awaiting payment.events
     COMPENSATING = "compensating"  # compensation(s) in flight
     COMPLETED = "completed"  # stock deducted, payment taken — terminal success
     FAILED = "failed"  # compensations done — terminal failure
@@ -70,9 +68,7 @@ class SagaOrderStatus:
 class TwoPhaseOrderStatus:
     PENDING = "pending"  # checkout not yet called
     PREPARING_STOCK = "preparing_stock"  # PREPARE_STOCK sent, awaiting stock.events
-    PREPARING_PAYMENT = (
-        "preparing_payment"  # PREPARE_PAYMENT sent, awaiting payment.events
-    )
+    PREPARING_PAYMENT = "preparing_payment"  # PREPARE_PAYMENT sent, awaiting payment.events
     COMMITTING = "committing"  # COMMIT sent to both services
     ABORTING = "aborting"  # ABORT sent to both services
     COMPLETED = "completed"  # both committed — terminal success
@@ -147,7 +143,6 @@ def build_message(tx_id: str, order_id: str, msg_type: str, payload: dict) -> di
         "order_id": order_id,
         "type": msg_type,
         "timestamp": int(time.time() * 1000),
-        "transaction_mode": TRANSACTION_MODE,
         "payload": payload,
     }
 

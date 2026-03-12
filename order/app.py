@@ -166,19 +166,55 @@ def add_item(order_id: str, item_id: str, quantity: int):
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
     """
-    Kafka path  — delegates entirely to kafka_worker.start_checkout().
-                  Returns 202 immediately. Poll GET /status/<order_id> for outcome.
-    HTTP path   — synchronous fallback when USE_KAFKA=false.
+    Kafka path:
+        - if already completed, do not start again
+        - if already in progress, return 202 again without creating a second tx
+        - otherwise start a new checkout
+    HTTP path:
+          — synchronous fallback when USE_KAFKA=false.
     """
     order_entry: OrderValue = get_order_from_db(order_id)
 
-    # ── Kafka path ─────────────────────────────────────────────────────────────
+    # Fast idempotency check: if the order is already paid/completed,
+    # never try to charge/reserve again.
+    status = get_order_status(order_id)
+    if order_entry.paid or status == SagaOrderStatus.COMPLETED:
+        return Response(
+            "Order already completed",
+            status=200,
+            headers={"Location": f"/orders/status/{order_id}"},
+        )
+
     if USE_KAFKA and is_available():
+        # Friendly fast-path for obvious duplicates.
+        if status in {
+            SagaOrderStatus.RESERVING_STOCK,
+            SagaOrderStatus.PROCESSING_PAYMENT,
+            SagaOrderStatus.COMPENSATING,
+        }:
+            return Response(
+                "Checkout already in progress",
+                status=202,
+                headers={"Location": f"/orders/status/{order_id}"},
+            )
+
         try:
-            start_checkout(order_id, order_entry)
+            result = start_checkout(order_id, order_entry)
         except Exception as exc:
             app.logger.error(f"[checkout] failed to start: {exc}")
             abort(400, str(exc))
+
+        # This handles the real race-safe answer coming back from saga_start_checkout().
+        if isinstance(result, dict) and result.get("reason") == "already_in_progress":
+            return Response(
+                "Checkout already in progress",
+                status=202,
+                headers={"Location": f"/orders/status/{order_id}"},
+            )
+
+        if isinstance(result, dict) and result.get("reason") == "error":
+            abort(400, "Failed to start checkout")
+
         return Response(
             "Checkout initiated",
             status=202,
