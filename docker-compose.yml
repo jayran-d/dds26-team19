@@ -2,6 +2,7 @@ services:
 
   kafka:
     image: apache/kafka:4.1.1
+    restart: unless-stopped
     environment:
       - KAFKA_NODE_ID=1
       - KAFKA_PROCESS_ROLES=broker,controller
@@ -24,6 +25,7 @@ services:
 
   gateway:
     image: nginx:1.25-bookworm
+    restart: unless-stopped
     volumes:
       - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
@@ -38,6 +40,7 @@ services:
       context: .
       dockerfile: order/Dockerfile
     image: order:latest
+    restart: unless-stopped
     environment:
       - GATEWAY_URL=http://gateway:80
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
@@ -50,19 +53,29 @@ services:
       - env/transaction.env
     depends_on:
       order-db:
-        condition: service_started
+        condition: service_healthy
       kafka:
         condition: service_healthy
 
   order-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    restart: unless-stopped
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync always --dir /data
+    volumes:
+      - order-db-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a redis ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
 
   stock-service:
     build:
       context: .
       dockerfile: stock/Dockerfile
     image: stock:latest
+    restart: unless-stopped
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - USE_KAFKA=true
@@ -74,19 +87,29 @@ services:
       - env/transaction.env
     depends_on:
       stock-db:
-        condition: service_started
+        condition: service_healthy
       kafka:
         condition: service_healthy
 
   stock-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    restart: unless-stopped
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync always --dir /data
+    volumes:
+      - stock-db-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a redis ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
 
   payment-service:
     build:
       context: .
       dockerfile: payment/Dockerfile
     image: user:latest
+    restart: unless-stopped
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - USE_KAFKA=true
@@ -98,10 +121,24 @@ services:
       - env/transaction.env
     depends_on:
       payment-db:
-        condition: service_started
+        condition: service_healthy
       kafka:
         condition: service_healthy
 
   payment-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    restart: unless-stopped
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync always --dir /data
+    volumes:
+      - payment-db-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a redis ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  order-db-data:
+  stock-db-data:
+  payment-db-data:
