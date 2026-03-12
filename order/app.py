@@ -4,6 +4,7 @@ import atexit
 import random
 import uuid
 from collections import defaultdict
+import time
 
 import redis
 import requests
@@ -23,6 +24,19 @@ REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
 USE_KAFKA   = os.getenv("USE_KAFKA", "false").lower() == "true"
+CHECKOUT_WAIT_TIMEOUT_SECONDS = float(os.getenv("CHECKOUT_WAIT_TIMEOUT_SECONDS", "45"))
+CHECKOUT_POLL_INTERVAL_SECONDS = float(os.getenv("CHECKOUT_POLL_INTERVAL_SECONDS", "0.05"))
+
+IN_PROGRESS_STATUSES = {
+    SagaOrderStatus.RESERVING_STOCK,
+    SagaOrderStatus.PROCESSING_PAYMENT,
+    SagaOrderStatus.COMPENSATING,
+}
+
+TERMINAL_STATUSES = {
+    SagaOrderStatus.COMPLETED,
+    SagaOrderStatus.FAILED,
+}
 
 app = Flask("order-service")
 
@@ -69,6 +83,47 @@ def get_order_status(order_id: str) -> str | None:
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
+
+def _wait_for_terminal_checkout_status(order_id: str) -> str | None:
+    """
+    Block until the Saga reaches a terminal state or the timeout expires.
+
+    This keeps the distributed transaction asynchronous internally, but gives
+    the external HTTP API a final success/failure result.
+    """
+    deadline = time.time() + CHECKOUT_WAIT_TIMEOUT_SECONDS
+
+    while time.time() < deadline:
+        status = get_order_status(order_id) or SagaOrderStatus.PENDING
+        if status in TERMINAL_STATUSES:
+            return status
+        time.sleep(CHECKOUT_POLL_INTERVAL_SECONDS)
+
+    return None
+
+
+def _build_terminal_checkout_response(order_id: str) -> Response:
+    final_status = _wait_for_terminal_checkout_status(order_id)
+
+    if final_status == SagaOrderStatus.COMPLETED:
+        return Response(
+            "Checkout successful",
+            status=200,
+            headers={"Location": f"/orders/status/{order_id}"},
+        )
+
+    if final_status == SagaOrderStatus.FAILED:
+        return Response(
+            "Checkout failed",
+            status=400,
+            headers={"Location": f"/orders/status/{order_id}"},
+        )
+
+    return Response(
+        "Checkout timed out before reaching a terminal state",
+        status=400,
+        headers={"Location": f"/orders/status/{order_id}"},
+    )
 
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
@@ -167,17 +222,17 @@ def add_item(order_id: str, item_id: str, quantity: int):
 def checkout(order_id: str):
     """
     Kafka path:
-        - if already completed, do not start again
-        - if already in progress, return 202 again without creating a second tx
-        - otherwise start a new checkout
+        - return a terminal HTTP result after the Saga finishes
+        - duplicate concurrent requests wait for the same active Saga instead of
+          starting a second checkout
+
     HTTP path:
-          — synchronous fallback when USE_KAFKA=false.
+        - synchronous fallback when USE_KAFKA=false
     """
     order_entry: OrderValue = get_order_from_db(order_id)
 
-    # Fast idempotency check: if the order is already paid/completed,
-    # never try to charge/reserve again.
     status = get_order_status(order_id)
+
     if order_entry.paid or status == SagaOrderStatus.COMPLETED:
         return Response(
             "Order already completed",
@@ -186,17 +241,10 @@ def checkout(order_id: str):
         )
 
     if USE_KAFKA and is_available():
-        # Friendly fast-path for obvious duplicates.
-        if status in {
-            SagaOrderStatus.RESERVING_STOCK,
-            SagaOrderStatus.PROCESSING_PAYMENT,
-            SagaOrderStatus.COMPENSATING,
-        }:
-            return Response(
-                "Checkout already in progress",
-                status=202,
-                headers={"Location": f"/orders/status/{order_id}"},
-            )
+        # If another request already started the Saga for this order,
+        # wait for its final result instead of starting a second one.
+        if status in IN_PROGRESS_STATUSES:
+            return _build_terminal_checkout_response(order_id)
 
         try:
             result = start_checkout(order_id, order_entry)
@@ -204,22 +252,13 @@ def checkout(order_id: str):
             app.logger.error(f"[checkout] failed to start: {exc}")
             abort(400, str(exc))
 
-        # This handles the real race-safe answer coming back from saga_start_checkout().
         if isinstance(result, dict) and result.get("reason") == "already_in_progress":
-            return Response(
-                "Checkout already in progress",
-                status=202,
-                headers={"Location": f"/orders/status/{order_id}"},
-            )
+            return _build_terminal_checkout_response(order_id)
 
         if isinstance(result, dict) and result.get("reason") == "error":
             abort(400, "Failed to start checkout")
 
-        return Response(
-            "Checkout initiated",
-            status=202,
-            headers={"Location": f"/orders/status/{order_id}"},
-        )
+        return _build_terminal_checkout_response(order_id)
 
     # ── HTTP fallback ──────────────────────────────────────────────────────────
     items_quantities: dict[str, int] = defaultdict(int)

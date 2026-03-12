@@ -102,8 +102,10 @@ def _handle_reserve_stock(
         return
 
     publish(STOCK_EVENTS_TOPIC, reply)
+    # Mark replied only after publish succeeds so restart replay can recover
+    # the "applied locally, reply not sent" crash window.
     stock_ledger.mark_replied(db, tx_id, RESERVE_STOCK)
-    logger.debug(f"[StockSaga] RESERVE_STOCK {result} tx={tx_id} order={order_id}")
+    logger.info(f"[StockSaga] RESERVE_STOCK {result} tx={tx_id} order={order_id}")
 
 
 
@@ -161,21 +163,18 @@ def _handle_release_stock(
         return
 
     publish(STOCK_EVENTS_TOPIC, reply)
+    # Compensation uses the same applied/replied split as reserve so duplicate
+    # delivery and restart replay stay deterministic.
     stock_ledger.mark_replied(db, tx_id, RELEASE_STOCK)
-    logger.debug(f"[StockSaga] RELEASE_STOCK done tx={tx_id} order={order_id}")
+    logger.info(f"[StockSaga] RELEASE_STOCK done tx={tx_id} order={order_id}")
 
 
 # ============================================================
 # INTERNAL HELPERS
 # ============================================================
 
-def _republish(
-    entry: dict,
-    tx_id: str,
-    order_id: str,
-    publish,
-) -> None:
-    """Rebuild and re-publish the stored reply event from the ledger entry."""
+def _republish(entry: dict, publish) -> None:
+    """Re-publish the stored reply event saved in the ledger entry."""
     reply_message = entry.get("reply_message")
     if reply_message:
         publish(STOCK_EVENTS_TOPIC, reply_message)
@@ -203,6 +202,9 @@ def _reserve_stock_atomically(
     while True:
         pipe = db.pipeline()
         try:
+            # Every item touched by the reservation participates in the watch.
+            # That lets Redis reject the transaction if concurrent activity
+            # changed stock after we validated but before we commit.
             pipe.watch(ledger_key, *item_ids)
 
             raw_entry = pipe.get(ledger_key)
@@ -274,6 +276,9 @@ def _reserve_stock_atomically(
             reply = build_stock_reserved(tx_id, order_id)
             updated_entry = _build_applied_entry(entry, "success", reply)
 
+            # Commit the entire reservation and the ledger transition in one
+            # EXEC so stock is never partially deducted without a matching
+            # durable participant state.
             pipe.multi()
             for item_id, updated_item in updated_items.items():
                 pipe.set(item_id, msgpack.encode(updated_item))
@@ -302,6 +307,8 @@ def _release_stock_atomically(
     while True:
         pipe = db.pipeline()
         try:
+            # Compensation depends on both the original reserve result and the
+            # current item rows, so they all need to be observed together.
             pipe.watch(release_key, reserve_key, *item_ids)
 
             raw_release = pipe.get(release_key)
@@ -323,6 +330,9 @@ def _release_stock_atomically(
             updated_release = _build_applied_entry(release_entry, "success", reply)
 
             if not reserve_succeeded:
+                # If RESERVE_STOCK never succeeded, RELEASE_STOCK is a no-op
+                # compensation. We still persist the terminal participant state
+                # so retries remain idempotent.
                 pipe.multi()
                 pipe.set(release_key, json.dumps(updated_release), ex=stock_ledger.LEDGER_TTL_SECONDS)
                 pipe.execute()

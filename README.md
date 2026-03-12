@@ -35,6 +35,11 @@ After coding the REST endpoint logic run `docker-compose up --build` in the base
 
 ***Requirements:*** You need to have docker and docker-compose installed on your machine. 
 
+### Testing Guides
+
+- Saga manual testing and log-watching guide:
+  [docs/manual_saga_testing.md](/Users/dariancomp/Documents/School/MasterTUDelftComputerScience/FirstYear/Q3/Distributed%20Data%20Systems/Assignment/dds26-team19/docs/manual_saga_testing.md)
+ 
 K8s is also possible, but we do not require it as part of your submission. 
 
 #### minikube (local k8s cluster)
