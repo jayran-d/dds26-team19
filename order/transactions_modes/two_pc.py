@@ -32,10 +32,15 @@ def _evaluate_2pc(producer, db, logger, order_id):
 
         logger.info(f"[Order2PC] order={order_id} ABORT")
 
-        producer.publish(STOCK_COMMANDS_TOPIC, build_abort_stock(db.get(f"order:{order_id}:tx_id").decode(), order_id))
-        producer.publish(PAYMENT_COMMANDS_TOPIC, build_abort_payment(db.get(f"order:{order_id}:tx_id").decode(), order_id))
+        tx_id = db.get(f"order:{order_id}:tx_id")
+        if not tx_id:
+            logger.warning(f"[Order2PC] order={order_id} missing tx_id, cannot abort")
+            return
+        tx_id = tx_id.decode()
+        producer.publish(STOCK_COMMANDS_TOPIC, build_abort_stock(tx_id, order_id))
+        producer.publish(PAYMENT_COMMANDS_TOPIC, build_abort_payment(tx_id, order_id))
         db.hset(_2pc_key(order_id), "decision", DECISION_ABORT)
-        set_status(logger, db, order_id, "FAILED")
+        set_status(logger, db, order_id, "failed")
         return
 
     # COMMIT RULE
@@ -89,9 +94,24 @@ def handle_2pc_commit_confirmation(db, logger, msg, participant_commit_key, comm
     logger.info(f"[Order2PC] order={order_id} {msg.get('type')}")
     # Check if both participants committed to mark COMPLETED
     state = db.hgetall(_2pc_key(order_id))
-    if (state[b"stock_commit_state"].decode() == STOCK_COMMIT_CONFIRMED and
-        state[b"payment_commit_state"].decode() == PAYMENT_COMMIT_CONFIRMED):
-        set_status(logger, db, order_id, "COMPLETED")
+    stock_commit_state = state.get(b"stock_commit_state", b"").decode()
+    payment_commit_state = state.get(b"payment_commit_state", b"").decode()
+    logger.info(f"[Order2PC] order={order_id} commit states: stock={stock_commit_state} payment={payment_commit_state}")
+    if (stock_commit_state == STOCK_COMMIT_CONFIRMED and
+        payment_commit_state == PAYMENT_COMMIT_CONFIRMED):
+        from msgspec import msgpack
+        from app import OrderValue
+        raw = db.get(order_id)
+        if raw:
+            order_entry = msgpack.decode(raw, type=OrderValue)
+            order = order_entry.__class__(
+            user_id=order_entry.user_id,
+            items=order_entry.items,
+            total_cost=order_entry.total_cost,
+            paid=True,
+        )
+            db.set(order_id, msgpack.encode(order))
+        set_status(logger, db, order_id, "completed")
 
 # def recover_incomplete_2pc(db, producer, logger):
 #     """ OLD!!!!!!!

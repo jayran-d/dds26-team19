@@ -24,7 +24,7 @@ from common.messages import (
 
 import ledger as stock_ledger
 from ledger import LedgerState
-from common.kafka_client import KafkaProducerClient, KafkaConsumerClient
+from common.kafka_client import KafkaProducerClient
 
 LOCK_TTL = 10000  # milliseconds
 
@@ -69,6 +69,7 @@ def _2pc_route_stock(msg: dict, db: redis_module.Redis, producer: KafkaProducerC
 
 # ---------------- PREPARE ----------------
 def _handle_prepare_stock(msg, db, producer, logger):
+    from app import get_item_from_db
     order_id = msg.get("order_id")
     tx_id = msg.get("tx_id")
     items = msg.get("payload", {}).get("items", [])
@@ -95,25 +96,30 @@ def _handle_prepare_stock(msg, db, producer, logger):
         acquired = db.set(lock_key, lock_val, nx=True, px=LOCK_TTL)
         if not acquired:
             for k, v in item_locks.items():
-                if db.get(k) == v:
+                if db.get(k) == v.encode():
                     db.delete(k)
+            logger.info(f"[Stock2PC] order={order_id} fails during lock acquisition\n")
             producer.publish(STOCK_EVENTS_TOPIC,
                              build_stock_prepare_failed(tx_id, order_id, f"Item {item['item_id']} locked"))
             return
         item_locks[lock_key] = lock_val
 
     logger.info(f"[Stock2PC] order={order_id} LOCKS_SET\n")
+
     # Check stock availability (without deducting)
     failed_items = []
     for item in items:
-        qty = int(db.get(f"stock:item:{item['item_id']}") or 0)
+        item_obj = get_item_from_db(item['item_id'])
+        qty = item_obj.stock if item_obj else 0
+        logger.info(f"[Stock2PC] order={order_id} item {item['item_id']} has {qty} in stock which should be >= {item['quantity']}\n")
         if qty < item['quantity']:
             failed_items.append(item['item_id'])
 
     if failed_items:
         for k, v in item_locks.items():
-            if db.get(k) == v:
+            if db.get(k) == v.encode():
                 db.delete(k)
+        logger.info(f"[Stock2PC] order={order_id} fails after item quantity check\n")
         producer.publish(STOCK_EVENTS_TOPIC,
                          build_stock_prepare_failed(tx_id, order_id, f"Out of stock {failed_items}"))
         return
@@ -130,27 +136,40 @@ def _handle_prepare_stock(msg, db, producer, logger):
 
 # ---------------- COMMIT ----------------
 def _handle_commit_stock(msg, db, producer, logger):
+    from app import apply_stock_delta
     order_id = msg.get("order_id")
     tx_id = msg.get("tx_id")
-    action_type = COMMIT_STOCK
 
-    entry = stock_ledger.get_entry(db, tx_id, action_type)
-    if not entry:
-        return  # nothing prepared → ignore
+    # Dedup
+    entry = stock_ledger.get_entry(db, tx_id, COMMIT_STOCK)
+    if entry and entry.get("local_state") in (LedgerState.APPLIED, LedgerState.REPLIED):
+        producer.publish(STOCK_EVENTS_TOPIC, build_stock_committed(tx_id, order_id))
+        return
 
-    # Deduct stock now
-    for item in entry["business_snapshot"]["items"]:
-        db.decrby(f"stock:item:{item['item_id']}", item["quantity"])
+    # Read items and locks from the PREPARE entry
+    prepare_entry = stock_ledger.get_entry(db, tx_id, PREPARE_STOCK)
+    if not prepare_entry or prepare_entry.get("result") != "success":
+        logger.info(f"[Stock2PC] COMMIT_STOCK tx={tx_id} -- no successful PREPARE found, ignoring")
+        return
 
-    # Publish committed event
-    producer.publish(STOCK_EVENTS_TOPIC, build_stock_committed(tx_id, order_id))
-    stock_ledger.mark_replied(db, tx_id, action_type)
+    items      = prepare_entry["business_snapshot"]["items"]
+    item_locks = prepare_entry["business_snapshot"].get("item_locks", {})
+
+    # Permanently deduct stock
+    for item in items:
+        success, error, _ = apply_stock_delta(item['item_id'], -item['quantity'])
+        if not success:
+            logger.error(f"[Stock2PC] COMMIT_STOCK: failed to deduct {item['item_id']}: {error}")
 
     # Release locks
-    for k, v in entry["business_snapshot"]["item_locks"].items():
-        if db.get(k) == v:
+    for k, v in item_locks.items():
+        if db.get(k) == v.encode():
             db.delete(k)
 
+    stock_ledger.create_entry(db, tx_id, COMMIT_STOCK, {})
+    stock_ledger.mark_applied(db, tx_id, COMMIT_STOCK, "success", STOCK_COMMITTED, {})
+    producer.publish(STOCK_EVENTS_TOPIC, build_stock_committed(tx_id, order_id))
+    stock_ledger.mark_replied(db, tx_id, COMMIT_STOCK)
     logger.info(f"[Stock2PC] order={order_id} STOCK_COMMITTED, locks released")
 
 
@@ -158,20 +177,26 @@ def _handle_commit_stock(msg, db, producer, logger):
 def _handle_abort_stock(msg, db, producer, logger):
     order_id = msg.get("order_id")
     tx_id = msg.get("tx_id")
-    action_type = ABORT_STOCK
 
-    entry = stock_ledger.get_entry(db, tx_id, action_type)
-    if not entry:
+    # Dedup
+    entry = stock_ledger.get_entry(db, tx_id, ABORT_STOCK)
+    if entry and entry.get("local_state") in (LedgerState.APPLIED, LedgerState.REPLIED):
+        producer.publish(STOCK_EVENTS_TOPIC, build_stock_aborted(tx_id, order_id))
         return
 
-    # No stock deduction happened yet, just release locks
-    for k, v in entry["business_snapshot"]["item_locks"].items():
-        if db.get(k) == v:
-            db.delete(k)
+    # Read locks from the PREPARE entry — stock was never touched, just release locks
+    prepare_entry = stock_ledger.get_entry(db, tx_id, PREPARE_STOCK)
+    if prepare_entry and prepare_entry.get("result") == "success":
+        item_locks = prepare_entry["business_snapshot"].get("item_locks", {})
+        for k, v in item_locks.items():
+                if db.get(k) == v.encode():
+                    db.delete(k)
+    else:
+        logger.info(f"[Stock2PC] ABORT_STOCK tx={tx_id} -- PREPARE did not succeed, nothing to release")
 
-    # Publish aborted event
+    stock_ledger.create_entry(db, tx_id, ABORT_STOCK, {})
+    stock_ledger.mark_applied(db, tx_id, ABORT_STOCK, "success", STOCK_ABORTED, {})
     producer.publish(STOCK_EVENTS_TOPIC, build_stock_aborted(tx_id, order_id))
-    stock_ledger.mark_replied(db, tx_id, action_type)
-
+    stock_ledger.mark_replied(db, tx_id, ABORT_STOCK)
     logger.info(f"[Stock2PC] order={order_id} STOCK_ABORTED, locks released")
     

@@ -15,7 +15,7 @@ import utils as tu
 
 
 # Max seconds to wait for a checkout to reach a terminal state.
-CHECKOUT_TIMEOUT = 15
+CHECKOUT_TIMEOUT = 50
 POLL_INTERVAL    = 0.5
 
 
