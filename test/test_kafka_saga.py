@@ -9,7 +9,7 @@ Assumptions:
     - Docker Compose stack is already up
     - USE_KAFKA=true
     - TRANSACTION_MODE=saga
-    - /orders/checkout/<order_id> is the async 202-based variant on this branch
+    - /orders/checkout/<order_id> waits for a terminal Saga result on this branch
 
 Coverage:
     - happy path and normal compensation
@@ -256,6 +256,40 @@ def wait_for_status(order_id: str, expected_status: str, timeout: int = STATE_WA
     return False
 
 
+def _start_checkout_request(order_id: str) -> tuple[threading.Thread, dict]:
+    """
+    Run checkout in a background thread so recovery tests can still stop/start
+    services while the HTTP request is waiting for the Saga to finish.
+    """
+    result: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            result["response"] = tu.checkout_order(order_id)
+        except Exception as exc:  # noqa: BLE001 - surface request failure to the test
+            result["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, result
+
+
+def _finish_checkout_request(
+    thread: threading.Thread,
+    result: dict,
+    timeout: int = CHECKOUT_TIMEOUT + 15,
+) -> requests.Response:
+    thread.join(timeout)
+    if thread.is_alive():
+        raise AssertionError("checkout request thread did not finish in time")
+    if "error" in result:
+        raise AssertionError(f"checkout request failed: {result['error']}")
+    response = result.get("response")
+    if response is None:
+        raise AssertionError("checkout request returned no response")
+    return response
+
+
 def _retry_setup_call(fn, *args, timeout: int = SETUP_RETRY_TIMEOUT):
     deadline = time.time() + timeout
     last_exc: Exception | None = None
@@ -357,10 +391,8 @@ class TestSagaBasic(SagaDockerTestCase):
         tu.add_item_to_order(order_id, item_id, 2)
 
         resp = tu.checkout_order(order_id)
-        self.assertEqual(resp.status_code, 202)
-
-        status = wait_for_checkout(order_id)
-        self.assertEqual(status, "completed")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(wait_for_checkout(order_id), "completed")
         self.assertEqual(tu.find_item(item_id)["stock"], 3)
         self.assertEqual(tu.find_user(user_id)["credit"], 80)
         self.assertTrue(tu.find_order(order_id)["paid"])
@@ -379,10 +411,8 @@ class TestSagaBasic(SagaDockerTestCase):
         tu.add_item_to_order(order_id, item_id, 5)
 
         resp = tu.checkout_order(order_id)
-        self.assertEqual(resp.status_code, 202)
-
-        status = wait_for_checkout(order_id)
-        self.assertEqual(status, "failed")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(wait_for_checkout(order_id), "failed")
         self.assertEqual(tu.find_item(item_id)["stock"], 1)
         self.assertEqual(tu.find_user(user_id)["credit"], 100)
         self.assertFalse(tu.find_order(order_id)["paid"])
@@ -401,10 +431,8 @@ class TestSagaBasic(SagaDockerTestCase):
         tu.add_item_to_order(order_id, item_id, 2)
 
         resp = tu.checkout_order(order_id)
-        self.assertEqual(resp.status_code, 202)
-
-        status = wait_for_checkout(order_id)
-        self.assertEqual(status, "failed")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(wait_for_checkout(order_id), "failed")
         self.assertEqual(tu.find_item(item_id)["stock"], 5)
         self.assertEqual(tu.find_user(user_id)["credit"], 5)
         self.assertFalse(tu.find_order(order_id)["paid"])
@@ -424,13 +452,15 @@ class TestSagaIdempotency(SagaDockerTestCase):
         order_id = order["order_id"]
         tu.add_item_to_order(order_id, item_id, 1)
 
-        resp1 = tu.checkout_order(order_id)
-        resp2 = tu.checkout_order(order_id)
-        self.assertEqual(resp1.status_code, 202)
-        self.assertIn(resp2.status_code, (202, 200))
+        thread1, result1 = _start_checkout_request(order_id)
+        thread2, result2 = _start_checkout_request(order_id)
 
-        status = wait_for_checkout(order_id)
-        self.assertEqual(status, "completed")
+        resp1 = _finish_checkout_request(thread1, result1)
+        resp2 = _finish_checkout_request(thread2, result2)
+
+        self.assertEqual(resp1.status_code, 200)
+        self.assertEqual(resp2.status_code, 200)
+        self.assertEqual(wait_for_checkout(order_id), "completed")
         self.assertEqual(tu.find_item(item_id)["stock"], 4)
         self.assertEqual(tu.find_user(user_id)["credit"], 90)
 
@@ -484,8 +514,8 @@ class TestSagaConcurrency(SagaDockerTestCase):
         results: dict[str, str] = {}
 
         def do_checkout(oid: str) -> None:
-            tu.checkout_order(oid)
-            results[oid] = wait_for_checkout(oid, timeout=CHECKOUT_TIMEOUT)
+            response = tu.checkout_order(oid)
+            results[oid] = "completed" if response.status_code == 200 else "failed"
 
         threads = [threading.Thread(target=do_checkout, args=(oid,)) for oid in order_ids]
         for thread in threads:
@@ -495,6 +525,7 @@ class TestSagaConcurrency(SagaDockerTestCase):
 
         statuses = list(results.values())
         self.assertEqual(statuses.count("completed"), 1, msg=f"Statuses: {results}")
+        self.assertEqual(statuses.count("failed"), CONCURRENT_USERS - 1, msg=f"Statuses: {results}")
         self.assertEqual(tu.find_item(item_id)["stock"], 0)
 
 
@@ -544,16 +575,15 @@ class TestSagaRecovery(SagaDockerTestCase):
 
         _stop_service(STOCK_SERVICE)
 
-        resp = tu.checkout_order(order_id)
-        self.assertEqual(resp.status_code, 202)
-        self.assertTrue(wait_for_status(order_id, "reserving_stock"))
+        thread, result = _start_checkout_request(order_id)
+        self.assertTrue(wait_for_status(order_id, "reserving_stock", timeout=CHECKOUT_TIMEOUT))
 
         _kill_service(ORDER_SERVICE)
         _start_service(ORDER_SERVICE)
         _start_service(STOCK_SERVICE)
 
-        status = wait_for_checkout(order_id)
-        self.assertEqual(status, "completed")
+        _finish_checkout_request(thread, result, timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT)
+        self.assertEqual(wait_for_checkout(order_id), "completed")
         self.assertEqual(tu.find_item(item_id)["stock"], 4)
         self.assertEqual(tu.find_user(user_id)["credit"], 90)
 
@@ -572,16 +602,15 @@ class TestSagaRecovery(SagaDockerTestCase):
 
         _stop_service(PAYMENT_SERVICE)
 
-        resp = tu.checkout_order(order_id)
-        self.assertEqual(resp.status_code, 202)
-        self.assertTrue(wait_for_status(order_id, "processing_payment"))
+        thread, result = _start_checkout_request(order_id)
+        self.assertTrue(wait_for_status(order_id, "processing_payment", timeout=CHECKOUT_TIMEOUT))
 
         _kill_service(ORDER_SERVICE)
         _start_service(ORDER_SERVICE)
         _start_service(PAYMENT_SERVICE)
 
-        status = wait_for_checkout(order_id)
-        self.assertEqual(status, "completed")
+        _finish_checkout_request(thread, result, timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT)
+        self.assertEqual(wait_for_checkout(order_id), "completed")
         self.assertEqual(tu.find_item(item_id)["stock"], 4)
         self.assertEqual(tu.find_user(user_id)["credit"], 90)
 
@@ -601,8 +630,7 @@ class TestSagaRecovery(SagaDockerTestCase):
         try:
             _stop_service(PAYMENT_SERVICE)
 
-            resp = tu.checkout_order(order_id)
-            self.assertEqual(resp.status_code, 202)
+            thread, result = _start_checkout_request(order_id)
             self.assertTrue(wait_for_status(order_id, "processing_payment", timeout=CHECKOUT_TIMEOUT))
 
             _stop_service(STOCK_SERVICE)
@@ -618,8 +646,8 @@ class TestSagaRecovery(SagaDockerTestCase):
             _start_service(STOCK_SERVICE, timeout=RECOVERY_WAIT)
             _start_service(PAYMENT_SERVICE, timeout=RECOVERY_WAIT)
 
-            status = wait_for_checkout(order_id, timeout=CHECKOUT_TIMEOUT)
-            self.assertEqual(status, "failed")
+            _finish_checkout_request(thread, result, timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT)
+            self.assertEqual(wait_for_checkout(order_id, timeout=CHECKOUT_TIMEOUT), "failed")
             self.assertEqual(tu.find_item(item_id)["stock"], 5)
             self.assertEqual(tu.find_user(user_id)["credit"], 5)
         finally:
@@ -640,15 +668,15 @@ class TestSagaRecovery(SagaDockerTestCase):
 
         _stop_service(STOCK_SERVICE)
 
-        resp = tu.checkout_order(order_id)
-        self.assertEqual(resp.status_code, 202)
-        self.assertTrue(wait_for_status(order_id, "reserving_stock"))
+        thread, result = _start_checkout_request(order_id)
+        self.assertTrue(wait_for_status(order_id, "reserving_stock", timeout=CHECKOUT_TIMEOUT))
 
         time.sleep(SAGA_TIMEOUT_SECONDS + 5)
         _start_service(STOCK_SERVICE)
 
-        status = wait_for_checkout(order_id)
-        self.assertEqual(status, "completed")
+        resp = _finish_checkout_request(thread, result, timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(wait_for_checkout(order_id), "completed")
         self.assertEqual(tu.find_item(item_id)["stock"], 4)
         self.assertEqual(tu.find_user(user_id)["credit"], 90)
 
@@ -667,15 +695,15 @@ class TestSagaRecovery(SagaDockerTestCase):
 
         _stop_service(PAYMENT_SERVICE)
 
-        resp = tu.checkout_order(order_id)
-        self.assertEqual(resp.status_code, 202)
-        self.assertTrue(wait_for_status(order_id, "processing_payment"))
+        thread, result = _start_checkout_request(order_id)
+        self.assertTrue(wait_for_status(order_id, "processing_payment", timeout=CHECKOUT_TIMEOUT))
 
         time.sleep(SAGA_TIMEOUT_SECONDS + 5)
         _start_service(PAYMENT_SERVICE)
 
-        status = wait_for_checkout(order_id)
-        self.assertEqual(status, "completed")
+        resp = _finish_checkout_request(thread, result, timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(wait_for_checkout(order_id), "completed")
         self.assertEqual(tu.find_item(item_id)["stock"], 4)
         self.assertEqual(tu.find_user(user_id)["credit"], 90)
 
