@@ -150,28 +150,42 @@ def handle_2pc_commit_confirmation(db, logger, msg, participant_commit_key, comm
 
 def recover_incomplete_2pc(db, producer, logger):
     """
-    Scan Redis only for 2PC transactions with decision=DECISION_NONE and resume them.
-    This avoids scanning all orders, improving performance.
+    On coordinator restart, scan all in-flight 2PC state and resume:
+    - DECISION_NONE  : coordinator crashed before deciding — re-evaluate
+    - DECISION_COMMIT: coordinator decided but may not have delivered — resend COMMITs
+    - DECISION_ABORT : coordinator decided but may not have delivered — resend ABORTs
+    Participants are idempotent via the ledger, so resending is safe.
     """
-
     for key in db.scan_iter("order:*:2pcstate"):
-        # Check decision directly
-        decision_bytes = db.hget(key, "decision")
-        decision = decision_bytes.decode() if decision_bytes else DECISION_NONE
-
-        if decision != DECISION_NONE:
-            # skip all transactions already decided
-            continue
-
+        state = db.hgetall(key)
+        decision = state.get(b"decision", b"").decode()
         order_id = key.decode().split(":")[1]  # order:{order_id}:2pcstate
+
         tx_id_bytes = db.get(f"order:{order_id}:tx_id")
         if not tx_id_bytes:
             logger.info(f"[Order2PC-Recover] order={order_id} missing tx_id, skipping")
             continue
         tx_id = tx_id_bytes.decode()
 
-        logger.info(f"[Order2PC-Recover] order={order_id} in-doubt, evaluating...")
-        _evaluate_2pc(producer, db, logger, order_id)
+        if decision == DECISION_NONE:
+            logger.info(f"[Order2PC-Recover] order={order_id} in-doubt, re-evaluating")
+            _evaluate_2pc(producer, db, logger, order_id)
+
+        elif decision == DECISION_COMMIT:
+            # Resend only to participants that haven't confirmed yet
+            stock_cs = state.get(b"stock_commit_state", b"").decode()
+            payment_cs = state.get(b"payment_commit_state", b"").decode()
+            if stock_cs != STOCK_COMMIT_CONFIRMED:
+                logger.info(f"[Order2PC-Recover] order={order_id} resending COMMIT_STOCK")
+                producer.publish(STOCK_COMMANDS_TOPIC, build_commit_stock(tx_id, order_id))
+            if payment_cs != PAYMENT_COMMIT_CONFIRMED:
+                logger.info(f"[Order2PC-Recover] order={order_id} resending COMMIT_PAYMENT")
+                producer.publish(PAYMENT_COMMANDS_TOPIC, build_commit_payment(tx_id, order_id))
+
+        elif decision == DECISION_ABORT:
+            logger.info(f"[Order2PC-Recover] order={order_id} resending ABORTs")
+            producer.publish(STOCK_COMMANDS_TOPIC, build_abort_stock(tx_id, order_id))
+            producer.publish(PAYMENT_COMMANDS_TOPIC, build_abort_payment(tx_id, order_id))
 
 def _2pc_start_checkout( 
     producer: KafkaProducerClient,
