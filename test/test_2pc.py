@@ -60,6 +60,7 @@ class Test2pc(unittest.TestCase):
         Happy path: user has enough credit, item has enough stock.
         Checkout should complete successfully.
         """
+        print("\nRunning test_checkout_success...")
         # Setup user
         user = tu.create_user()
         user_id = user["user_id"]
@@ -100,6 +101,7 @@ class Test2pc(unittest.TestCase):
         Stock failure: item doesn't have enough stock.
         Checkout should fail, credit should be untouched.
         """
+        print("\nRunning test_checkout_insufficient_stock...")
         # Setup user with plenty of credit
         user = tu.create_user()
         user_id = user["user_id"]
@@ -136,6 +138,7 @@ class Test2pc(unittest.TestCase):
         Payment failure: user doesn't have enough credit.
         Checkout should fail and reserved stock should be released.
         """
+        print("\nRunning test_checkout_insufficient_credit...")
         # Setup user with insufficient credit
         user = tu.create_user()
         user_id = user["user_id"]
@@ -171,6 +174,8 @@ class Test2pc(unittest.TestCase):
         """
         Order with multiple different items — all must be reserved atomically.
         """
+        print("\nRunning test_checkout_multiple_items...")
+
         user = tu.create_user()
         user_id = user["user_id"]
         tu.add_credit_to_user(user_id, 100)
@@ -204,6 +209,7 @@ class Test2pc(unittest.TestCase):
         Multi-item order where one item is out of stock.
         Nothing should be deducted — all-or-nothing validation.
         """
+        print("\nRunning test_checkout_one_item_out_of_stock...")
         user = tu.create_user()
         user_id = user["user_id"]
         tu.add_credit_to_user(user_id, 100)
@@ -361,6 +367,31 @@ def _wait_for_checkout_direct(order_id: str, timeout: int = RECOVERY_CHECKOUT_TI
     return "timeout"
 
 
+def _wait_for_2pc_field(
+    order_id: str,
+    field: str,
+    expected_value: str,
+    timeout: int = 30,
+) -> bool:
+    """
+    Poll the order:{order_id}:2pcstate Redis hash directly until
+    `field` equals `expected_value` or timeout is reached.
+    Returns True if the condition was met.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = _compose(
+            "exec", "-T", ORDER_DB_SERVICE,
+            "redis-cli", "-a", REDIS_PASSWORD,
+            "HGET", f"order:{order_id}:2pcstate", field,
+            check=False,
+        )
+        if result.stdout.strip() == expected_value:
+            return True
+        time.sleep(0.3)
+    return False
+
+
 class TwoPC_DockerTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -381,6 +412,7 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
         is down. After both restart: stock picks up PREPARE_STOCK from Kafka, both
         participants confirm READY, coordinator commits → completed.
         """
+        print("\nRunning test_coordinator_crash_before_decision_resolves_completed...")
         user = tu.create_user()
         user_id = user["user_id"]
         tu.add_credit_to_user(user_id, 50)
@@ -399,8 +431,12 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
         resp = tu.checkout_order(order_id)
         self.assertEqual(resp.status_code, 202)
 
-        # Give payment time to process PREPARE_PAYMENT and reply PAYMENT_PREPARED
-        time.sleep(4)
+        # Wait until the coordinator has recorded PAYMENT_READY before killing it,
+        # so Redis is deterministically in the DECISION_NONE/PAYMENT_READY/STOCK_UNKNOWN state.
+        self.assertTrue(
+            _wait_for_2pc_field(order_id, "payment_state", "PAYMENT_READY"),
+            "payment_state did not become PAYMENT_READY before the coordinator kill",
+        )
 
         # Kill coordinator mid-flight: Redis has DECISION_NONE, PAYMENT_READY, STOCK_UNKNOWN
         _kill_service(ORDER_SERVICE)
@@ -422,6 +458,7 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
         User has insufficient credit. After both restart: payment processes
         PREPARE_PAYMENT, fails → coordinator sends ABORT → stock locks released → failed.
         """
+        print("\nRunning test_coordinator_crash_before_decision_resolves_failed...")
         user = tu.create_user()
         user_id = user["user_id"]
         tu.add_credit_to_user(user_id, 5)  # insufficient: order costs 20
@@ -440,8 +477,11 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
         resp = tu.checkout_order(order_id)
         self.assertEqual(resp.status_code, 202)
 
-        # Give stock time to process PREPARE_STOCK and acquire locks
-        time.sleep(4)
+        # Wait until the coordinator has recorded STOCK_READY before killing it.
+        self.assertTrue(
+            _wait_for_2pc_field(order_id, "stock_state", "STOCK_READY"),
+            "stock_state did not become STOCK_READY before the coordinator kill",
+        )
 
         # Kill coordinator: DECISION_NONE, STOCK_READY, PAYMENT_UNKNOWN
         _kill_service(ORDER_SERVICE)
@@ -463,6 +503,7 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
         After stock restarts it picks up the pending command from Kafka and the
         transaction completes normally.
         """
+        print("\nRunning test_stock_service_restart_during_prepare...")
         user = tu.create_user()
         user_id = user["user_id"]
         tu.add_credit_to_user(user_id, 50)
@@ -495,6 +536,7 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
         After payment restarts it picks up the pending command from Kafka and the
         transaction completes normally.
         """
+        print("\nRunning test_payment_service_restart_during_prepare...")
         user = tu.create_user()
         user_id = user["user_id"]
         tu.add_credit_to_user(user_id, 50)

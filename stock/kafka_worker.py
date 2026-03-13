@@ -59,7 +59,7 @@ def init_kafka(logger, db) -> None:
     _consumer = KafkaConsumerClient(
         topics=[STOCK_COMMANDS_TOPIC],
         group_id="stock-service",
-        auto_commit=True,
+        auto_commit=False,
         auto_offset_reset="earliest",
         ensure_topics=ALL_TOPICS,
     )
@@ -100,6 +100,7 @@ def _consumer_loop() -> None:
                 continue
 
             _route_event(result.msg)
+            _consumer.commit()
 
         except Exception as exc:
             _logger.info(f"[StockKafka] Consumer loop crashed: {exc}")

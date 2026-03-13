@@ -136,7 +136,7 @@ def _handle_prepare_stock(msg, db, producer, logger):
 
 # ---------------- COMMIT ----------------
 def _handle_commit_stock(msg, db, producer, logger):
-    from app import apply_stock_delta
+    from app import StockValue
     order_id = msg.get("order_id")
     tx_id = msg.get("tx_id")
 
@@ -155,22 +155,69 @@ def _handle_commit_stock(msg, db, producer, logger):
     items      = prepare_entry["business_snapshot"]["items"]
     item_locks = prepare_entry["business_snapshot"].get("item_locks", {})
 
-    # Permanently deduct stock
+    # Merge duplicate items so each Redis row is updated once in the transaction.
+    qty_by_item: dict[str, int] = {}
     for item in items:
-        success, error, _ = apply_stock_delta(item['item_id'], -item['quantity'])
-        if not success:
-            logger.error(f"[Stock2PC] COMMIT_STOCK: failed to deduct {item['item_id']}: {error}")
+        item_id = item["item_id"]
+        qty_by_item[item_id] = qty_by_item.get(item_id, 0) + int(item["quantity"])
 
-    # Release locks
-    for k, v in item_locks.items():
-        if db.get(k) == v.encode():
-            db.delete(k)
+    item_ids = list(qty_by_item.keys())
+    lock_keys = list(item_locks.keys())
+
+    max_retries = 5
+    committed = False
+    for _ in range(max_retries):
+        try:
+            with db.pipeline() as pipe:
+                watch_keys = item_ids + lock_keys
+                if watch_keys:
+                    pipe.watch(*watch_keys)
+
+                # Ensure we still own all prepare locks.
+                for lock_key, lock_val in item_locks.items():
+                    if pipe.get(lock_key) != lock_val.encode():
+                        logger.warning(f"[Stock2PC] COMMIT_STOCK tx={tx_id} lock lost for {lock_key}")
+                        pipe.unwatch()
+                        return
+
+                current_rows = pipe.mget(item_ids)
+                updated_rows: dict[str, bytes] = {}
+                for item_id, raw in zip(item_ids, current_rows):
+                    if not raw:
+                        logger.error(f"[Stock2PC] COMMIT_STOCK tx={tx_id} missing item row {item_id}")
+                        pipe.unwatch()
+                        return
+
+                    item_entry = msgpack.decode(raw, type=StockValue)
+                    item_entry.stock -= qty_by_item[item_id]
+                    if item_entry.stock < 0:
+                        logger.error(
+                            f"[Stock2PC] COMMIT_STOCK tx={tx_id} would make {item_id} negative"
+                        )
+                        pipe.unwatch()
+                        return
+                    updated_rows[item_id] = msgpack.encode(item_entry)
+
+                pipe.multi()
+                for item_id, encoded in updated_rows.items():
+                    pipe.set(item_id, encoded)
+                if lock_keys:
+                    pipe.delete(*lock_keys)
+                pipe.execute()
+                committed = True
+                break
+        except redis_module.WatchError:
+            continue
+
+    if not committed:
+        logger.warning(f"[Stock2PC] COMMIT_STOCK tx={tx_id} failed after retries, will rely on resend")
+        return
 
     stock_ledger.create_entry(db, tx_id, COMMIT_STOCK, {})
     stock_ledger.mark_applied(db, tx_id, COMMIT_STOCK, "success", STOCK_COMMITTED, {})
     producer.publish(STOCK_EVENTS_TOPIC, build_stock_committed(tx_id, order_id))
     stock_ledger.mark_replied(db, tx_id, COMMIT_STOCK)
-    logger.info(f"[Stock2PC] order={order_id} STOCK_COMMITTED, locks released")
+    logger.info(f"[Stock2PC] order={order_id} STOCK_COMMITTED atomically, locks released")
 
 
 # ---------------- ABORT ----------------

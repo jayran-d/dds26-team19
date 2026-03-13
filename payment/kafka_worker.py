@@ -61,7 +61,7 @@ def init_kafka(logger, db) -> None:
     _consumer = KafkaConsumerClient(
         topics=[PAYMENT_COMMANDS_TOPIC],
         group_id="payment-service",
-        auto_commit=True,
+        auto_commit=False,
         auto_offset_reset="earliest",
         ensure_topics=ALL_TOPICS,
     )
@@ -106,6 +106,7 @@ def _consumer_loop() -> None:
                 continue
 
             _route_command(result.msg)
+            _consumer.commit()
 
         except Exception as exc:
             _logger.info(f"[PaymentKafka] Consumer loop crashed: {exc}")

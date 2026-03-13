@@ -60,7 +60,7 @@ def init_kafka(logger, db: redis_module.Redis) -> None:
     _consumer = KafkaConsumerClient(
         topics=[STOCK_EVENTS_TOPIC, PAYMENT_EVENTS_TOPIC],
         group_id="order-service",
-        auto_commit=True,
+        auto_commit=False,
         auto_offset_reset="earliest",
         ensure_topics=ALL_TOPICS,
     )
@@ -131,6 +131,7 @@ def _event_loop() -> None:
                 continue
 
             _route_event(result.msg)
+            _consumer.commit()
 
         except Exception as exc:
             _logger.error(f"[OrderKafka] Event loop crashed: {exc}")

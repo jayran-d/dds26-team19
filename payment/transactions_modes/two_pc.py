@@ -2,6 +2,7 @@
 import uuid
 
 import redis as redis_module
+from msgspec import msgpack
 
 from common.messages import (
     PAYMENT_EVENTS_TOPIC,
@@ -101,7 +102,7 @@ def _handle_prepare_payment(msg, db, producer, logger):
 
 # ---------------- COMMIT ----------------
 def _handle_commit_payment(msg, db, producer, logger):
-    from app import remove_credit_internal
+    from app import UserValue
 
     tx_id    = msg.get("tx_id")
     order_id = msg.get("order_id")
@@ -124,20 +125,55 @@ def _handle_commit_payment(msg, db, producer, logger):
     lock_key = snapshot["lock_key"]
     lock_val = snapshot["lock_val"]
 
-    # Permanently deduct credit
-    success, error, _ = remove_credit_internal(user_id, amount)
-    if not success:
-        logger.error(f"[Payment2PC] COMMIT_PAYMENT: failed to deduct credit for {user_id}: {error}")
+    max_retries = 5
+    committed = False
+    for _ in range(max_retries):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(user_id, lock_key)
 
-    # Release lock
-    if db.get(lock_key) == lock_val.encode():
-        db.delete(lock_key)
+                if pipe.get(lock_key) != lock_val.encode():
+                    logger.warning(
+                        f"[Payment2PC] COMMIT_PAYMENT tx={tx_id} lock lost for user {user_id}"
+                    )
+                    pipe.unwatch()
+                    return
+
+                raw_user = pipe.get(user_id)
+                if not raw_user:
+                    logger.error(
+                        f"[Payment2PC] COMMIT_PAYMENT tx={tx_id} missing user row {user_id}"
+                    )
+                    pipe.unwatch()
+                    return
+
+                user_entry = msgpack.decode(raw_user, type=UserValue)
+                user_entry.credit -= amount
+                if user_entry.credit < 0:
+                    logger.error(
+                        f"[Payment2PC] COMMIT_PAYMENT tx={tx_id} would make user {user_id} negative"
+                    )
+                    pipe.unwatch()
+                    return
+
+                pipe.multi()
+                pipe.set(user_id, msgpack.encode(user_entry))
+                pipe.delete(lock_key)
+                pipe.execute()
+                committed = True
+                break
+        except redis_module.WatchError:
+            continue
+
+    if not committed:
+        logger.warning(f"[Payment2PC] COMMIT_PAYMENT tx={tx_id} failed after retries, will rely on resend")
+        return
 
     payment_ledger.create_entry(db, tx_id, COMMIT_PAYMENT, {})
     payment_ledger.mark_applied(db, tx_id, COMMIT_PAYMENT, "success", PAYMENT_COMMITTED, {})
     producer.publish(PAYMENT_EVENTS_TOPIC, build_payment_committed(tx_id, order_id))
     payment_ledger.mark_replied(db, tx_id, COMMIT_PAYMENT)
-    logger.info(f"[Payment2PC] order={order_id} PAYMENT_COMMITTED, lock released")
+    logger.info(f"[Payment2PC] order={order_id} PAYMENT_COMMITTED atomically, lock released")
 
 
 # ---------------- ABORT ----------------
