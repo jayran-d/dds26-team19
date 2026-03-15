@@ -1,7 +1,7 @@
 """
 test_2pc.py
 
-Async-aware tests for the 2PC Kafka checkout mode.
+Tests for the 2PC Kafka checkout mode.
 
 Assumes:
     - Services are running with USE_KAFKA=true
@@ -11,9 +11,11 @@ Assumes:
 
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
+from typing import Optional
 
 import requests
 import utils as tu
@@ -53,6 +55,33 @@ def wait_for_checkout(order_id: str, timeout: int = CHECKOUT_TIMEOUT) -> str:
     return "timeout"
 
 
+def _start_checkout_in_background(order_id: str) -> tuple[threading.Thread, dict]:
+    outcome: dict = {}
+
+    def run() -> None:
+        try:
+            outcome["response"] = tu.checkout_order(order_id)
+        except Exception as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, outcome
+
+
+def _wait_for_background_checkout(
+    thread: threading.Thread,
+    outcome: dict,
+    timeout: int = 30,
+):
+    thread.join(timeout)
+    if thread.is_alive():
+        raise AssertionError("background checkout request did not finish in time")
+    if "error" in outcome:
+        raise AssertionError(f"background checkout raised: {outcome['error']}")
+    return outcome.get("response")
+
+
 class Test2pc(unittest.TestCase):
 
     def test_checkout_success(self):
@@ -78,7 +107,7 @@ class Test2pc(unittest.TestCase):
 
         # Checkout
         checkout_response = tu.checkout_order(order_id)
-        self.assertEqual(checkout_response.status_code, 202)
+        self.assertEqual(checkout_response.status_code, 200)
 
         # Wait for completion
         status = wait_for_checkout(order_id)
@@ -119,7 +148,7 @@ class Test2pc(unittest.TestCase):
 
         # Checkout
         checkout_response = tu.checkout_order(order_id)
-        self.assertEqual(checkout_response.status_code, 202)
+        self.assertEqual(checkout_response.status_code, 400)
 
         # Wait for failure
         status = wait_for_checkout(order_id)
@@ -156,7 +185,7 @@ class Test2pc(unittest.TestCase):
 
         # Checkout
         checkout_response = tu.checkout_order(order_id)
-        self.assertEqual(checkout_response.status_code, 202)
+        self.assertEqual(checkout_response.status_code, 400)
 
         # Wait for failure
         status = wait_for_checkout(order_id)
@@ -194,7 +223,7 @@ class Test2pc(unittest.TestCase):
         tu.add_item_to_order(order_id, item_id2, 1)  # cost 20, total = 40
 
         checkout_response = tu.checkout_order(order_id)
-        self.assertEqual(checkout_response.status_code, 202)
+        self.assertEqual(checkout_response.status_code, 200)
 
         status = wait_for_checkout(order_id)
         self.assertEqual(status, "completed", f"Expected completed, got: {status}")
@@ -228,7 +257,7 @@ class Test2pc(unittest.TestCase):
         tu.add_item_to_order(order_id, item_id2, 5)  # requesting 5, only 1 available
 
         checkout_response = tu.checkout_order(order_id)
-        self.assertEqual(checkout_response.status_code, 202)
+        self.assertEqual(checkout_response.status_code, 400)
 
         status = wait_for_checkout(order_id)
         self.assertEqual(status, "failed", f"Expected failed, got: {status}")
@@ -252,7 +281,7 @@ GATEWAY_SERVICE  = "gateway"
 REDIS_PASSWORD   = "redis"
 
 
-def _compose(*args: str, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess:
+def _compose(*args: str, input_text: Optional[str] = None, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["docker", "compose", *args],
         cwd=PROJECT_ROOT,
@@ -428,8 +457,7 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
         # Stop stock so it cannot process PREPARE_STOCK
         _stop_service(STOCK_SERVICE)
 
-        resp = tu.checkout_order(order_id)
-        self.assertEqual(resp.status_code, 202)
+        thread, outcome = _start_checkout_in_background(order_id)
 
         # Wait until the coordinator has recorded PAYMENT_READY before killing it,
         # so Redis is deterministically in the DECISION_NONE/PAYMENT_READY/STOCK_UNKNOWN state.
@@ -448,6 +476,8 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
 
         status = _wait_for_checkout_direct(order_id)
         self.assertEqual(status, "completed", f"Expected completed, got: {status}")
+        response = _wait_for_background_checkout(thread, outcome)
+        self.assertIn(response.status_code, {200, 502})
         self.assertEqual(tu.find_item(item_id)["stock"], 3)
         self.assertEqual(tu.find_user(user_id)["credit"], 30)
         self.assertTrue(tu.find_order(order_id)["paid"])
@@ -474,8 +504,7 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
         # Stop payment so it cannot process PREPARE_PAYMENT
         _stop_service(PAYMENT_SERVICE)
 
-        resp = tu.checkout_order(order_id)
-        self.assertEqual(resp.status_code, 202)
+        thread, outcome = _start_checkout_in_background(order_id)
 
         # Wait until the coordinator has recorded STOCK_READY before killing it.
         self.assertTrue(
@@ -494,6 +523,8 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
         # PAYMENT_PREPARE_FAILED → coordinator ABORTs → ABORT_STOCK sent → locks released
         status = _wait_for_checkout_direct(order_id)
         self.assertEqual(status, "failed", f"Expected failed, got: {status}")
+        response = _wait_for_background_checkout(thread, outcome)
+        self.assertIn(response.status_code, {400, 502})
         self.assertEqual(tu.find_item(item_id)["stock"], 5)
         self.assertEqual(tu.find_user(user_id)["credit"], 5)
 
@@ -518,14 +549,20 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
 
         _stop_service(STOCK_SERVICE)
 
-        resp = tu.checkout_order(order_id)
-        self.assertEqual(resp.status_code, 202)
+        thread, outcome = _start_checkout_in_background(order_id)
+
+        self.assertTrue(
+            _wait_for_2pc_field(order_id, "payment_state", "PAYMENT_READY"),
+            "payment_state did not become PAYMENT_READY before stock restart",
+        )
 
         # Restart stock — picks up PREPARE_STOCK from Kafka (auto_offset_reset="earliest")
         _start_service(STOCK_SERVICE)
 
         status = _wait_for_checkout_direct(order_id)
         self.assertEqual(status, "completed", f"Expected completed, got: {status}")
+        response = _wait_for_background_checkout(thread, outcome)
+        self.assertIn(response.status_code, {200, 502})
         self.assertEqual(tu.find_item(item_id)["stock"], 3)
         self.assertEqual(tu.find_user(user_id)["credit"], 30)
         self.assertTrue(tu.find_order(order_id)["paid"])
@@ -551,14 +588,20 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
 
         _stop_service(PAYMENT_SERVICE)
 
-        resp = tu.checkout_order(order_id)
-        self.assertEqual(resp.status_code, 202)
+        thread, outcome = _start_checkout_in_background(order_id)
+
+        self.assertTrue(
+            _wait_for_2pc_field(order_id, "stock_state", "STOCK_READY"),
+            "stock_state did not become STOCK_READY before payment restart",
+        )
 
         # Restart payment — picks up PREPARE_PAYMENT from Kafka
         _start_service(PAYMENT_SERVICE)
 
         status = _wait_for_checkout_direct(order_id)
         self.assertEqual(status, "completed", f"Expected completed, got: {status}")
+        response = _wait_for_background_checkout(thread, outcome)
+        self.assertIn(response.status_code, {200, 502})
         self.assertEqual(tu.find_item(item_id)["stock"], 3)
         self.assertEqual(tu.find_user(user_id)["credit"], 30)
         self.assertTrue(tu.find_order(order_id)["paid"])
