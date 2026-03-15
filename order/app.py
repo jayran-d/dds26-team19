@@ -3,6 +3,7 @@ import os
 import atexit
 import random
 import uuid
+import time
 from collections import defaultdict
 
 import redis
@@ -23,6 +24,10 @@ REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
 USE_KAFKA   = os.getenv("USE_KAFKA", "false").lower() == "true"
+
+CHECKOUT_WAIT_TIMEOUT_SECONDS = float(os.getenv("CHECKOUT_WAIT_TIMEOUT_SECONDS", "45"))
+CHECKOUT_POLL_INTERVAL_SECONDS = float(os.getenv("CHECKOUT_POLL_INTERVAL_SECONDS", "0.05"))
+TERMINAL_CHECKOUT_STATUSES = {"completed", "failed"}
 
 app = Flask("order-service")
 
@@ -67,6 +72,47 @@ def get_order_status(order_id: str) -> str | None:
     except redis.exceptions.RedisError:
         return None
 
+def _wait_for_terminal_checkout_status(order_id: str) -> str | None:
+    """
+    Wait until the Kafka-driven checkout reaches a terminal state.
+
+    This keeps the internal protocol asynchronous, but makes the external
+    HTTP API behave like the benchmark expects: POST /checkout returns the
+    final result instead of 202 Accepted.
+    """
+    deadline = time.time() + CHECKOUT_WAIT_TIMEOUT_SECONDS
+
+    while time.time() < deadline:
+        status = get_order_status(order_id)
+        if status in TERMINAL_CHECKOUT_STATUSES:
+            return status
+        time.sleep(CHECKOUT_POLL_INTERVAL_SECONDS)
+
+    return None
+
+
+def _build_terminal_checkout_response(order_id: str) -> Response:
+    final_status = _wait_for_terminal_checkout_status(order_id)
+
+    if final_status == "completed":
+        return Response(
+            "Checkout successful",
+            status=200,
+            headers={"Location": f"/orders/status/{order_id}"},
+        )
+
+    if final_status == "failed":
+        return Response(
+            "Checkout failed",
+            status=400,
+            headers={"Location": f"/orders/status/{order_id}"},
+        )
+
+    return Response(
+        "Checkout timed out before reaching a terminal state",
+        status=400,
+        headers={"Location": f"/orders/status/{order_id}"},
+    )
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
@@ -166,24 +212,36 @@ def add_item(order_id: str, item_id: str, quantity: int):
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
     """
-    Kafka path  — delegates entirely to kafka_worker.start_checkout().
-                  Returns 202 immediately. Poll GET /status/<order_id> for outcome.
-    HTTP path   — synchronous fallback when USE_KAFKA=false.
+    Kafka path:
+        - start the distributed transaction
+        - return only when it reached completed/failed
+
+    HTTP path:
+        - synchronous fallback when USE_KAFKA=false
     """
     order_entry: OrderValue = get_order_from_db(order_id)
+    status = get_order_status(order_id)
 
-    # ── Kafka path ─────────────────────────────────────────────────────────────
+    if order_entry.paid or status == "completed":
+        return Response(
+            "Order already completed",
+            status=200,
+            headers={"Location": f"/orders/status/{order_id}"},
+        )
+
     if USE_KAFKA and is_available():
+        # If another request already started work for this order, just wait
+        # for the same terminal result instead of starting another transaction.
+        if status and status not in TERMINAL_CHECKOUT_STATUSES:
+            return _build_terminal_checkout_response(order_id)
+
         try:
             start_checkout(order_id, order_entry)
         except Exception as exc:
             app.logger.error(f"[checkout] failed to start: {exc}")
             abort(400, str(exc))
-        return Response(
-            "Checkout initiated",
-            status=202,
-            headers={"Location": f"/orders/status/{order_id}"},
-        )
+
+        return _build_terminal_checkout_response(order_id)
 
     # ── HTTP fallback ──────────────────────────────────────────────────────────
     items_quantities: dict[str, int] = defaultdict(int)
@@ -215,6 +273,7 @@ def checkout(order_id: str):
         return abort(400, DB_ERROR_STR)
 
     return Response("Checkout successful", status=200)
+
 
 
 # ── Startup ────────────────────────────────────────────────────────────────────

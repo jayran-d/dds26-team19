@@ -112,7 +112,7 @@ def _route_event(msg: dict) -> None:
     msg_type = msg.get("type")
 
     _logger.info(
-        f"[OrderKafka] event={msg_type} "
+        f"[StockKafka] event={msg_type} "
         f"order={msg.get('order_id')} tx={msg.get('tx_id')}"
     )
 

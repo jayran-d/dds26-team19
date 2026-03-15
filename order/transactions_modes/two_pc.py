@@ -215,6 +215,7 @@ def _2pc_start_checkout(
         "stock_commit_state": STOCK_NOT_COMMITTED,
         "payment_commit_state": PAYMENT_NOT_COMMITTED,
     })
+    set_status(logger, db, order_id, TwoPhaseOrderStatus.PREPARING_STOCK)
 
     prepare_stock_msg = build_prepare_stock(tx_id=tx_id, order_id=order_id, items=items)
     producer.publish(STOCK_COMMANDS_TOPIC, prepare_stock_msg)

@@ -1,4 +1,5 @@
-
+import json
+import time
 import uuid
 
 import redis as redis_module
@@ -36,6 +37,24 @@ def _2pc_route_payment(producer, db: redis_module.Redis, logger, msg: dict, msg_
         _handle_abort_payment(msg, db, producer, logger)
     else:
         logger.info(f"[Payment2PC] Unknown command type: {msg_type!r} — dropping")
+
+def _ledger_key(tx_id: str, action_type: str) -> str:
+    return f"payment:ledger:{tx_id}:{action_type}"
+
+
+def _build_applied_entry(
+    entry: dict,
+    result: str,
+    response_event_type: str,
+    response_payload: dict,
+) -> dict:
+    updated = dict(entry)
+    updated["local_state"] = LedgerState.APPLIED
+    updated["result"] = result
+    updated["response_event_type"] = response_event_type
+    updated["response_payload"] = response_payload
+    updated["updated_at_ms"] = int(time.time() * 1000)
+    return updated
 
 
 # ---------------- PREPARE ----------------
@@ -104,13 +123,22 @@ def _handle_prepare_payment(msg, db, producer, logger):
 def _handle_commit_payment(msg, db, producer, logger):
     from app import UserValue
 
-    tx_id    = msg.get("tx_id")
+    tx_id = msg.get("tx_id")
     order_id = msg.get("order_id")
 
     # Dedup
     entry = payment_ledger.get_entry(db, tx_id, COMMIT_PAYMENT)
     if entry and entry.get("local_state") in (LedgerState.APPLIED, LedgerState.REPLIED):
-        producer.publish(PAYMENT_EVENTS_TOPIC, build_payment_committed(tx_id, order_id))
+        producer.publish(
+            PAYMENT_EVENTS_TOPIC,
+            build_message(
+                tx_id,
+                order_id,
+                entry["response_event_type"],
+                entry.get("response_payload", {}),
+            ),
+        )
+        payment_ledger.mark_replied(db, tx_id, COMMIT_PAYMENT)
         return
 
     # Read the PREPARE snapshot for user_id, amount, and lock info
@@ -120,17 +148,42 @@ def _handle_commit_payment(msg, db, producer, logger):
         return
 
     snapshot = prepare_entry["business_snapshot"]
-    user_id  = snapshot["user_id"]
-    amount   = snapshot["amount"]
+    user_id = snapshot["user_id"]
+    amount = snapshot["amount"]
     lock_key = snapshot["lock_key"]
     lock_val = snapshot["lock_val"]
+
+    # Ensure there is a COMMIT ledger row before attempting the atomic local commit.
+    if not entry:
+        created = payment_ledger.create_entry(db, tx_id, COMMIT_PAYMENT, {})
+        if not created:
+            entry = payment_ledger.get_entry(db, tx_id, COMMIT_PAYMENT)
+            if not entry:
+                logger.error(f"[Payment2PC] COMMIT_PAYMENT tx={tx_id} failed to create/read commit ledger")
+                return
+
+    ledger_key = _ledger_key(tx_id, COMMIT_PAYMENT)
 
     max_retries = 5
     committed = False
     for _ in range(max_retries):
         try:
             with db.pipeline() as pipe:
-                pipe.watch(user_id, lock_key)
+                pipe.watch(user_id, lock_key, ledger_key)
+
+                raw_commit = pipe.get(ledger_key)
+                if not raw_commit:
+                    logger.error(f"[Payment2PC] COMMIT_PAYMENT tx={tx_id} missing commit ledger row")
+                    pipe.unwatch()
+                    return
+
+                commit_entry = json.loads(raw_commit)
+                state = commit_entry.get("local_state")
+                if state in (LedgerState.APPLIED, LedgerState.REPLIED):
+                    pipe.unwatch()
+                    producer.publish(PAYMENT_EVENTS_TOPIC, build_payment_committed(tx_id, order_id))
+                    payment_ledger.mark_replied(db, tx_id, COMMIT_PAYMENT)
+                    return
 
                 if pipe.get(lock_key) != lock_val.encode():
                     logger.warning(
@@ -156,9 +209,21 @@ def _handle_commit_payment(msg, db, producer, logger):
                     pipe.unwatch()
                     return
 
+                updated_commit_entry = _build_applied_entry(
+                    commit_entry,
+                    "success",
+                    PAYMENT_COMMITTED,
+                    {},
+                )
+
                 pipe.multi()
                 pipe.set(user_id, msgpack.encode(user_entry))
                 pipe.delete(lock_key)
+                pipe.set(
+                    ledger_key,
+                    json.dumps(updated_commit_entry),
+                    ex=payment_ledger.LEDGER_TTL_SECONDS,
+                )
                 pipe.execute()
                 committed = True
                 break
@@ -169,11 +234,10 @@ def _handle_commit_payment(msg, db, producer, logger):
         logger.warning(f"[Payment2PC] COMMIT_PAYMENT tx={tx_id} failed after retries, will rely on resend")
         return
 
-    payment_ledger.create_entry(db, tx_id, COMMIT_PAYMENT, {})
-    payment_ledger.mark_applied(db, tx_id, COMMIT_PAYMENT, "success", PAYMENT_COMMITTED, {})
     producer.publish(PAYMENT_EVENTS_TOPIC, build_payment_committed(tx_id, order_id))
     payment_ledger.mark_replied(db, tx_id, COMMIT_PAYMENT)
     logger.info(f"[Payment2PC] order={order_id} PAYMENT_COMMITTED atomically, lock released")
+
 
 
 # ---------------- ABORT ----------------

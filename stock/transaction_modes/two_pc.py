@@ -1,8 +1,7 @@
-from collections import defaultdict
+import json
+import time
 
 import redis as redis_module
-import time
-import uuid
 from msgspec import msgpack
 
 from common.messages import (
@@ -19,12 +18,13 @@ from common.messages import (
     build_stock_aborted,
     build_stock_committed,
     build_stock_prepare_failed,
-    build_stock_prepared
+    build_stock_prepared,
 )
 
 import ledger as stock_ledger
 from ledger import LedgerState
 from common.kafka_client import KafkaProducerClient
+
 
 LOCK_TTL = 10000  # milliseconds
 
@@ -38,6 +38,207 @@ def _2pc_route_stock(msg: dict, db: redis_module.Redis, producer: KafkaProducerC
         _handle_abort_stock(msg, db, producer, logger)
     else:
         logger.info(f"[Stock2PC] Unknown command type: {msg_type!r} — dropping")
+    
+
+def _ledger_key(tx_id: str, action_type: str) -> str:
+    return f"stock:ledger:{tx_id}:{action_type}"
+
+
+def _build_applied_entry(
+    entry: dict,
+    result: str,
+    response_event_type: str,
+    response_payload: dict,
+) -> dict:
+    updated = dict(entry)
+    updated["local_state"] = LedgerState.APPLIED
+    updated["result"] = result
+    updated["response_event_type"] = response_event_type
+    updated["response_payload"] = response_payload
+    updated["updated_at_ms"] = int(time.time() * 1000)
+    return updated
+
+
+def _merge_items(items: list[dict]) -> dict[str, int]:
+    qty_by_item: dict[str, int] = {}
+    for item in items:
+        item_id = str(item.get("item_id", ""))
+        quantity = item.get("quantity")
+        if not item_id or quantity is None:
+            raise RuntimeError("Invalid item payload")
+        qty_by_item[item_id] = qty_by_item.get(item_id, 0) + int(quantity)
+    return qty_by_item
+
+
+def _prepare_stock_atomically(
+    db: redis_module.Redis,
+    tx_id: str,
+    order_id: str,
+    items: list[dict],
+) -> tuple[dict, str]:
+    from app import StockValue
+
+    if not items:
+        raise RuntimeError("No items in payload")
+
+    qty_by_item = _merge_items(items)
+    item_ids = sorted(qty_by_item.keys())
+    ledger_key = _ledger_key(tx_id, PREPARE_STOCK)
+
+    while True:
+        pipe = db.pipeline()
+        try:
+            pipe.watch(ledger_key, *item_ids)
+
+            raw_entry = pipe.get(ledger_key)
+            if not raw_entry:
+                pipe.unwatch()
+                raise RuntimeError(f"Missing PREPARE_STOCK ledger entry for tx={tx_id}")
+
+            entry = json.loads(raw_entry)
+            state = entry.get("local_state")
+            if state in (LedgerState.APPLIED, LedgerState.REPLIED):
+                pipe.unwatch()
+                reply = build_message(
+                    tx_id,
+                    order_id,
+                    entry["response_event_type"],
+                    entry.get("response_payload", {}),
+                )
+                return reply, entry.get("result", "success")
+
+            current_rows = pipe.mget(item_ids)
+            updated_rows: dict[str, bytes] = {}
+
+            for item_id, raw in zip(item_ids, current_rows):
+                if not raw:
+                    reason = f"Item {item_id} not found"
+                    reply = build_stock_prepare_failed(tx_id, order_id, reason)
+                    updated_entry = _build_applied_entry(
+                        entry,
+                        "failure",
+                        STOCK_PREPARE_FAILED,
+                        {"reason": reason},
+                    )
+
+                    pipe.multi()
+                    pipe.set(ledger_key, json.dumps(updated_entry), ex=stock_ledger.LEDGER_TTL_SECONDS)
+                    pipe.execute()
+                    return reply, "failure"
+
+                item_entry = msgpack.decode(raw, type=StockValue)
+                needed = qty_by_item[item_id]
+                if item_entry.stock < needed:
+                    reason = f"Insufficient stock for item {item_id} (have {item_entry.stock}, need {needed})"
+                    reply = build_stock_prepare_failed(tx_id, order_id, reason)
+                    updated_entry = _build_applied_entry(
+                        entry,
+                        "failure",
+                        STOCK_PREPARE_FAILED,
+                        {"reason": reason},
+                    )
+
+                    pipe.multi()
+                    pipe.set(ledger_key, json.dumps(updated_entry), ex=stock_ledger.LEDGER_TTL_SECONDS)
+                    pipe.execute()
+                    return reply, "failure"
+
+                updated_item = StockValue(
+                    stock=item_entry.stock - needed,
+                    price=item_entry.price,
+                )
+                updated_rows[item_id] = msgpack.encode(updated_item)
+
+            reply = build_stock_prepared(tx_id, order_id)
+            updated_entry = _build_applied_entry(entry, "success", STOCK_PREPARED, {})
+
+            pipe.multi()
+            for item_id, encoded in updated_rows.items():
+                pipe.set(item_id, encoded)
+            pipe.set(ledger_key, json.dumps(updated_entry), ex=stock_ledger.LEDGER_TTL_SECONDS)
+            pipe.execute()
+            return reply, "success"
+
+        except redis_module.WatchError:
+            continue
+        finally:
+            pipe.reset()
+
+
+def _abort_stock_atomically(
+    db: redis_module.Redis,
+    tx_id: str,
+    order_id: str,
+) -> dict:
+    from app import StockValue
+
+    abort_key = _ledger_key(tx_id, ABORT_STOCK)
+    prepare_entry = stock_ledger.get_entry(db, tx_id, PREPARE_STOCK)
+
+    reserve_succeeded = (
+        prepare_entry is not None and prepare_entry.get("result") == "success"
+    )
+    items = prepare_entry["business_snapshot"]["items"] if reserve_succeeded else []
+    qty_by_item = _merge_items(items) if reserve_succeeded else {}
+    item_ids = sorted(qty_by_item.keys())
+
+    while True:
+        pipe = db.pipeline()
+        try:
+            pipe.watch(abort_key, *item_ids)
+
+            raw_abort = pipe.get(abort_key)
+            if not raw_abort:
+                pipe.unwatch()
+                raise RuntimeError(f"Missing ABORT_STOCK ledger entry for tx={tx_id}")
+
+            abort_entry = json.loads(raw_abort)
+            state = abort_entry.get("local_state")
+            if state in (LedgerState.APPLIED, LedgerState.REPLIED):
+                pipe.unwatch()
+                return build_message(
+                    tx_id,
+                    order_id,
+                    abort_entry["response_event_type"],
+                    abort_entry.get("response_payload", {}),
+                )
+
+            updated_abort = _build_applied_entry(abort_entry, "success", STOCK_ABORTED, {})
+            reply = build_stock_aborted(tx_id, order_id)
+
+            if not reserve_succeeded:
+                pipe.multi()
+                pipe.set(abort_key, json.dumps(updated_abort), ex=stock_ledger.LEDGER_TTL_SECONDS)
+                pipe.execute()
+                return reply
+
+            current_rows = pipe.mget(item_ids)
+            updated_rows: dict[str, bytes] = {}
+
+            for item_id, raw in zip(item_ids, current_rows):
+                if not raw:
+                    pipe.unwatch()
+                    raise RuntimeError(f"Missing item row {item_id} during ABORT_STOCK tx={tx_id}")
+
+                item_entry = msgpack.decode(raw, type=StockValue)
+                updated_item = StockValue(
+                    stock=item_entry.stock + qty_by_item[item_id],
+                    price=item_entry.price,
+                )
+                updated_rows[item_id] = msgpack.encode(updated_item)
+
+            pipe.multi()
+            for item_id, encoded in updated_rows.items():
+                pipe.set(item_id, encoded)
+            pipe.set(abort_key, json.dumps(updated_abort), ex=stock_ledger.LEDGER_TTL_SECONDS)
+            pipe.execute()
+            return reply
+
+        except redis_module.WatchError:
+            continue
+        finally:
+            pipe.reset()
+
 
 # def _handle_prepare_stock(
 #     msg: dict,
@@ -69,155 +270,93 @@ def _2pc_route_stock(msg: dict, db: redis_module.Redis, producer: KafkaProducerC
 
 # ---------------- PREPARE ----------------
 def _handle_prepare_stock(msg, db, producer, logger):
-    from app import get_item_from_db
     order_id = msg.get("order_id")
     tx_id = msg.get("tx_id")
     items = msg.get("payload", {}).get("items", [])
     action_type = PREPARE_STOCK
 
-    logger.info(f"[Stock2PC] order={order_id} PREPARING_STOCK\n")
+    logger.info(f"[Stock2PC] order={order_id} PREPARING_STOCK")
 
-    # Duplicate check via ledger
     entry = stock_ledger.get_entry(db, tx_id, action_type)
     if entry:
-        if entry["local_state"] in [LedgerState.APPLIED, LedgerState.REPLIED]:
-            producer.publish(STOCK_EVENTS_TOPIC,
-                             build_message(tx_id, order_id, entry["response_event_type"], entry["response_payload"]))
+        if entry["local_state"] in (LedgerState.APPLIED, LedgerState.REPLIED):
+            producer.publish(
+                STOCK_EVENTS_TOPIC,
+                build_message(
+                    tx_id,
+                    order_id,
+                    entry["response_event_type"],
+                    entry.get("response_payload", {}),
+                ),
+            )
             stock_ledger.mark_replied(db, tx_id, action_type)
-        return
-
-    logger.info(f"[Stock2PC] order={order_id} DUPLICATE_CHECK_PASSED\n")
-    # Attempt to acquire per-item locks
-    item_locks = {}
-    for item in items:
-        lock_key = f"lock:stock:item:{item['item_id']}"
-        lock_val = str(uuid.uuid4())
-        logger.info(f"[Stock2PC] order={order_id} before db.set in locks\n")
-        acquired = db.set(lock_key, lock_val, nx=True, px=LOCK_TTL)
-        if not acquired:
-            for k, v in item_locks.items():
-                if db.get(k) == v.encode():
-                    db.delete(k)
-            logger.info(f"[Stock2PC] order={order_id} fails during lock acquisition\n")
-            producer.publish(STOCK_EVENTS_TOPIC,
-                             build_stock_prepare_failed(tx_id, order_id, f"Item {item['item_id']} locked"))
             return
-        item_locks[lock_key] = lock_val
 
-    logger.info(f"[Stock2PC] order={order_id} LOCKS_SET\n")
+    if not entry:
+        created = stock_ledger.create_entry(
+            db,
+            tx_id,
+            action_type,
+            {"items": items},
+        )
+        if not created:
+            entry = stock_ledger.get_entry(db, tx_id, action_type)
+            if not entry:
+                logger.error(f"[Stock2PC] order={order_id} failed to create/read PREPARE ledger")
+                return
 
-    # Check stock availability (without deducting)
-    failed_items = []
-    for item in items:
-        item_obj = get_item_from_db(item['item_id'])
-        qty = item_obj.stock if item_obj else 0
-        logger.info(f"[Stock2PC] order={order_id} item {item['item_id']} has {qty} in stock which should be >= {item['quantity']}\n")
-        if qty < item['quantity']:
-            failed_items.append(item['item_id'])
-
-    if failed_items:
-        for k, v in item_locks.items():
-            if db.get(k) == v.encode():
-                db.delete(k)
-        logger.info(f"[Stock2PC] order={order_id} fails after item quantity check\n")
-        producer.publish(STOCK_EVENTS_TOPIC,
-                         build_stock_prepare_failed(tx_id, order_id, f"Out of stock {failed_items}"))
+    try:
+        reply, result = _prepare_stock_atomically(db, tx_id, order_id, items)
+    except RuntimeError as exc:
+        logger.error(f"[Stock2PC] PREPARE_STOCK tx={tx_id} failed: {exc}")
         return
 
-    # Create ledger entry marking as ready
-    snapshot = {"items": items, "item_locks": item_locks}
-    stock_ledger.create_entry(db, tx_id, action_type, snapshot)
-    stock_ledger.mark_applied(db, tx_id, action_type, "success", STOCK_PREPARED, {})
-
-    # Publish ready event
-    producer.publish(STOCK_EVENTS_TOPIC, build_stock_prepared(tx_id, order_id))
-    logger.info(f"[Stock2PC] order={order_id} STOCK_PREPARED")
+    producer.publish(STOCK_EVENTS_TOPIC, reply)
+    stock_ledger.mark_replied(db, tx_id, action_type)
+    logger.info(f"[Stock2PC] order={order_id} PREPARE_STOCK {result}")
 
 
 # ---------------- COMMIT ----------------
 def _handle_commit_stock(msg, db, producer, logger):
-    from app import StockValue
     order_id = msg.get("order_id")
     tx_id = msg.get("tx_id")
 
-    # Dedup
     entry = stock_ledger.get_entry(db, tx_id, COMMIT_STOCK)
     if entry and entry.get("local_state") in (LedgerState.APPLIED, LedgerState.REPLIED):
-        producer.publish(STOCK_EVENTS_TOPIC, build_stock_committed(tx_id, order_id))
+        producer.publish(
+            STOCK_EVENTS_TOPIC,
+            build_message(
+                tx_id,
+                order_id,
+                entry["response_event_type"],
+                entry.get("response_payload", {}),
+            ),
+        )
+        stock_ledger.mark_replied(db, tx_id, COMMIT_STOCK)
         return
 
-    # Read items and locks from the PREPARE entry
     prepare_entry = stock_ledger.get_entry(db, tx_id, PREPARE_STOCK)
     if not prepare_entry or prepare_entry.get("result") != "success":
         logger.info(f"[Stock2PC] COMMIT_STOCK tx={tx_id} -- no successful PREPARE found, ignoring")
         return
 
-    items      = prepare_entry["business_snapshot"]["items"]
-    item_locks = prepare_entry["business_snapshot"].get("item_locks", {})
+    if not entry:
+        created = stock_ledger.create_entry(db, tx_id, COMMIT_STOCK, {})
+        if not created:
+            entry = stock_ledger.get_entry(db, tx_id, COMMIT_STOCK)
+            if not entry:
+                logger.error(f"[Stock2PC] order={order_id} failed to create/read COMMIT ledger")
+                return
 
-    # Merge duplicate items so each Redis row is updated once in the transaction.
-    qty_by_item: dict[str, int] = {}
-    for item in items:
-        item_id = item["item_id"]
-        qty_by_item[item_id] = qty_by_item.get(item_id, 0) + int(item["quantity"])
-
-    item_ids = list(qty_by_item.keys())
-    lock_keys = list(item_locks.keys())
-
-    max_retries = 5
-    committed = False
-    for _ in range(max_retries):
-        try:
-            with db.pipeline() as pipe:
-                watch_keys = item_ids + lock_keys
-                if watch_keys:
-                    pipe.watch(*watch_keys)
-
-                # Ensure we still own all prepare locks.
-                for lock_key, lock_val in item_locks.items():
-                    if pipe.get(lock_key) != lock_val.encode():
-                        logger.warning(f"[Stock2PC] COMMIT_STOCK tx={tx_id} lock lost for {lock_key}")
-                        pipe.unwatch()
-                        return
-
-                current_rows = pipe.mget(item_ids)
-                updated_rows: dict[str, bytes] = {}
-                for item_id, raw in zip(item_ids, current_rows):
-                    if not raw:
-                        logger.error(f"[Stock2PC] COMMIT_STOCK tx={tx_id} missing item row {item_id}")
-                        pipe.unwatch()
-                        return
-
-                    item_entry = msgpack.decode(raw, type=StockValue)
-                    item_entry.stock -= qty_by_item[item_id]
-                    if item_entry.stock < 0:
-                        logger.error(
-                            f"[Stock2PC] COMMIT_STOCK tx={tx_id} would make {item_id} negative"
-                        )
-                        pipe.unwatch()
-                        return
-                    updated_rows[item_id] = msgpack.encode(item_entry)
-
-                pipe.multi()
-                for item_id, encoded in updated_rows.items():
-                    pipe.set(item_id, encoded)
-                if lock_keys:
-                    pipe.delete(*lock_keys)
-                pipe.execute()
-                committed = True
-                break
-        except redis_module.WatchError:
-            continue
-
-    if not committed:
-        logger.warning(f"[Stock2PC] COMMIT_STOCK tx={tx_id} failed after retries, will rely on resend")
+    ok = stock_ledger.mark_applied(db, tx_id, COMMIT_STOCK, "success", STOCK_COMMITTED, {})
+    if not ok:
+        logger.error(f"[Stock2PC] order={order_id} failed to mark COMMIT_STOCK applied")
         return
 
-    stock_ledger.create_entry(db, tx_id, COMMIT_STOCK, {})
-    stock_ledger.mark_applied(db, tx_id, COMMIT_STOCK, "success", STOCK_COMMITTED, {})
     producer.publish(STOCK_EVENTS_TOPIC, build_stock_committed(tx_id, order_id))
     stock_ledger.mark_replied(db, tx_id, COMMIT_STOCK)
-    logger.info(f"[Stock2PC] order={order_id} STOCK_COMMITTED atomically, locks released")
+    logger.info(f"[Stock2PC] order={order_id} STOCK_COMMITTED")
+
 
 
 # ---------------- ABORT ----------------
@@ -225,25 +364,36 @@ def _handle_abort_stock(msg, db, producer, logger):
     order_id = msg.get("order_id")
     tx_id = msg.get("tx_id")
 
-    # Dedup
     entry = stock_ledger.get_entry(db, tx_id, ABORT_STOCK)
     if entry and entry.get("local_state") in (LedgerState.APPLIED, LedgerState.REPLIED):
-        producer.publish(STOCK_EVENTS_TOPIC, build_stock_aborted(tx_id, order_id))
+        producer.publish(
+            STOCK_EVENTS_TOPIC,
+            build_message(
+                tx_id,
+                order_id,
+                entry["response_event_type"],
+                entry.get("response_payload", {}),
+            ),
+        )
+        stock_ledger.mark_replied(db, tx_id, ABORT_STOCK)
         return
 
-    # Read locks from the PREPARE entry — stock was never touched, just release locks
-    prepare_entry = stock_ledger.get_entry(db, tx_id, PREPARE_STOCK)
-    if prepare_entry and prepare_entry.get("result") == "success":
-        item_locks = prepare_entry["business_snapshot"].get("item_locks", {})
-        for k, v in item_locks.items():
-                if db.get(k) == v.encode():
-                    db.delete(k)
-    else:
-        logger.info(f"[Stock2PC] ABORT_STOCK tx={tx_id} -- PREPARE did not succeed, nothing to release")
+    if not entry:
+        created = stock_ledger.create_entry(db, tx_id, ABORT_STOCK, {})
+        if not created:
+            entry = stock_ledger.get_entry(db, tx_id, ABORT_STOCK)
+            if not entry:
+                logger.error(f"[Stock2PC] order={order_id} failed to create/read ABORT ledger")
+                return
 
-    stock_ledger.create_entry(db, tx_id, ABORT_STOCK, {})
-    stock_ledger.mark_applied(db, tx_id, ABORT_STOCK, "success", STOCK_ABORTED, {})
-    producer.publish(STOCK_EVENTS_TOPIC, build_stock_aborted(tx_id, order_id))
+    try:
+        reply = _abort_stock_atomically(db, tx_id, order_id)
+    except RuntimeError as exc:
+        logger.error(f"[Stock2PC] ABORT_STOCK tx={tx_id} failed: {exc}")
+        return
+
+    producer.publish(STOCK_EVENTS_TOPIC, reply)
     stock_ledger.mark_replied(db, tx_id, ABORT_STOCK)
-    logger.info(f"[Stock2PC] order={order_id} STOCK_ABORTED, locks released")
+    logger.info(f"[Stock2PC] order={order_id} STOCK_ABORTED")
+
     
