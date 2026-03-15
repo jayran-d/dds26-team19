@@ -37,9 +37,9 @@ def _evaluate_2pc(producer, db, logger, order_id):
             logger.warning(f"[Order2PC] order={order_id} missing tx_id, cannot abort")
             return
         tx_id = tx_id.decode()
+        db.hset(_2pc_key(order_id), "decision", DECISION_ABORT)
         producer.publish(STOCK_COMMANDS_TOPIC, build_abort_stock(tx_id, order_id))
         producer.publish(PAYMENT_COMMANDS_TOPIC, build_abort_payment(tx_id, order_id))
-        db.hset(_2pc_key(order_id), "decision", DECISION_ABORT)
         set_status(logger, db, order_id, "failed")
         return
 

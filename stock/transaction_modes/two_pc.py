@@ -84,11 +84,25 @@ def _prepare_stock_atomically(
     qty_by_item = _merge_items(items)
     item_ids = sorted(qty_by_item.keys())
     ledger_key = _ledger_key(tx_id, PREPARE_STOCK)
+    abort_key = _ledger_key(tx_id, ABORT_STOCK)
 
     while True:
         pipe = db.pipeline()
         try:
-            pipe.watch(ledger_key, *item_ids)
+            pipe.watch(ledger_key, abort_key, *item_ids)
+
+            raw_abort = pipe.get(abort_key)
+            if raw_abort:
+                abort_entry = json.loads(raw_abort)
+                if abort_entry.get("local_state") in (LedgerState.APPLIED, LedgerState.REPLIED):
+                    pipe.unwatch()
+                    reply = build_message(
+                        tx_id,
+                        order_id,
+                        abort_entry["response_event_type"],
+                        abort_entry.get("response_payload", {}),
+                    )
+                    return reply, "aborted"
 
             raw_entry = pipe.get(ledger_key)
             if not raw_entry:
@@ -173,19 +187,22 @@ def _abort_stock_atomically(
     from app import StockValue
 
     abort_key = _ledger_key(tx_id, ABORT_STOCK)
+    prepare_key = _ledger_key(tx_id, PREPARE_STOCK)
     prepare_entry = stock_ledger.get_entry(db, tx_id, PREPARE_STOCK)
 
-    reserve_succeeded = (
-        prepare_entry is not None and prepare_entry.get("result") == "success"
-    )
-    items = prepare_entry["business_snapshot"]["items"] if reserve_succeeded else []
-    qty_by_item = _merge_items(items) if reserve_succeeded else {}
-    item_ids = sorted(qty_by_item.keys())
+    qty_by_item: dict[str, int] = {}
+    item_ids: list[str] = []
+    if prepare_entry:
+        snapshot = prepare_entry.get("business_snapshot", {})
+        items = snapshot.get("items", [])
+        if items:
+            qty_by_item = _merge_items(items)
+            item_ids = sorted(qty_by_item.keys())
 
     while True:
         pipe = db.pipeline()
         try:
-            pipe.watch(abort_key, *item_ids)
+            pipe.watch(abort_key, prepare_key, *item_ids)
 
             raw_abort = pipe.get(abort_key)
             if not raw_abort:
@@ -203,10 +220,24 @@ def _abort_stock_atomically(
                     abort_entry.get("response_payload", {}),
                 )
 
+            raw_prepare = pipe.get(prepare_key)
+            prepare_entry = json.loads(raw_prepare) if raw_prepare else None
+            reserve_succeeded = (
+                prepare_entry is not None and prepare_entry.get("result") == "success"
+            )
+            if prepare_entry and not item_ids:
+                snapshot = prepare_entry.get("business_snapshot", {})
+                discovered_items = snapshot.get("items", [])
+                if discovered_items:
+                    qty_by_item = _merge_items(discovered_items)
+                    item_ids = sorted(qty_by_item.keys())
+                    pipe.unwatch()
+                    continue
+
             updated_abort = _build_applied_entry(abort_entry, "success", STOCK_ABORTED, {})
             reply = build_stock_aborted(tx_id, order_id)
 
-            if not reserve_succeeded:
+            if not reserve_succeeded or not item_ids:
                 pipe.multi()
                 pipe.set(abort_key, json.dumps(updated_abort), ex=stock_ledger.LEDGER_TTL_SECONDS)
                 pipe.execute()
@@ -277,6 +308,19 @@ def _handle_prepare_stock(msg, db, producer, logger):
 
     logger.info(f"[Stock2PC] order={order_id} PREPARING_STOCK")
 
+    abort_entry = stock_ledger.get_entry(db, tx_id, ABORT_STOCK)
+    if abort_entry and abort_entry.get("local_state") in (LedgerState.APPLIED, LedgerState.REPLIED):
+        producer.publish(
+            STOCK_EVENTS_TOPIC,
+            build_message(
+                tx_id,
+                order_id,
+                abort_entry["response_event_type"],
+                abort_entry.get("response_payload", {}),
+            ),
+        )
+        return
+
     entry = stock_ledger.get_entry(db, tx_id, action_type)
     if entry:
         if entry["local_state"] in (LedgerState.APPLIED, LedgerState.REPLIED):
@@ -312,7 +356,8 @@ def _handle_prepare_stock(msg, db, producer, logger):
         return
 
     producer.publish(STOCK_EVENTS_TOPIC, reply)
-    stock_ledger.mark_replied(db, tx_id, action_type)
+    if reply.get("type") in (STOCK_PREPARED, STOCK_PREPARE_FAILED):
+        stock_ledger.mark_replied(db, tx_id, action_type)
     logger.info(f"[Stock2PC] order={order_id} PREPARE_STOCK {result}")
 
 
