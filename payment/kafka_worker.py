@@ -21,8 +21,10 @@ from common.kafka_client import KafkaProducerClient, KafkaConsumerClient
 from common.messages import (
     ALL_TOPICS,
     PAYMENT_COMMANDS_TOPIC,
+    PAYMENT_EVENTS_TOPIC,
 )
 
+import ledger as payment_ledger
 from transactions_modes.simple import simple_route_payment
 from transactions_modes.saga import saga_route_payment
 from transactions_modes.two_pc import _2pc_route_payment
@@ -61,14 +63,19 @@ def init_kafka(logger, db) -> None:
     _consumer = KafkaConsumerClient(
         topics=[PAYMENT_COMMANDS_TOPIC],
         group_id="payment-service",
+        # Manual commit is required for Saga durability:
+        # Kafka must not acknowledge a command before we have durably handled it.
         auto_commit=False,
         auto_offset_reset="earliest",
         ensure_topics=ALL_TOPICS,
     )
 
+    _replay_unreplied_entries()
+
     thread = threading.Thread(target=_consumer_loop, daemon=True)
     thread.start()
     logger.info("[PaymentKafka] Consumer thread started")
+
 
 
 def close_kafka() -> None:
@@ -109,6 +116,9 @@ def _consumer_loop() -> None:
             _consumer.commit()
 
         except Exception as exc:
+            # Intentionally do NOT commit here.
+            # If we crashed before durable handling completed, we want Kafka
+            # to redeliver the command after restart.
             _logger.info(f"[PaymentKafka] Consumer loop crashed: {exc}")
             time.sleep(1)
 
@@ -126,3 +136,25 @@ def _route_command(msg: dict) -> None:
         saga_route_payment(msg, _db, _producer.publish, _logger)
     elif TRANSACTION_MODE == "2pc":
         _2pc_route_payment(_producer, _db, _logger, msg, msg_type)
+
+
+def _replay_unreplied_entries() -> None:
+    if TRANSACTION_MODE != "saga" or _db is None or _producer is None:
+        return
+
+    entries = payment_ledger.get_unreplied_entries(_db)
+    if not entries:
+        return
+
+    _logger.info(f"[PaymentKafka] Replaying {len(entries)} unreplied payment ledger entries")
+
+    for entry in entries:
+        reply_message = entry.get("reply_message")
+        if not reply_message:
+            _logger.warning(
+                f"[PaymentKafka] Missing reply_message in ledger tx={entry.get('tx_id')} action={entry.get('action_type')}"
+            )
+            continue
+
+        _producer.publish(PAYMENT_EVENTS_TOPIC, reply_message)
+        payment_ledger.mark_replied(_db, entry["tx_id"], entry["action_type"])

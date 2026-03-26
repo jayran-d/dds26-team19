@@ -51,7 +51,7 @@ def simple_start_checkout(
 
     msg = build_reserve_stock(tx_id=tx_id, order_id=order_id, items=items)
     producer.publish(STOCK_COMMANDS_TOPIC, msg)
-    logger.debug(f"[Simple] order={order_id} tx={tx_id} RESERVE_STOCK published")
+    logger.info(f"[Simple] order={order_id} tx={tx_id} RESERVE_STOCK published")
 
 
 def simple_route_order(
@@ -72,7 +72,7 @@ def simple_route_order(
     if handler:
         handler(producer, db, logger, msg)
     else:
-        logger.warning(f"[Simple] Unknown event type: {msg_type!r} — dropping")
+        logger.info(f"[Simple] Unknown event type: {msg_type!r} — dropping")
 
 
 def simple_on_stock_reserved(
@@ -108,7 +108,7 @@ def simple_on_stock_reservation_failed(
 ) -> None:
     """Stock reservation failed — nothing was reserved, just mark failed."""
     order_id = msg.get("order_id")
-    logger.debug(
+    logger.info(
         f"[Simple] order={order_id} stock reservation failed — no rollback needed"
     )
     set_status(logger, db, order_id, "failed")
@@ -119,7 +119,7 @@ def simple_on_stock_released(
 ) -> None:
     """Stock successfully released after a payment failure — mark order failed."""
     order_id = msg.get("order_id")
-    logger.debug(f"[Simple] order={order_id} stock released — marking failed")
+    logger.info(f"[Simple] order={order_id} stock released — marking failed")
     set_status(logger, db, order_id, "failed")
 
 
@@ -146,7 +146,7 @@ def simple_on_payment_success(
     )
     db.set(order_id, msgpack.encode(order))
     set_status(logger, db, order_id, "completed")
-    logger.debug(f"[Simple] order={order_id} marked paid — COMPLETED")
+    logger.info(f"[Simple] order={order_id} marked paid — COMPLETED")
 
 
 def simple_on_payment_failed(
@@ -179,4 +179,4 @@ def simple_on_payment_failed(
 
     producer.publish(STOCK_COMMANDS_TOPIC, release_msg)
 
-    logger.debug(f"[Simple] order={order_id} payment failed — RELEASE_STOCK published")
+    logger.info(f"[Simple] order={order_id} payment failed — RELEASE_STOCK published")

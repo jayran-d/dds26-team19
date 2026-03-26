@@ -65,16 +65,16 @@ def create_entry(
     Uses SET NX so duplicate commands don't overwrite a progressed entry.
     Returns True on success, False on Redis error or if entry already exists.
     """
+    now = int(time.time() * 1000)
     entry = {
-        "tx_id":               tx_id,
-        "action_type":         action_type,
-        "local_state":         LedgerState.RECEIVED,
-        "result":              None,
-        "response_event_type": None,
-        "response_payload":    None,
-        "business_snapshot":   business_snapshot,
-        "created_at_ms":       int(time.time() * 1000),
-        "updated_at_ms":       int(time.time() * 1000),
+        "tx_id": tx_id,
+        "action_type": action_type,
+        "local_state": LedgerState.RECEIVED,
+        "result": None,
+        "reply_message": None,
+        "business_snapshot": business_snapshot,
+        "created_at_ms": now,
+        "updated_at_ms": now,
     }
     try:
         key = _key(tx_id, action_type)
@@ -89,8 +89,7 @@ def mark_applied(
     tx_id:               str,
     action_type:         str,
     result:              str,
-    response_event_type: str,
-    response_payload:    dict,
+    reply_message:       dict,
 ) -> bool:
     """
     Transition ledger entry to state=applied.
@@ -106,11 +105,10 @@ def mark_applied(
         if not raw:
             return False
         entry = json.loads(raw)
-        entry["local_state"]         = LedgerState.APPLIED
-        entry["result"]              = result
-        entry["response_event_type"] = response_event_type
-        entry["response_payload"]    = response_payload
-        entry["updated_at_ms"]       = int(time.time() * 1000)
+        entry["local_state"] = LedgerState.APPLIED
+        entry["result"] = result
+        entry["reply_message"] = reply_message
+        entry["updated_at_ms"] = int(time.time() * 1000)
         db.set(key, json.dumps(entry), ex=LEDGER_TTL_SECONDS)
         return True
     except Exception:

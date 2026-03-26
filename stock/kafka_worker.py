@@ -23,7 +23,10 @@ from common.kafka_client import KafkaProducerClient, KafkaConsumerClient
 from common.messages import (
     ALL_TOPICS,
     STOCK_COMMANDS_TOPIC,
+    STOCK_EVENTS_TOPIC,
 )
+
+import ledger as stock_ledger
 
 from transaction_modes.saga import saga_route_stock
 from transaction_modes.simple import simple_route_stock
@@ -59,10 +62,14 @@ def init_kafka(logger, db) -> None:
     _consumer = KafkaConsumerClient(
         topics=[STOCK_COMMANDS_TOPIC],
         group_id="stock-service",
+        # Disable Kafka auto-acknowledgement.
+        # We only want to commit after local Saga handling is durable.
         auto_commit=False,
         auto_offset_reset="earliest",
         ensure_topics=ALL_TOPICS,
     )
+
+    _replay_unreplied_entries()
 
     thread = threading.Thread(target=_consumer_loop, daemon=True)
     thread.start()
@@ -103,6 +110,7 @@ def _consumer_loop() -> None:
             _consumer.commit()
 
         except Exception as exc:
+            # No commit on failure: let Kafka redeliver.
             _logger.info(f"[StockKafka] Consumer loop crashed: {exc}")
             time.sleep(1)
 
@@ -122,3 +130,25 @@ def _route_event(msg: dict) -> None:
         saga_route_stock(msg, _db, _producer.publish, _logger)
     elif TRANSACTION_MODE == "2pc":
         _2pc_route_stock(msg, _db, _producer, _logger)
+
+
+def _replay_unreplied_entries() -> None:
+    if TRANSACTION_MODE != "saga" or _db is None or _producer is None:
+        return
+
+    entries = stock_ledger.get_unreplied_entries(_db)
+    if not entries:
+        return
+
+    _logger.info(f"[StockKafka] Replaying {len(entries)} unreplied stock ledger entries")
+
+    for entry in entries:
+        reply_message = entry.get("reply_message")
+        if not reply_message:
+            _logger.warning(
+                f"[StockKafka] Missing reply_message in ledger tx={entry.get('tx_id')} action={entry.get('action_type')}"
+            )
+            continue
+
+        _producer.publish(STOCK_EVENTS_TOPIC, reply_message)
+        stock_ledger.mark_replied(_db, entry["tx_id"], entry["action_type"])

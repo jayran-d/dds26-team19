@@ -63,51 +63,64 @@ def saga_start_checkout(
     db: redis_module.Redis,
     logger,
     order_id: str,
-    order_entry,  # OrderValue msgspec struct
-) -> None:
+    order_entry,
+) -> dict:
     """
-    Called by kafka_worker.py when a checkout request comes in.
-    Creates the Saga record and fires the first command.
+    Start a new Saga only if this order does not already have an active one.
+
+    Return shape:
+        {"started": True,  "reason": "started",             "tx_id": "..."}
+        {"started": False, "reason": "already_in_progress", "tx_id": "..."}
+        {"started": False, "reason": "error"}
     """
     tx_id = str(uuid.uuid4())
 
-    # Collapse items — combine duplicate item_ids into one entry
+    # Collapse duplicate item_ids first so the Saga stores a canonical item list.
     item_counts = {}
     for item_id, quantity in order_entry.items:
         key = str(item_id)
         item_counts[key] = item_counts.get(key, 0) + quantity
     items = [{"item_id": k, "quantity": v} for k, v in item_counts.items()]
 
-    # Create Saga record — must happen before any publish
-    ok = saga_record.create(
+    ok, active_tx_id = saga_record.create_if_no_active(
         db=db,
         tx_id=tx_id,
         order_id=order_id,
         user_id=str(order_entry.user_id),
         amount=int(order_entry.total_cost),
         items=items,
-    )
-    if not ok:
-        logger.error(f"[Saga] Failed to create Saga record for order={order_id}")
-        return
-
-    # Store tx_id on the order so kafka_worker can look it up by order_id
-    db.set(f"order:{order_id}:tx_id", tx_id)
-
-    # Transition to reserving_stock BEFORE publishing
-    saga_record.transition(
-        db=db,
-        tx_id=tx_id,
-        new_state=SagaOrderStatus.RESERVING_STOCK,
+        initial_state=SagaOrderStatus.RESERVING_STOCK,
         last_command_type=RESERVE_STOCK,
         awaiting_event_type=STOCK_RESERVED,
     )
+
+    if not ok:
+        if active_tx_id:
+            logger.info(
+                f"[Saga] checkout already in progress for order={order_id} active_tx={active_tx_id}"
+            )
+            return {
+                "started": False,
+                "reason": "already_in_progress",
+                "tx_id": active_tx_id,
+            }
+
+        logger.error(f"[Saga] failed to create Saga record for order={order_id}")
+        return {"started": False, "reason": "error"}
+
+    # This pointer is redundant with the full saga record, but very convenient
+    # for tests, debugging, and tracing one order through the system.
+    db.set(f"order:{order_id}:tx_id", tx_id)
     _set_status(db, order_id, SagaOrderStatus.RESERVING_STOCK)
 
-    # Publish RESERVE_STOCK
+    # Important: the Saga record was already durably written before this publish.
+    # If publish fails or the service crashes now, recovery can replay RESERVE_STOCK.
     cmd = build_reserve_stock(tx_id, order_id, items)
     publish(STOCK_COMMANDS_TOPIC, cmd)
+
     logger.info(f"[Saga] started tx={tx_id} order={order_id}")
+    return {"started": True, "reason": "started", "tx_id": tx_id}
+
 
 
 # ============================================================
@@ -129,18 +142,21 @@ def saga_route_order(
     tx_id = msg.get("tx_id")
     order_id = msg.get("order_id")
 
-    # ── Dedup: drop exact duplicate Kafka messages ─────────────────────────────
+    if not message_id or not tx_id or not order_id:
+        logger.warning(f"[Saga] malformed event: {msg}")
+        return
+
     if saga_record.is_seen(db, message_id):
         logger.debug(f"[Saga] duplicate message_id={message_id} — dropping")
         return
-    saga_record.mark_seen(db, message_id)
 
-    # ── Stale check: drop events from old transaction attempts ─────────────────
     if saga_record.is_stale(db, order_id, tx_id):
+        # A later checkout attempt for the same order may already own a newer
+        # tx_id. Old events must be ignored so they cannot advance the wrong saga.
         logger.debug(f"[Saga] stale tx_id={tx_id} for order={order_id} — dropping")
+        saga_record.mark_seen(db, message_id)
         return
 
-    # ── Load Saga record ───────────────────────────────────────────────────────
     record = saga_record.get(db, tx_id)
     if not record:
         logger.warning(f"[Saga] no record found for tx_id={tx_id} — dropping")
@@ -148,14 +164,13 @@ def saga_route_order(
 
     state = record.get("state")
 
-    # ── Ignore events that arrive in terminal states ───────────────────────────
     if state in (SagaOrderStatus.COMPLETED, SagaOrderStatus.FAILED):
         logger.debug(
             f"[Saga] event {msg_type} arrived in terminal state={state} — dropping"
         )
+        saga_record.mark_seen(db, message_id)
         return
 
-    # ── Dispatch ───────────────────────────────────────────────────────────────
     if msg_type == STOCK_RESERVED:
         saga_on_stock_reserved(record, msg, db, publish, logger)
     elif msg_type == STOCK_RESERVATION_FAILED:
@@ -168,6 +183,11 @@ def saga_route_order(
         saga_on_payment_failed(record, msg, db, publish, logger)
     else:
         logger.warning(f"[Saga] unknown event type={msg_type} — dropping")
+        return
+
+    # Mark the event as processed only after the transition/publish logic
+    # finished. If we crash first, Kafka redelivery is still allowed.
+    saga_record.mark_seen(db, message_id)
 
 
 # ============================================================
@@ -182,7 +202,7 @@ def saga_on_stock_reserved(record, msg, db, publish, logger):
     amount = record["amount"]
 
     if record["state"] != SagaOrderStatus.RESERVING_STOCK:
-        logger.warning(
+        logger.info(
             f"[Saga] STOCK_RESERVED in unexpected state={record['state']} tx={tx_id}"
         )
         return
@@ -215,7 +235,6 @@ def saga_on_stock_reservation_failed(record, msg, db, logger):
         )
         return
 
-    # Stock was never reserved — no compensation needed, go straight to failed
     saga_record.transition(
         db=db,
         tx_id=tx_id,
@@ -224,6 +243,11 @@ def saga_on_stock_reservation_failed(record, msg, db, logger):
         reset_timeout=False,
     )
     _set_status(db, order_id, SagaOrderStatus.FAILED)
+
+    # Terminal state reached: release the active-order claim so a later retry
+    # can start a fresh transaction if the user wants to try again.
+    saga_record.clear_active_tx_id(db, order_id, tx_id)
+
     logger.info(f"[Saga] stock reservation failed tx={tx_id}: {reason}")
 
 
@@ -237,11 +261,13 @@ def saga_on_payment_success(record, msg, db, logger):
         )
         return
 
-    # Mark order as paid in Redis
+    from app import OrderValue
+
     raw = db.get(order_id)
     if raw:
-        order_entry = msgpack.decode(raw)
-        # OrderValue is a msgspec struct — rebuild with paid=True
+        # The order row is user-facing state. We only flip it to paid after the
+        # payment success event arrives, not when the command is sent.
+        order_entry = msgpack.decode(raw, type=OrderValue)
         updated = order_entry.__class__(
             user_id=order_entry.user_id,
             items=order_entry.items,
@@ -257,7 +283,12 @@ def saga_on_payment_success(record, msg, db, logger):
         reset_timeout=False,
     )
     _set_status(db, order_id, SagaOrderStatus.COMPLETED)
+
+    # Terminal success: free the active-order slot.
+    saga_record.clear_active_tx_id(db, order_id, tx_id)
+
     logger.info(f"[Saga] completed tx={tx_id} order={order_id}")
+
 
 
 def saga_on_payment_failed(record, msg, db, publish, logger):
@@ -266,14 +297,16 @@ def saga_on_payment_failed(record, msg, db, publish, logger):
     reason = msg.get("payload", {}).get("reason", "unknown")
 
     if record["state"] != SagaOrderStatus.PROCESSING_PAYMENT:
-        logger.warning(
+        logger.info(
             f"[Saga] PAYMENT_FAILED in unexpected state={record['state']} tx={tx_id}"
         )
         return
 
     items = record.get("items", [])
 
-    # Transition to compensating BEFORE publishing RELEASE_STOCK
+    # Persist the intent to compensate before publishing RELEASE_STOCK. If we
+    # crash after the state change but before the publish, startup recovery and
+    # timeout replay both know which command still has to be sent.
     saga_record.transition(
         db=db,
         tx_id=tx_id,
@@ -306,7 +339,12 @@ def saga_on_stock_released(record, msg, db, logger):
         reset_timeout=False,
     )
     _set_status(db, order_id, SagaOrderStatus.FAILED)
+
+    # Compensation finished: the order is no longer active.
+    saga_record.clear_active_tx_id(db, order_id, tx_id)
+
     logger.info(f"[Saga] compensation done → failed tx={tx_id}")
+
 
 
 # ============================================================
@@ -372,11 +410,12 @@ def check_timeouts(db: redis_module.Redis, publish, logger) -> None:
         tx_id = record["tx_id"]
         order_id = record["order_id"]
         state = record["state"]
-        logger.warning(
+        logger.info(
             f"[Saga] timeout detected tx={tx_id} order={order_id} state={state}"
         )
 
-        # Reset timeout before replaying so we don't spam every check cycle
+        # Reset the deadline before replaying so one slow participant does not
+        # cause the same command to be re-sent on every scanner iteration.
         saga_record.transition(
             db=db,
             tx_id=tx_id,

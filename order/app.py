@@ -24,10 +24,19 @@ REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
 USE_KAFKA   = os.getenv("USE_KAFKA", "false").lower() == "true"
-
 CHECKOUT_WAIT_TIMEOUT_SECONDS = float(os.getenv("CHECKOUT_WAIT_TIMEOUT_SECONDS", "45"))
 CHECKOUT_POLL_INTERVAL_SECONDS = float(os.getenv("CHECKOUT_POLL_INTERVAL_SECONDS", "0.05"))
-TERMINAL_CHECKOUT_STATUSES = {"completed", "failed"}
+
+IN_PROGRESS_STATUSES = {
+    SagaOrderStatus.RESERVING_STOCK,
+    SagaOrderStatus.PROCESSING_PAYMENT,
+    SagaOrderStatus.COMPENSATING,
+}
+
+TERMINAL_STATUSES = {
+    SagaOrderStatus.COMPLETED,
+    SagaOrderStatus.FAILED,
+}
 
 app = Flask("order-service")
 
@@ -72,19 +81,21 @@ def get_order_status(order_id: str) -> str | None:
     except redis.exceptions.RedisError:
         return None
 
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+
 def _wait_for_terminal_checkout_status(order_id: str) -> str | None:
     """
-    Wait until the Kafka-driven checkout reaches a terminal state.
+    Block until the Saga reaches a terminal state or the timeout expires.
 
-    This keeps the internal protocol asynchronous, but makes the external
-    HTTP API behave like the benchmark expects: POST /checkout returns the
-    final result instead of 202 Accepted.
+    This keeps the distributed transaction asynchronous internally, but gives
+    the external HTTP API a final success/failure result.
     """
     deadline = time.time() + CHECKOUT_WAIT_TIMEOUT_SECONDS
 
     while time.time() < deadline:
-        status = get_order_status(order_id)
-        if status in TERMINAL_CHECKOUT_STATUSES:
+        status = get_order_status(order_id) or SagaOrderStatus.PENDING
+        if status in TERMINAL_STATUSES:
             return status
         time.sleep(CHECKOUT_POLL_INTERVAL_SECONDS)
 
@@ -94,14 +105,14 @@ def _wait_for_terminal_checkout_status(order_id: str) -> str | None:
 def _build_terminal_checkout_response(order_id: str) -> Response:
     final_status = _wait_for_terminal_checkout_status(order_id)
 
-    if final_status == "completed":
+    if final_status == SagaOrderStatus.COMPLETED:
         return Response(
             "Checkout successful",
             status=200,
             headers={"Location": f"/orders/status/{order_id}"},
         )
 
-    if final_status == "failed":
+    if final_status == SagaOrderStatus.FAILED:
         return Response(
             "Checkout failed",
             status=400,
@@ -113,8 +124,6 @@ def _build_terminal_checkout_response(order_id: str) -> Response:
         status=400,
         headers={"Location": f"/orders/status/{order_id}"},
     )
-
-# ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
@@ -213,8 +222,9 @@ def add_item(order_id: str, item_id: str, quantity: int):
 def checkout(order_id: str):
     """
     Kafka path:
-        - start the distributed transaction
-        - return only when it reached completed/failed
+        - return a terminal HTTP result after the Saga finishes
+        - duplicate concurrent requests wait for the same active Saga instead of
+          starting a second checkout
 
     HTTP path:
         - synchronous fallback when USE_KAFKA=false
@@ -222,7 +232,7 @@ def checkout(order_id: str):
     order_entry: OrderValue = get_order_from_db(order_id)
     status = get_order_status(order_id)
 
-    if order_entry.paid or status == "completed":
+    if order_entry.paid or status == SagaOrderStatus.COMPLETED:
         return Response(
             "Order already completed",
             status=200,
@@ -230,16 +240,22 @@ def checkout(order_id: str):
         )
 
     if USE_KAFKA and is_available():
-        # If another request already started work for this order, just wait
-        # for the same terminal result instead of starting another transaction.
-        if status and status not in TERMINAL_CHECKOUT_STATUSES:
+        # If another request already started the Saga for this order,
+        # wait for its final result instead of starting a second one.
+        if status in IN_PROGRESS_STATUSES:
             return _build_terminal_checkout_response(order_id)
 
         try:
-            start_checkout(order_id, order_entry)
+            result = start_checkout(order_id, order_entry)
         except Exception as exc:
             app.logger.error(f"[checkout] failed to start: {exc}")
             abort(400, str(exc))
+
+        if isinstance(result, dict) and result.get("reason") == "already_in_progress":
+            return _build_terminal_checkout_response(order_id)
+
+        if isinstance(result, dict) and result.get("reason") == "error":
+            abort(400, "Failed to start checkout")
 
         return _build_terminal_checkout_response(order_id)
 
