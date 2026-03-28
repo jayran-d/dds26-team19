@@ -52,8 +52,8 @@ db: redis.Redis = redis.Redis(
 
 
 def close_connections():
-    db.close()
     close_kafka()
+    db.close()
 
 
 atexit.register(close_connections)
@@ -89,6 +89,7 @@ def get_order_status(order_id: str) -> str | None:
 
 def _wait_for_terminal_checkout_status(order_id: str) -> str | None:
     return wait_for_terminal_status(
+        db=db,
         order_id=order_id,
         get_status=get_order_status,
         timeout_seconds=CHECKOUT_WAIT_TIMEOUT_SECONDS,

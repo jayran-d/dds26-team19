@@ -40,6 +40,17 @@ EVENT_LOOP_CONSUMERS = max(
     1,
     int(os.getenv("ORDER_KAFKA_EVENT_CONSUMERS", os.getenv("KAFKA_NUM_PARTITIONS", "4"))),
 )
+COORDINATOR_KEY = os.getenv(
+    "ORDER_KAFKA_COORDINATOR_KEY",
+    "order:kafka:coordinator:leader",
+)
+COORDINATOR_LEASE_SECONDS = max(
+    TIMEOUT_SCAN_INTERVAL_SECONDS * 2,
+    int(os.getenv("ORDER_KAFKA_COORDINATOR_LEASE_SECONDS", "15")),
+)
+COORDINATOR_RETRY_INTERVAL_SECONDS = float(
+    os.getenv("ORDER_KAFKA_COORDINATOR_RETRY_INTERVAL_SECONDS", "1.0")
+)
 
 # ── Module-level state ─────────────────────────────────────────────────────────
 _producer: KafkaProducerClient | None = None
@@ -47,6 +58,7 @@ _consumers: list[KafkaConsumerClient] = []
 _db: redis_module.Redis | None = None
 _available: bool = False
 _logger = None
+_instance_id = f"{os.getpid()}:{uuid.uuid4()}"
 
 
 
@@ -86,13 +98,8 @@ def init_kafka(logger, db: redis_module.Redis) -> None:
     _available = True
 
     if TRANSACTION_MODE == "saga":
-        # Recover before the event loop starts consuming new events. That keeps
-        # startup deterministic: first restore in-flight intent, then process
-        # whatever Kafka redelivers afterwards.
-        saga_recover(_db, _producer.publish, _logger)
-
-        timeout_thread = threading.Thread(target=_timeout_loop, daemon=True)
-        timeout_thread.start()
+        coordinator_thread = threading.Thread(target=_coordinator_loop, daemon=True)
+        coordinator_thread.start()
 
     for consumer in _consumers:
         event_thread = threading.Thread(target=_event_loop, args=(consumer,), daemon=True)
@@ -106,6 +113,7 @@ def init_kafka(logger, db: redis_module.Redis) -> None:
 def close_kafka() -> None:
     global _available
     _available = False
+    _release_coordinator_role()
     for consumer in _consumers:
         consumer.close()
     if _producer is not None:
@@ -181,15 +189,109 @@ def _event_loop(consumer: KafkaConsumerClient) -> None:
             _logger.error(f"[OrderKafka] Event loop crashed: {exc}")
             time.sleep(1)
 
-def _timeout_loop() -> None:
+def _coordinator_loop() -> None:
+    was_leader = False
+
     while _available and TRANSACTION_MODE == "saga":
         try:
-            # Timeouts are handled centrally by the orchestrator. Participants
+            is_leader = _claim_or_renew_coordinator_role()
+
+            if not is_leader:
+                if was_leader:
+                    _logger.info("[OrderKafka] Lost coordinator role")
+                was_leader = False
+                time.sleep(COORDINATOR_RETRY_INTERVAL_SECONDS)
+                continue
+
+            if not was_leader:
+                _logger.info("[OrderKafka] Acquired coordinator role")
+                # Recover only on coordinator ownership so multi-worker startup
+                # does not replay the same in-flight Sagas from every process.
+                saga_recover(_db, _producer.publish, _logger)
+
+            was_leader = True
+
+            # Timeouts are handled centrally by the coordinator. Participants
             # stay simpler: they only need durable local handling + replay.
             saga_check_timeouts(_db, _producer.publish, _logger)
         except Exception as exc:
-            _logger.error(f"[OrderKafka] Timeout loop crashed: {exc}")
+            _logger.error(f"[OrderKafka] Coordinator loop crashed: {exc}")
         time.sleep(TIMEOUT_SCAN_INTERVAL_SECONDS)
+
+
+def _claim_or_renew_coordinator_role() -> bool:
+    if _db is None:
+        return False
+
+    try:
+        acquired = _db.set(
+            COORDINATOR_KEY,
+            _instance_id,
+            nx=True,
+            ex=COORDINATOR_LEASE_SECONDS,
+        )
+        if acquired:
+            return True
+    except redis_module.exceptions.RedisError:
+        return False
+
+    while True:
+        pipe = _db.pipeline()
+        try:
+            pipe.watch(COORDINATOR_KEY)
+            raw_leader = pipe.get(COORDINATOR_KEY)
+            if not raw_leader:
+                pipe.unwatch()
+                return False
+
+            leader_id = raw_leader.decode()
+            if leader_id != _instance_id:
+                pipe.unwatch()
+                return False
+
+            pipe.multi()
+            pipe.set(
+                COORDINATOR_KEY,
+                _instance_id,
+                ex=COORDINATOR_LEASE_SECONDS,
+            )
+            pipe.execute()
+            return True
+        except redis_module.exceptions.WatchError:
+            continue
+        except redis_module.exceptions.RedisError:
+            return False
+        finally:
+            pipe.reset()
+
+
+def _release_coordinator_role() -> None:
+    if _db is None:
+        return
+
+    while True:
+        pipe = _db.pipeline()
+        try:
+            pipe.watch(COORDINATOR_KEY)
+            raw_leader = pipe.get(COORDINATOR_KEY)
+            if not raw_leader:
+                pipe.unwatch()
+                return
+
+            if raw_leader.decode() != _instance_id:
+                pipe.unwatch()
+                return
+
+            pipe.multi()
+            pipe.delete(COORDINATOR_KEY)
+            pipe.execute()
+            return
+        except redis_module.exceptions.WatchError:
+            continue
+        except redis_module.exceptions.RedisError:
+            return
+        finally:
+            pipe.reset()
 
 
 def _route_event(msg: dict) -> None:

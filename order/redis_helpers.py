@@ -1,4 +1,4 @@
-import threading
+import os
 import time
 
 from common.messages import SagaOrderStatus
@@ -9,67 +9,40 @@ TERMINAL_STATUSES = {
     SagaOrderStatus.FAILED,
 }
 
-_waiters_lock = threading.Lock()
-_waiters: dict[str, "_CheckoutWaiter"] = {}
+STATUS_CHANNEL_PREFIX = "order:status:channel:"
+STATUS_RECHECK_INTERVAL_SECONDS = float(
+    os.getenv("CHECKOUT_STATUS_RECHECK_INTERVAL_SECONDS", "0.5")
+)
 
 
-class _CheckoutWaiter:
-    __slots__ = ("event", "status", "waiter_count")
-
-    def __init__(self) -> None:
-        self.event = threading.Event()
-        self.status: str | None = None
-        self.waiter_count = 0
+def _status_channel(order_id: str) -> str:
+    return f"{STATUS_CHANNEL_PREFIX}{order_id}"
 
 
-def _register_waiter(order_id: str) -> _CheckoutWaiter:
-    with _waiters_lock:
-        waiter = _waiters.get(order_id)
-        if waiter is None:
-            waiter = _CheckoutWaiter()
-            _waiters[order_id] = waiter
-        waiter.waiter_count += 1
-        return waiter
-
-
-def _unregister_waiter(order_id: str, waiter: _CheckoutWaiter) -> None:
-    with _waiters_lock:
-        current = _waiters.get(order_id)
-        if current is not waiter:
-            return
-        waiter.waiter_count -= 1
-        if waiter.waiter_count <= 0:
-            _waiters.pop(order_id, None)
-
-
-def notify_status(order_id: str, status: str) -> None:
-    with _waiters_lock:
-        waiter = _waiters.get(order_id)
-        if waiter is None:
-            return
-        waiter.status = status
-        if status in TERMINAL_STATUSES:
-            waiter.event.set()
-        else:
-            waiter.event.clear()
+def notify_status(db, order_id: str, status: str) -> None:
+    try:
+        db.publish(_status_channel(order_id), status)
+    except Exception:
+        # Publishing is only a wake-up optimization. wait_for_terminal_status()
+        # still re-checks Redis directly so correctness does not depend on this.
+        pass
 
 
 def wait_for_terminal_status(
+    db,
     order_id: str,
     get_status,
     timeout_seconds: float,
 ) -> str | None:
     deadline = time.monotonic() + timeout_seconds
+    pubsub = db.pubsub(ignore_subscribe_messages=True)
 
-    while True:
-        status = get_status(order_id) or SagaOrderStatus.PENDING
-        if status in TERMINAL_STATUSES:
-            return status
+    try:
+        pubsub.subscribe(_status_channel(order_id))
 
-        waiter = _register_waiter(order_id)
-        try:
-            # Re-check after registration so a terminal transition cannot be
-            # missed between the initial read and event subscription.
+        while True:
+            # Re-check Redis on every loop so correctness does not depend on
+            # pub/sub delivery or which order-service worker handles the request.
             status = get_status(order_id) or SagaOrderStatus.PENDING
             if status in TERMINAL_STATUSES:
                 return status
@@ -78,11 +51,21 @@ def wait_for_terminal_status(
             if remaining <= 0:
                 return None
 
-            waiter.event.wait(remaining)
-            if waiter.status in TERMINAL_STATUSES:
-                return waiter.status
-        finally:
-            _unregister_waiter(order_id, waiter)
+            message = pubsub.get_message(
+                timeout=min(remaining, STATUS_RECHECK_INTERVAL_SECONDS)
+            )
+            if not message:
+                continue
+
+            status = message.get("data")
+            if isinstance(status, bytes):
+                status = status.decode()
+            if status in TERMINAL_STATUSES:
+                confirmed_status = get_status(order_id) or SagaOrderStatus.PENDING
+                if confirmed_status in TERMINAL_STATUSES:
+                    return confirmed_status
+    finally:
+        pubsub.close()
 
 # ============================================================
 # REDIS HELPERS
@@ -91,7 +74,7 @@ def wait_for_terminal_status(
 def set_status(logger, db, order_id: str, status: str) -> None:
     try:
         db.set(f"order:{order_id}:status", status)
-        notify_status(order_id, status)
+        notify_status(db, order_id, status)
     except Exception as e:
         if logger is not None:
             logger.error(f"[OrderKafka] Failed to set status {status} for {order_id}: {e}")
