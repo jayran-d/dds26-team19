@@ -133,7 +133,7 @@ def _route_event(msg: dict) -> None:
 
 
 def _replay_unreplied_entries() -> None:
-    if TRANSACTION_MODE != "saga" or _db is None or _producer is None:
+    if TRANSACTION_MODE not in {"saga", "2pc"} or _db is None or _producer is None:
         return
 
     entries = stock_ledger.get_unreplied_entries(_db)

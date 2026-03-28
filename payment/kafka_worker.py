@@ -139,7 +139,7 @@ def _route_command(msg: dict) -> None:
 
 
 def _replay_unreplied_entries() -> None:
-    if TRANSACTION_MODE != "saga" or _db is None or _producer is None:
+    if TRANSACTION_MODE not in {"saga", "2pc"} or _db is None or _producer is None:
         return
 
     entries = payment_ledger.get_unreplied_entries(_db)

@@ -38,15 +38,17 @@ def _evaluate_2pc(producer, db, logger, order_id):
             return
         tx_id = tx_id.decode()
         db.hset(_2pc_key(order_id), "decision", DECISION_ABORT)
+        set_status(logger, db, order_id, TwoPhaseOrderStatus.ABORTING)
         producer.publish(STOCK_COMMANDS_TOPIC, build_abort_stock(tx_id, order_id))
         producer.publish(PAYMENT_COMMANDS_TOPIC, build_abort_payment(tx_id, order_id))
-        set_status(logger, db, order_id, "failed")
+        set_status(logger, db, order_id, TwoPhaseOrderStatus.FAILED)
         return
 
     # COMMIT RULE
     if stock_state == STOCK_READY and payment_state == PAYMENT_READY:
         logger.info(f"[Order2PC] order={order_id} COMMIT")
         db.hset(_2pc_key(order_id), "decision", DECISION_COMMIT)
+        set_status(logger, db, order_id, TwoPhaseOrderStatus.COMMITTING)
         tx_id = db.get(f"order:{order_id}:tx_id").decode()
         producer.publish(STOCK_COMMANDS_TOPIC, build_commit_stock(tx_id, order_id))
         producer.publish(PAYMENT_COMMANDS_TOPIC, build_commit_payment(tx_id, order_id))
