@@ -330,7 +330,7 @@ def _handle_commit_payment(msg, db, producer, logger):
                 logger.error(f"[Payment2PC] COMMIT_PAYMENT tx={tx_id} failed to create/read commit ledger")
                 return
 
-    ok = payment_ledger.mark_applied(db, tx_id, COMMIT_PAYMENT, "success", PAYMENT_COMMITTED, {})
+    ok = payment_ledger.mark_applied(db, tx_id, COMMIT_PAYMENT, "success", PAYMENT_COMMITTED)
     if not ok:
         logger.error(f"[Payment2PC] COMMIT_PAYMENT tx={tx_id} failed to mark commit ledger applied")
         return

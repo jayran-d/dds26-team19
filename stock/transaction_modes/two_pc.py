@@ -393,7 +393,7 @@ def _handle_commit_stock(msg, db, producer, logger):
                 logger.error(f"[Stock2PC] order={order_id} failed to create/read COMMIT ledger")
                 return
 
-    ok = stock_ledger.mark_applied(db, tx_id, COMMIT_STOCK, "success", STOCK_COMMITTED, {})
+    ok = stock_ledger.mark_applied(db, tx_id, COMMIT_STOCK, "success", STOCK_COMMITTED)
     if not ok:
         logger.error(f"[Stock2PC] order={order_id} failed to mark COMMIT_STOCK applied")
         return
