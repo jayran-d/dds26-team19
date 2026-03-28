@@ -47,8 +47,8 @@ services:
       - USE_KAFKA=true
       - KAFKA_NUM_PARTITIONS=8
       - KAFKA_REPLICATION_FACTOR=1
-      - ORDER_KAFKA_EVENT_CONSUMERS=8
-    command: gunicorn -b 0.0.0.0:5000 -k gthread --threads 256 -w 1 --timeout 90 --log-level=warning app:app
+      - ORDER_KAFKA_EVENT_CONSUMERS=2
+    command: gunicorn -b 0.0.0.0:5000 -k gthread --threads 256 -w 4 --timeout 90 --log-level=warning app:app
     env_file:
       - env/order_redis.env
       - env/transaction.env
