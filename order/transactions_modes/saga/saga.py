@@ -34,6 +34,7 @@ import redis as redis_module
 from msgspec import msgpack
 
 from . import saga_record
+from redis_helpers import set_status
 from common.messages import (
     SagaOrderStatus,
     STOCK_RESERVED,
@@ -111,7 +112,7 @@ def saga_start_checkout(
     # This pointer is redundant with the full saga record, but very convenient
     # for tests, debugging, and tracing one order through the system.
     db.set(f"order:{order_id}:tx_id", tx_id)
-    _set_status(db, order_id, SagaOrderStatus.RESERVING_STOCK)
+    _set_status(db, order_id, SagaOrderStatus.RESERVING_STOCK, logger)
 
     # Important: the Saga record was already durably written before this publish.
     # If publish fails or the service crashes now, recovery can replay RESERVE_STOCK.
@@ -217,7 +218,7 @@ def saga_on_stock_reserved(record, msg, db, publish, logger):
         awaiting_event_type=PAYMENT_SUCCESS,
         needs_stock_comp=True,  # stock is reserved — must release if we abort
     )
-    _set_status(db, order_id, SagaOrderStatus.PROCESSING_PAYMENT)
+    _set_status(db, order_id, SagaOrderStatus.PROCESSING_PAYMENT, logger)
 
     cmd = build_process_payment(tx_id, order_id, user_id, amount)
     publish(PAYMENT_COMMANDS_TOPIC, cmd)
@@ -242,7 +243,7 @@ def saga_on_stock_reservation_failed(record, msg, db, logger):
         failure_reason=reason,
         reset_timeout=False,
     )
-    _set_status(db, order_id, SagaOrderStatus.FAILED)
+    _set_status(db, order_id, SagaOrderStatus.FAILED, logger)
 
     # Terminal state reached: release the active-order claim so a later retry
     # can start a fresh transaction if the user wants to try again.
@@ -282,7 +283,7 @@ def saga_on_payment_success(record, msg, db, logger):
         new_state=SagaOrderStatus.COMPLETED,
         reset_timeout=False,
     )
-    _set_status(db, order_id, SagaOrderStatus.COMPLETED)
+    _set_status(db, order_id, SagaOrderStatus.COMPLETED, logger)
 
     # Terminal success: free the active-order slot.
     saga_record.clear_active_tx_id(db, order_id, tx_id)
@@ -315,7 +316,7 @@ def saga_on_payment_failed(record, msg, db, publish, logger):
         awaiting_event_type=STOCK_RELEASED,
         failure_reason=reason,
     )
-    _set_status(db, order_id, SagaOrderStatus.COMPENSATING)
+    _set_status(db, order_id, SagaOrderStatus.COMPENSATING, logger)
 
     cmd = build_release_stock(tx_id, order_id, items)
     publish(STOCK_COMMANDS_TOPIC, cmd)
@@ -338,7 +339,7 @@ def saga_on_stock_released(record, msg, db, logger):
         new_state=SagaOrderStatus.FAILED,
         reset_timeout=False,
     )
-    _set_status(db, order_id, SagaOrderStatus.FAILED)
+    _set_status(db, order_id, SagaOrderStatus.FAILED, logger)
 
     # Compensation finished: the order is no longer active.
     saga_record.clear_active_tx_id(db, order_id, tx_id)
@@ -440,6 +441,11 @@ def check_timeouts(db: redis_module.Redis, publish, logger) -> None:
 # ============================================================
 
 
-def _set_status(db: redis_module.Redis, order_id: str, status: str) -> None:
+def _set_status(
+    db: redis_module.Redis,
+    order_id: str,
+    status: str,
+    logger=None,
+) -> None:
     """Write the human-facing order status that GET /orders/status/<id> reads."""
-    db.set(f"order:{order_id}:status", status)
+    set_status(logger=logger, db=db, order_id=order_id, status=status)

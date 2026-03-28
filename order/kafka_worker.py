@@ -36,10 +36,14 @@ from common.messages import ALL_TOPICS, STOCK_EVENTS_TOPIC, PAYMENT_EVENTS_TOPIC
 USE_KAFKA = os.getenv("USE_KAFKA", "false").lower() == "true"
 TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "simple")  # "simple" | "saga" | "2pc"
 TIMEOUT_SCAN_INTERVAL_SECONDS = 5
+EVENT_LOOP_CONSUMERS = max(
+    1,
+    int(os.getenv("ORDER_KAFKA_EVENT_CONSUMERS", os.getenv("KAFKA_NUM_PARTITIONS", "4"))),
+)
 
 # ── Module-level state ─────────────────────────────────────────────────────────
 _producer: KafkaProducerClient | None = None
-_consumer: KafkaConsumerClient | None = None
+_consumers: list[KafkaConsumerClient] = []
 _db: redis_module.Redis | None = None
 _available: bool = False
 _logger = None
@@ -56,7 +60,7 @@ def init_kafka(logger, db: redis_module.Redis) -> None:
     Initialise producer, consumer, and start the event loop thread.
     Called once at gunicorn startup. Does nothing if USE_KAFKA=false.
     """
-    global _producer, _consumer, _db, _available, _logger
+    global _producer, _consumers, _db, _available, _logger
 
     if not USE_KAFKA:
         return
@@ -65,15 +69,19 @@ def init_kafka(logger, db: redis_module.Redis) -> None:
     _db = db
 
     _producer = KafkaProducerClient(ensure_topics=ALL_TOPICS)
-    _consumer = KafkaConsumerClient(
-        topics=[STOCK_EVENTS_TOPIC, PAYMENT_EVENTS_TOPIC],
-        group_id="order-service",
-        # The order service also needs manual commits.
-        # It must not ack an event before the Saga record is durably advanced.
-        auto_commit=False,
-        auto_offset_reset="earliest",
-        ensure_topics=ALL_TOPICS,
-    )
+    _consumers = []
+    for consumer_index in range(EVENT_LOOP_CONSUMERS):
+        _consumers.append(
+            KafkaConsumerClient(
+                topics=[STOCK_EVENTS_TOPIC, PAYMENT_EVENTS_TOPIC],
+                group_id="order-service",
+                # The order service also needs manual commits.
+                # It must not ack an event before the Saga record is durably advanced.
+                auto_commit=False,
+                auto_offset_reset="earliest",
+                ensure_topics=ALL_TOPICS if consumer_index == 0 else [],
+            )
+        )
 
     _available = True
 
@@ -86,16 +94,20 @@ def init_kafka(logger, db: redis_module.Redis) -> None:
         timeout_thread = threading.Thread(target=_timeout_loop, daemon=True)
         timeout_thread.start()
 
-    event_thread = threading.Thread(target=_event_loop, daemon=True)
-    event_thread.start()
-    logger.info(f"[OrderKafka] Event loop started (mode={TRANSACTION_MODE})")
+    for consumer in _consumers:
+        event_thread = threading.Thread(target=_event_loop, args=(consumer,), daemon=True)
+        event_thread.start()
+
+    logger.info(
+        f"[OrderKafka] Event loops started (mode={TRANSACTION_MODE}, consumers={len(_consumers)})"
+    )
 
 
 def close_kafka() -> None:
     global _available
     _available = False
-    if _consumer is not None:
-        _consumer.close()
+    for consumer in _consumers:
+        consumer.close()
     if _producer is not None:
         _producer.close()
 
@@ -140,10 +152,10 @@ def start_checkout(order_id: str, order_entry):
 # ============================================================
 
 
-def _event_loop() -> None:
+def _event_loop(consumer: KafkaConsumerClient) -> None:
     while True:
         try:
-            result = _consumer.poll(timeout=1.0)
+            result = consumer.poll(timeout=1.0)
 
             if result.error:
                 _logger.error(f"[OrderKafka] Poll error: {result.error}")
@@ -160,7 +172,7 @@ def _event_loop() -> None:
             # 1. durably updated the Saga record,
             # 2. published the next command if needed,
             # 3. marked the incoming event as seen.
-            _consumer.commit()
+            consumer.commit()
 
         except Exception as exc:
             # No commit here.

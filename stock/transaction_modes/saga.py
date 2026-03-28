@@ -227,8 +227,7 @@ def _reserve_stock_atomically(
                 pipe.execute()
                 return reply, "failure"
 
-            updated_items = {}
-
+            normalized_items: list[tuple[str, int]] = []
             for item_entry in items:
                 item_id = str(item_entry.get("item_id", ""))
                 quantity = item_entry.get("quantity")
@@ -242,7 +241,14 @@ def _reserve_stock_atomically(
                     pipe.execute()
                     return reply, "failure"
 
-                raw_item = pipe.get(item_id)
+                normalized_items.append((item_id, int(quantity)))
+
+            raw_items = pipe.mget(item_ids)
+            stock_by_item_id = dict(zip(item_ids, raw_items))
+            updated_items = {}
+
+            for item_id, quantity in normalized_items:
+                raw_item = stock_by_item_id.get(item_id)
                 if not raw_item:
                     reply = build_stock_reservation_failed(tx_id, order_id, f"Item {item_id} not found")
                     updated_entry = _build_applied_entry(entry, "failure", reply)
@@ -253,7 +259,6 @@ def _reserve_stock_atomically(
                     return reply, "failure"
 
                 stock_entry = msgpack.decode(raw_item, type=StockValue)
-                quantity = int(quantity)
 
                 if stock_entry.stock < quantity:
                     reply = build_stock_reservation_failed(
@@ -338,13 +343,15 @@ def _release_stock_atomically(
                 pipe.execute()
                 return reply, "success"
 
+            raw_items = pipe.mget(item_ids)
+            stock_by_item_id = dict(zip(item_ids, raw_items))
             updated_items = {}
 
             for item_entry in items:
                 item_id = str(item_entry.get("item_id", ""))
                 quantity = int(item_entry.get("quantity", 0))
 
-                raw_item = pipe.get(item_id)
+                raw_item = stock_by_item_id.get(item_id)
                 if not raw_item:
                     pipe.unwatch()
                     raise RuntimeError(f"Missing item {item_id} during RELEASE_STOCK for tx={tx_id}")

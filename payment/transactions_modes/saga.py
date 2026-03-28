@@ -213,7 +213,7 @@ def _apply_process_payment_atomically(
             # them before EXEC, Redis raises WatchError and we retry safely.
             pipe.watch(ledger_key, user_id)
 
-            raw_entry = pipe.get(ledger_key)
+            raw_entry, raw_user = pipe.mget([ledger_key, user_id])
             if not raw_entry:
                 pipe.unwatch()
                 raise RuntimeError(f"Missing PROCESS_PAYMENT ledger entry for tx={tx_id}")
@@ -224,7 +224,6 @@ def _apply_process_payment_atomically(
                 pipe.unwatch()
                 return entry["reply_message"], entry.get("result", "failure")
 
-            raw_user = pipe.get(user_id)
             if not raw_user:
                 reply = build_payment_failed(tx_id, order_id, f"User: {user_id} not found!")
                 updated_entry = _build_applied_entry(entry, "failure", reply)
@@ -288,7 +287,7 @@ def _apply_refund_payment_atomically(
             # current user balance, so all three keys participate in the watch.
             pipe.watch(refund_key, payment_key, user_id)
 
-            raw_refund = pipe.get(refund_key)
+            raw_refund, raw_payment, raw_user = pipe.mget([refund_key, payment_key, user_id])
             if not raw_refund:
                 pipe.unwatch()
                 raise RuntimeError(f"Missing REFUND_PAYMENT ledger entry for tx={tx_id}")
@@ -299,7 +298,6 @@ def _apply_refund_payment_atomically(
                 pipe.unwatch()
                 return refund_entry["reply_message"], refund_entry.get("result", "success")
 
-            raw_payment = pipe.get(payment_key)
             payment_entry = json.loads(raw_payment) if raw_payment else None
             payment_succeeded = payment_entry is not None and payment_entry.get("result") == "success"
 
@@ -315,7 +313,6 @@ def _apply_refund_payment_atomically(
                 pipe.execute()
                 return reply, "success"
 
-            raw_user = pipe.get(user_id)
             if not raw_user:
                 pipe.unwatch()
                 raise RuntimeError(f"Missing user {user_id} during refund for tx={tx_id}")

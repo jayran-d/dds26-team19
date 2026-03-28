@@ -14,7 +14,7 @@ services:
       - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
       - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
       - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
-      - KAFKA_MIN_INSYNC_REPLICAS=2
+      - KAFKA_MIN_INSYNC_REPLICAS=1
       - KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
     healthcheck:
       test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
@@ -45,9 +45,10 @@ services:
       - GATEWAY_URL=http://gateway:80
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - USE_KAFKA=true
-      - KAFKA_NUM_PARTITIONS=4
-      - KAFKA_REPLICATION_FACTOR=2
-    command: gunicorn -b 0.0.0.0:5000 -k gthread --threads 32 -w 1 --timeout 90 --log-level=info app:app
+      - KAFKA_NUM_PARTITIONS=8
+      - KAFKA_REPLICATION_FACTOR=1
+      - ORDER_KAFKA_EVENT_CONSUMERS=8
+    command: gunicorn -b 0.0.0.0:5000 -k gthread --threads 256 -w 1 --timeout 90 --log-level=warning app:app
     env_file:
       - env/order_redis.env
       - env/transaction.env
@@ -79,9 +80,10 @@ services:
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - USE_KAFKA=true
-      - KAFKA_NUM_PARTITIONS=4
+      - KAFKA_NUM_PARTITIONS=8
       - KAFKA_REPLICATION_FACTOR=1
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      - STOCK_KAFKA_CONSUMERS=8
+    command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=warning app:app
     env_file:
       - env/stock_redis.env
       - env/transaction.env
@@ -113,9 +115,10 @@ services:
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - USE_KAFKA=true
-      - KAFKA_NUM_PARTITIONS=4
+      - KAFKA_NUM_PARTITIONS=8
       - KAFKA_REPLICATION_FACTOR=1
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      - PAYMENT_KAFKA_CONSUMERS=8
+    command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=warning app:app
     env_file:
       - env/payment_redis.env
       - env/transaction.env

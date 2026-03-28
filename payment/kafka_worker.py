@@ -31,11 +31,15 @@ from transactions_modes.two_pc import _2pc_route_payment
 
 USE_KAFKA = os.getenv("USE_KAFKA", "false").lower() == "true"
 TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "simple")  # "simple" | "saga" | "2pc"
+CONSUMER_THREADS = max(
+    1,
+    int(os.getenv("PAYMENT_KAFKA_CONSUMERS", os.getenv("KAFKA_NUM_PARTITIONS", "4"))),
+)
 
 
 # ── Module-level state ─────────────────────────────────────────────────────────
 _producer: KafkaProducerClient | None = None
-_consumer: KafkaConsumerClient | None = None
+_consumers: list[KafkaConsumerClient] = []
 _logger = None
 _db: redis_module.Redis | None = None
 
@@ -51,7 +55,7 @@ def init_kafka(logger, db) -> None:
     Initialise Kafka clients and start the background consumer thread.
     Does nothing if USE_KAFKA=false.
     """
-    global _producer, _consumer, _logger, _db
+    global _producer, _consumers, _logger, _db
 
     if not USE_KAFKA:
         return
@@ -60,27 +64,32 @@ def init_kafka(logger, db) -> None:
     _db = db
 
     _producer = KafkaProducerClient(ensure_topics=ALL_TOPICS)
-    _consumer = KafkaConsumerClient(
-        topics=[PAYMENT_COMMANDS_TOPIC],
-        group_id="payment-service",
-        # Manual commit is required for Saga durability:
-        # Kafka must not acknowledge a command before we have durably handled it.
-        auto_commit=False,
-        auto_offset_reset="earliest",
-        ensure_topics=ALL_TOPICS,
-    )
+    _consumers = []
+    for consumer_index in range(CONSUMER_THREADS):
+        _consumers.append(
+            KafkaConsumerClient(
+                topics=[PAYMENT_COMMANDS_TOPIC],
+                group_id="payment-service",
+                # Manual commit is required for Saga durability:
+                # Kafka must not acknowledge a command before we have durably handled it.
+                auto_commit=False,
+                auto_offset_reset="earliest",
+                ensure_topics=ALL_TOPICS if consumer_index == 0 else [],
+            )
+        )
 
     _replay_unreplied_entries()
 
-    thread = threading.Thread(target=_consumer_loop, daemon=True)
-    thread.start()
-    logger.info("[PaymentKafka] Consumer thread started")
+    for consumer in _consumers:
+        thread = threading.Thread(target=_consumer_loop, args=(consumer,), daemon=True)
+        thread.start()
+    logger.info(f"[PaymentKafka] Consumer threads started (count={len(_consumers)})")
 
 
 
 def close_kafka() -> None:
-    if _consumer is not None:
-        _consumer.close()
+    for consumer in _consumers:
+        consumer.close()
     if _producer is not None:
         _producer.close()
 
@@ -99,10 +108,10 @@ def close_kafka() -> None:
 # ============================================================
 
 
-def _consumer_loop() -> None:
+def _consumer_loop(consumer: KafkaConsumerClient) -> None:
     while True:
         try:
-            result = _consumer.poll(timeout=1.0)
+            result = consumer.poll(timeout=1.0)
 
             if result.error:
                 _logger.info(f"[PaymentKafka] Poll error: {result.error}")
@@ -117,7 +126,7 @@ def _consumer_loop() -> None:
             # Only acknowledge Kafka after the handler returned successfully.
             # In Saga mode this means the participant has already durably written
             # its ledger/business state, so a crash after this point is recoverable.
-            _consumer.commit()
+            consumer.commit()
 
         except Exception as exc:
             # Intentionally do NOT commit here.

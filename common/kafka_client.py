@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import threading
 from confluent_kafka import Producer, Consumer, KafkaError
 from confluent_kafka.admin import AdminClient, NewTopic
 
@@ -58,6 +59,8 @@ class KafkaProducerClient:
                     {
                         "bootstrap.servers": BOOTSTRAP_SERVERS,
                         "acks": "all",
+                        "linger.ms": "2",
+                        "batch.num.messages": "10000",
                         "metadata.request.timeout.ms": "5000",
                     }
                 )
@@ -108,23 +111,24 @@ class KafkaProducerClient:
         """
         Synchronous publish used by the Saga code.
 
-        Why the callback + flush pattern exists:
+        Why the callback + wait loop pattern exists:
         - confluent-kafka is asynchronous internally
         - produce(...) only queues the message locally
-        - the delivery callback runs later when poll()/flush() drives the client
+        - the delivery callback runs later when poll() drives the client
         - callback exceptions do not naturally bubble into this function call
 
-        So we store the callback outcome in a small mutable holder, then flush,
-        then inspect that holder and raise if delivery failed or timed out.
+        So we store the callback outcome in a small mutable holder, then poll
+        until this specific publish gets its delivery callback, then inspect
+        that holder and raise if delivery failed or timed out.
         """
+        delivery_done = threading.Event()
         delivery = {
-            "done": False,
             "error": None,
         }
 
         def on_delivery(err, msg):
-            delivery["done"] = True
             delivery["error"] = err
+            delivery_done.set()
 
         try:
             self._producer.produce(
@@ -138,27 +142,20 @@ class KafkaProducerClient:
                 f"Failed to enqueue Kafka message for topic={topic}: {exc}"
             ) from exc
 
-        # Let librdkafka start processing immediately.
-        self._producer.poll(0)
-
-        # flush() drives delivery callbacks and waits up to timeout seconds.
-        # It returns how many messages are still pending afterwards.
-        remaining = self._producer.flush(timeout)
-
-        if remaining > 0:
-            raise KafkaPublishError(
-                f"Timed out waiting for Kafka delivery on topic={topic}; "
-                f"{remaining} message(s) still pending"
-            )
+        deadline = time.monotonic() + timeout
+        while not delivery_done.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise KafkaPublishError(
+                    f"Timed out waiting for Kafka delivery on topic={topic}"
+                )
+            # Drive only long enough for this message's callback instead of
+            # flushing the entire shared producer queue on every publish().
+            self._producer.poll(min(0.05, remaining))
 
         if delivery["error"] is not None:
             raise KafkaPublishError(
                 f"Kafka delivery failed for topic={topic}: {delivery['error']}"
-            )
-
-        if not delivery["done"]:
-            raise KafkaPublishError(
-                f"Kafka publish finished without a delivery callback for topic={topic}"
             )
 
     def close(self):

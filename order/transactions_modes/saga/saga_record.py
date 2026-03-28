@@ -141,9 +141,8 @@ def get_all_active(db: redis_module.Redis) -> list[dict]:
     """
     terminal = {SagaOrderStatus.COMPLETED, SagaOrderStatus.FAILED}
     try:
-        keys = db.keys("saga:record:*")
         records = []
-        for key in keys:
+        for key in db.scan_iter(match="saga:record:*", count=128):
             raw = db.get(key)
             if not raw:
                 continue
@@ -272,9 +271,8 @@ def get_timed_out(db: redis_module.Redis) -> list[dict]:
     now = int(time.time() * 1000)
     terminal = {SagaOrderStatus.COMPLETED, SagaOrderStatus.FAILED}
     try:
-        keys = db.keys("saga:record:*")
         timed_out = []
-        for key in keys:
+        for key in db.scan_iter(match="saga:record:*", count=128):
             raw = db.get(key)
             if not raw:
                 continue

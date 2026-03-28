@@ -146,9 +146,8 @@ def get_unreplied_entries(db: redis_module.Redis) -> list[dict]:
     Called on service startup to re-publish any replies lost in a crash.
     """
     try:
-        keys = db.keys("payment:ledger:*")
         entries = []
-        for key in keys:
+        for key in db.scan_iter(match="payment:ledger:*", count=128):
             raw = db.get(key)
             if not raw:
                 continue

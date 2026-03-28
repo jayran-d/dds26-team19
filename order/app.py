@@ -4,7 +4,6 @@ import atexit
 import random
 import uuid
 from collections import defaultdict
-import time
 
 import redis
 import requests
@@ -18,6 +17,7 @@ from kafka_worker import (
     start_checkout,
 )
 from common.messages import SagaOrderStatus
+from redis_helpers import wait_for_terminal_status
 
 DB_ERROR_STR  = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -25,7 +25,6 @@ REQ_ERROR_STR = "Requests error"
 GATEWAY_URL = os.environ['GATEWAY_URL']
 USE_KAFKA   = os.getenv("USE_KAFKA", "false").lower() == "true"
 CHECKOUT_WAIT_TIMEOUT_SECONDS = float(os.getenv("CHECKOUT_WAIT_TIMEOUT_SECONDS", "45"))
-CHECKOUT_POLL_INTERVAL_SECONDS = float(os.getenv("CHECKOUT_POLL_INTERVAL_SECONDS", "0.05"))
 
 IN_PROGRESS_STATUSES = {
     SagaOrderStatus.RESERVING_STOCK,
@@ -89,21 +88,11 @@ def get_order_status(order_id: str) -> str | None:
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 def _wait_for_terminal_checkout_status(order_id: str) -> str | None:
-    """
-    Block until the Saga reaches a terminal state or the timeout expires.
-
-    This keeps the distributed transaction asynchronous internally, but gives
-    the external HTTP API a final success/failure result.
-    """
-    deadline = time.time() + CHECKOUT_WAIT_TIMEOUT_SECONDS
-
-    while time.time() < deadline:
-        status = get_order_status(order_id) or SagaOrderStatus.PENDING
-        if status in TERMINAL_STATUSES:
-            return status
-        time.sleep(CHECKOUT_POLL_INTERVAL_SECONDS)
-
-    return None
+    return wait_for_terminal_status(
+        order_id=order_id,
+        get_status=get_order_status,
+        timeout_seconds=CHECKOUT_WAIT_TIMEOUT_SECONDS,
+    )
 
 
 def _build_terminal_checkout_response(order_id: str) -> Response:
