@@ -17,6 +17,7 @@ Coverage:
     - stale event safety
     - oversell prevention
     - order-service restart recovery
+    - Redis database kill/recovery for order/stock/payment during in-flight Saga steps
     - timeout recovery while stock/payment are unavailable
 
 What this does not deterministically cover:
@@ -71,9 +72,21 @@ ORDER_SERVICE = "order-service"
 STOCK_SERVICE = "stock-service"
 PAYMENT_SERVICE = "payment-service"
 ORDER_DB_SERVICE = "order-db"
+STOCK_DB_SERVICE = "stock-db"
+PAYMENT_DB_SERVICE = "payment-db"
 KAFKA_SERVICE = "kafka"
 GATEWAY_SERVICE = "gateway"
 REDIS_PASSWORD = "redis"
+HTTP_SERVICES = {
+    ORDER_SERVICE,
+    STOCK_SERVICE,
+    PAYMENT_SERVICE,
+}
+REDIS_SERVICES = {
+    ORDER_DB_SERVICE,
+    STOCK_DB_SERVICE,
+    PAYMENT_DB_SERVICE,
+}
 
 
 # ── Compose helpers ───────────────────────────────────────────────────────────
@@ -83,14 +96,19 @@ def _compose(
     input_text: str | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    result = subprocess.run(
         ["docker", "compose", *args],
         cwd=PROJECT_ROOT,
-        check=check,
+        check=False,
         capture_output=True,
         text=True,
         input=input_text,
     )
+    if check and result.returncode != 0:
+        cmd = " ".join(["docker", "compose", *args])
+        details = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+        raise AssertionError(f"Compose command failed: {cmd}\n{details}")
+    return result
 
 
 def _kill_service(service: str) -> None:
@@ -107,12 +125,31 @@ def _start_service(service: str, timeout: int = RECOVERY_WAIT) -> None:
     # Keep the same container identity during recovery tests.
     _compose("start", service)
     time.sleep(1)
-    _wait_for_service_http(service, timeout=timeout)
-    _refresh_gateway()
+    if service in HTTP_SERVICES:
+        _wait_for_service_http(service, timeout=timeout)
+        _refresh_gateway()
+    elif service in REDIS_SERVICES:
+        _wait_for_redis(service, timeout=timeout)
+    else:
+        raise ValueError(f"Unknown service: {service}")
 
 
 def _ensure_services_started() -> None:
-    _compose("start", GATEWAY_SERVICE, ORDER_SERVICE, STOCK_SERVICE, PAYMENT_SERVICE)
+    _compose(
+        "up",
+        "-d",
+        KAFKA_SERVICE,
+        ORDER_DB_SERVICE,
+        STOCK_DB_SERVICE,
+        PAYMENT_DB_SERVICE,
+        GATEWAY_SERVICE,
+        ORDER_SERVICE,
+        STOCK_SERVICE,
+        PAYMENT_SERVICE,
+    )
+    _wait_for_redis(ORDER_DB_SERVICE)
+    _wait_for_redis(STOCK_DB_SERVICE)
+    _wait_for_redis(PAYMENT_DB_SERVICE)
     _wait_for_service_http(ORDER_SERVICE)
     _wait_for_service_http(STOCK_SERVICE)
     _wait_for_service_http(PAYMENT_SERVICE)
@@ -156,6 +193,26 @@ def _wait_for_service_http(service: str, timeout: int = RECOVERY_WAIT) -> None:
             check=False,
         )
         if probe.returncode == 0:
+            return
+        time.sleep(0.5)
+
+    raise AssertionError(f"{service} did not become ready within {timeout}s")
+
+
+def _wait_for_redis(service: str, timeout: int = RECOVERY_WAIT) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        probe = _compose(
+            "exec",
+            "-T",
+            service,
+            "redis-cli",
+            "-a",
+            REDIS_PASSWORD,
+            "PING",
+            check=False,
+        )
+        if probe.returncode == 0 and "PONG" in probe.stdout:
             return
         time.sleep(0.5)
 
@@ -700,6 +757,159 @@ class TestSagaRecovery(SagaDockerTestCase):
 
         time.sleep(SAGA_TIMEOUT_SECONDS + 5)
         _start_service(PAYMENT_SERVICE)
+
+        resp = _finish_checkout_request(thread, result, timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(wait_for_checkout(order_id), "completed")
+        self.assertEqual(tu.find_item(item_id)["stock"], 4)
+        self.assertEqual(tu.find_user(user_id)["credit"], 90)
+
+
+class TestSagaDatabaseRecovery(SagaDockerTestCase):
+    def test_order_db_restart_recovers_from_reserving_stock(self):
+        user = _create_user()
+        user_id = user["user_id"]
+        tu.add_credit_to_user(user_id, 100)
+
+        item = _create_item(10)
+        item_id = item["item_id"]
+        tu.add_stock(item_id, 5)
+
+        order = _create_order(user_id)
+        order_id = order["order_id"]
+        tu.add_item_to_order(order_id, item_id, 1)
+
+        _stop_service(STOCK_SERVICE)
+
+        thread, result = _start_checkout_request(order_id)
+        self.assertTrue(wait_for_status(order_id, "reserving_stock", timeout=CHECKOUT_TIMEOUT))
+
+        _stop_service(ORDER_DB_SERVICE)
+        _start_service(STOCK_SERVICE)
+        _start_service(ORDER_DB_SERVICE)
+        self.assertEqual(wait_for_checkout(order_id, timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT), "completed")
+        thread.join(5)
+        self.assertEqual(tu.find_item(item_id)["stock"], 4)
+        self.assertEqual(tu.find_user(user_id)["credit"], 90)
+        self.assertTrue(tu.find_order(order_id)["paid"])
+
+    def test_order_db_restart_recovers_from_processing_payment(self):
+        user = _create_user()
+        user_id = user["user_id"]
+        tu.add_credit_to_user(user_id, 100)
+
+        item = _create_item(10)
+        item_id = item["item_id"]
+        tu.add_stock(item_id, 5)
+
+        order = _create_order(user_id)
+        order_id = order["order_id"]
+        tu.add_item_to_order(order_id, item_id, 1)
+
+        _stop_service(PAYMENT_SERVICE)
+
+        thread, result = _start_checkout_request(order_id)
+        self.assertTrue(wait_for_status(order_id, "processing_payment", timeout=CHECKOUT_TIMEOUT))
+
+        _stop_service(ORDER_DB_SERVICE)
+        _start_service(PAYMENT_SERVICE)
+        _start_service(ORDER_DB_SERVICE)
+        self.assertEqual(wait_for_checkout(order_id, timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT), "completed")
+        thread.join(5)
+        self.assertEqual(tu.find_item(item_id)["stock"], 4)
+        self.assertEqual(tu.find_user(user_id)["credit"], 90)
+        self.assertTrue(tu.find_order(order_id)["paid"])
+
+    def test_order_db_restart_recovers_from_compensating(self):
+        user = _create_user()
+        user_id = user["user_id"]
+        tu.add_credit_to_user(user_id, 5)
+
+        item = _create_item(10)
+        item_id = item["item_id"]
+        tu.add_stock(item_id, 5)
+
+        order = _create_order(user_id)
+        order_id = order["order_id"]
+        tu.add_item_to_order(order_id, item_id, 2)
+
+        try:
+            _stop_service(PAYMENT_SERVICE)
+
+            thread, result = _start_checkout_request(order_id)
+            self.assertTrue(wait_for_status(order_id, "processing_payment", timeout=CHECKOUT_TIMEOUT))
+
+            _stop_service(STOCK_SERVICE)
+
+            tx_id = _get_order_tx_id(order_id)
+            forced_failure = build_payment_failed(tx_id, order_id, "forced test failure")
+            _publish_to_kafka(PAYMENT_EVENTS_TOPIC, forced_failure)
+
+            self.assertTrue(wait_for_status(order_id, "compensating", timeout=CHECKOUT_TIMEOUT))
+
+            _stop_service(ORDER_DB_SERVICE)
+            _start_service(STOCK_SERVICE, timeout=RECOVERY_WAIT)
+            _start_service(PAYMENT_SERVICE, timeout=RECOVERY_WAIT)
+            _start_service(ORDER_DB_SERVICE, timeout=RECOVERY_WAIT)
+            self.assertEqual(wait_for_checkout(order_id, timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT), "failed")
+            thread.join(5)
+            self.assertEqual(tu.find_item(item_id)["stock"], 5)
+            self.assertEqual(tu.find_user(user_id)["credit"], 5)
+            self.assertFalse(tu.find_order(order_id)["paid"])
+        finally:
+            _ensure_services_started()
+
+    def test_stock_db_restart_recovers_from_reserving_stock(self):
+        user = _create_user()
+        user_id = user["user_id"]
+        tu.add_credit_to_user(user_id, 100)
+
+        item = _create_item(10)
+        item_id = item["item_id"]
+        tu.add_stock(item_id, 5)
+
+        order = _create_order(user_id)
+        order_id = order["order_id"]
+        tu.add_item_to_order(order_id, item_id, 1)
+
+        _stop_service(STOCK_DB_SERVICE)
+
+        thread, result = _start_checkout_request(order_id)
+        self.assertTrue(wait_for_status(order_id, "reserving_stock", timeout=CHECKOUT_TIMEOUT))
+
+        time.sleep(2)
+        self.assertTrue(thread.is_alive(), "checkout should still be waiting while stock-db is down")
+
+        _start_service(STOCK_DB_SERVICE)
+
+        resp = _finish_checkout_request(thread, result, timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(wait_for_checkout(order_id), "completed")
+        self.assertEqual(tu.find_item(item_id)["stock"], 4)
+        self.assertEqual(tu.find_user(user_id)["credit"], 90)
+
+    def test_payment_db_restart_recovers_from_processing_payment(self):
+        user = _create_user()
+        user_id = user["user_id"]
+        tu.add_credit_to_user(user_id, 100)
+
+        item = _create_item(10)
+        item_id = item["item_id"]
+        tu.add_stock(item_id, 5)
+
+        order = _create_order(user_id)
+        order_id = order["order_id"]
+        tu.add_item_to_order(order_id, item_id, 1)
+
+        _stop_service(PAYMENT_DB_SERVICE)
+
+        thread, result = _start_checkout_request(order_id)
+        self.assertTrue(wait_for_status(order_id, "processing_payment", timeout=CHECKOUT_TIMEOUT))
+
+        time.sleep(2)
+        self.assertTrue(thread.is_alive(), "checkout should still be waiting while payment-db is down")
+
+        _start_service(PAYMENT_DB_SERVICE)
 
         resp = _finish_checkout_request(thread, result, timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT)
         self.assertEqual(resp.status_code, 200)
