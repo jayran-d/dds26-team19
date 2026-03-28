@@ -19,6 +19,10 @@ Coverage:
     - order-service restart recovery
     - timeout recovery while stock/payment are unavailable
 
+Database stop/kill recovery coverage lives in:
+
+    python3 test/test_kafka_saga_databases.py
+
 What this does not deterministically cover:
     - the exact "participant applied locally but crashed before reply" line-level
       window. That needs explicit service failpoints or instrumentation.
@@ -71,9 +75,21 @@ ORDER_SERVICE = "order-service"
 STOCK_SERVICE = "stock-service"
 PAYMENT_SERVICE = "payment-service"
 ORDER_DB_SERVICE = "order-db"
+STOCK_DB_SERVICE = "stock-db"
+PAYMENT_DB_SERVICE = "payment-db"
 KAFKA_SERVICE = "kafka"
 GATEWAY_SERVICE = "gateway"
 REDIS_PASSWORD = "redis"
+HTTP_SERVICES = {
+    ORDER_SERVICE,
+    STOCK_SERVICE,
+    PAYMENT_SERVICE,
+}
+REDIS_SERVICES = {
+    ORDER_DB_SERVICE,
+    STOCK_DB_SERVICE,
+    PAYMENT_DB_SERVICE,
+}
 
 
 # ── Compose helpers ───────────────────────────────────────────────────────────
@@ -83,14 +99,19 @@ def _compose(
     input_text: str | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    result = subprocess.run(
         ["docker", "compose", *args],
         cwd=PROJECT_ROOT,
-        check=check,
+        check=False,
         capture_output=True,
         text=True,
         input=input_text,
     )
+    if check and result.returncode != 0:
+        cmd = " ".join(["docker", "compose", *args])
+        details = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+        raise AssertionError(f"Compose command failed: {cmd}\n{details}")
+    return result
 
 
 def _kill_service(service: str) -> None:
@@ -107,12 +128,31 @@ def _start_service(service: str, timeout: int = RECOVERY_WAIT) -> None:
     # Keep the same container identity during recovery tests.
     _compose("start", service)
     time.sleep(1)
-    _wait_for_service_http(service, timeout=timeout)
-    _refresh_gateway()
+    if service in HTTP_SERVICES:
+        _wait_for_service_http(service, timeout=timeout)
+        _refresh_gateway()
+    elif service in REDIS_SERVICES:
+        _wait_for_redis(service, timeout=timeout)
+    else:
+        raise ValueError(f"Unknown service: {service}")
 
 
 def _ensure_services_started() -> None:
-    _compose("start", GATEWAY_SERVICE, ORDER_SERVICE, STOCK_SERVICE, PAYMENT_SERVICE)
+    _compose(
+        "up",
+        "-d",
+        KAFKA_SERVICE,
+        ORDER_DB_SERVICE,
+        STOCK_DB_SERVICE,
+        PAYMENT_DB_SERVICE,
+        GATEWAY_SERVICE,
+        ORDER_SERVICE,
+        STOCK_SERVICE,
+        PAYMENT_SERVICE,
+    )
+    _wait_for_redis(ORDER_DB_SERVICE)
+    _wait_for_redis(STOCK_DB_SERVICE)
+    _wait_for_redis(PAYMENT_DB_SERVICE)
     _wait_for_service_http(ORDER_SERVICE)
     _wait_for_service_http(STOCK_SERVICE)
     _wait_for_service_http(PAYMENT_SERVICE)
@@ -156,6 +196,26 @@ def _wait_for_service_http(service: str, timeout: int = RECOVERY_WAIT) -> None:
             check=False,
         )
         if probe.returncode == 0:
+            return
+        time.sleep(0.5)
+
+    raise AssertionError(f"{service} did not become ready within {timeout}s")
+
+
+def _wait_for_redis(service: str, timeout: int = RECOVERY_WAIT) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        probe = _compose(
+            "exec",
+            "-T",
+            service,
+            "redis-cli",
+            "-a",
+            REDIS_PASSWORD,
+            "PING",
+            check=False,
+        )
+        if probe.returncode == 0 and "PONG" in probe.stdout:
             return
         time.sleep(0.5)
 

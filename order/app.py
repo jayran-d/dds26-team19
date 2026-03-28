@@ -45,6 +45,10 @@ db: redis.Redis = redis.Redis(
     port=int(os.environ['REDIS_PORT']),
     password=os.environ['REDIS_PASSWORD'],
     db=int(os.environ['REDIS_DB']),
+    socket_connect_timeout=2,
+    socket_timeout=2,
+    retry_on_timeout=True,
+    health_check_interval=30,
 )
 
 
