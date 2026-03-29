@@ -17,6 +17,7 @@ from kafka_worker import (
     is_available,
     start_checkout,
 )
+from redis_helpers import order_status_channel
 from common.messages import SagaOrderStatus
 
 DB_ERROR_STR  = "DB error"
@@ -25,7 +26,6 @@ REQ_ERROR_STR = "Requests error"
 GATEWAY_URL = os.environ['GATEWAY_URL']
 USE_KAFKA   = os.getenv("USE_KAFKA", "false").lower() == "true"
 CHECKOUT_WAIT_TIMEOUT_SECONDS = float(os.getenv("CHECKOUT_WAIT_TIMEOUT_SECONDS", "45"))
-CHECKOUT_POLL_INTERVAL_SECONDS = float(os.getenv("CHECKOUT_POLL_INTERVAL_SECONDS", "0.05"))
 
 IN_PROGRESS_STATUSES = {
     SagaOrderStatus.RESERVING_STOCK,
@@ -86,20 +86,45 @@ def get_order_status(order_id: str) -> str | None:
 
 def _wait_for_terminal_checkout_status(order_id: str) -> str | None:
     """
-    Block until the Saga reaches a terminal state or the timeout expires.
+    Block until checkout reaches a terminal state or the timeout expires.
 
-    This keeps the distributed transaction asynchronous internally, but gives
-    the external HTTP API a final success/failure result.
+    Uses Redis Pub/Sub to avoid tight polling loops while still keeping Redis
+    order status as the durable source of truth. This works across processes:
+    whichever worker finalizes the checkout publishes a wake-up event.
     """
     deadline = time.time() + CHECKOUT_WAIT_TIMEOUT_SECONDS
+    channel = order_status_channel(order_id)
+    pubsub = db.pubsub(ignore_subscribe_messages=True)
 
-    while time.time() < deadline:
+    try:
+        pubsub.subscribe(channel)
+
+        # After subscribing, check the durable status once so we do not miss a
+        # terminal update that raced with subscription setup.
         status = get_order_status(order_id) or SagaOrderStatus.PENDING
         if status in TERMINAL_STATUSES:
             return status
-        time.sleep(CHECKOUT_POLL_INTERVAL_SECONDS)
 
-    return None
+        while time.time() < deadline:
+            remaining = max(0.0, deadline - time.time())
+            message = pubsub.get_message(timeout=min(1.0, remaining))
+            if not message:
+                continue
+
+            if message.get("type") != "message":
+                continue
+
+            data = message.get("data")
+            status = data.decode() if isinstance(data, (bytes, bytearray)) else str(data)
+            if status in TERMINAL_STATUSES:
+                return status
+
+        return None
+    finally:
+        try:
+            pubsub.close()
+        except Exception:
+            pass
 
 
 def _build_terminal_checkout_response(order_id: str) -> Response:

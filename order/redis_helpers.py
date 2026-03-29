@@ -4,9 +4,20 @@
 from common.messages import (STOCK_COMMANDS_TOPIC, PAYMENT_COMMANDS_TOPIC)
 
 
+def order_status_key(order_id: str) -> str:
+    return f"order:{order_id}:status"
+
+
+def order_status_channel(order_id: str) -> str:
+    return f"order:{order_id}:status:events"
+
+
 def set_status(logger, db, order_id: str, status: str) -> None:
     try:
-        db.set(f"order:{order_id}:status", status)
+        pipe = db.pipeline(transaction=False)
+        pipe.set(order_status_key(order_id), status)
+        pipe.publish(order_status_channel(order_id), status)
+        pipe.execute()
     except Exception as e:
         logger.error(f"[OrderKafka] Failed to set status {status} for {order_id}: {e}")
 

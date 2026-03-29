@@ -34,6 +34,7 @@ import redis as redis_module
 from msgspec import msgpack
 
 from . import saga_record
+from redis_helpers import set_status
 from common.messages import (
     SagaOrderStatus,
     STOCK_RESERVED,
@@ -441,5 +442,9 @@ def check_timeouts(db: redis_module.Redis, publish, logger) -> None:
 
 
 def _set_status(db: redis_module.Redis, order_id: str, status: str) -> None:
-    """Write the human-facing order status that GET /orders/status/<id> reads."""
-    db.set(f"order:{order_id}:status", status)
+    """Write the human-facing order status and notify any waiting checkout."""
+    class _NoopLogger:
+        def error(self, *args, **kwargs):
+            pass
+
+    set_status(_NoopLogger(), db, order_id, status)
