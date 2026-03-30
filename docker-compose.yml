@@ -12,9 +12,12 @@ services:
         soft: 65536
         hard: 65536
     depends_on:
-      - order-service
-      - stock-service
-      - payment-service
+      order-service:
+        condition: service_healthy
+      stock-service:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
 
   order-service:
     build:
@@ -49,6 +52,16 @@ services:
       nofile:
         soft: 65536
         hard: 65536
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import socket; s = socket.create_connection(("127.0.0.1", 5000), 2); s.close()
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
     depends_on:
       order-db:
         condition: service_healthy
@@ -100,6 +113,16 @@ services:
       nofile:
         soft: 65536
         hard: 65536
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import socket; s = socket.create_connection(("127.0.0.1", 5000), 2); s.close()
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
     depends_on:
       stock-db:
         condition: service_healthy
@@ -147,6 +170,16 @@ services:
       nofile:
         soft: 65536
         hard: 65536
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import socket; s = socket.create_connection(("127.0.0.1", 5000), 2); s.close()
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
     depends_on:
       payment-db:
         condition: service_healthy

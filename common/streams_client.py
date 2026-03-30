@@ -67,6 +67,7 @@ So you need:
 This wrapper provides ALL of that.
 """
 
+import os
 from typing import List, Tuple
 import redis as redis_module
 from msgspec import msgpack
@@ -77,7 +78,7 @@ from msgspec import msgpack
 STREAM_MAXLEN = 100_000
 
 # How long XREADGROUP blocks waiting for messages (ms)
-CONSUMER_BLOCK_MS = 500
+CONSUMER_BLOCK_MS = int(os.getenv("STREAM_BLOCK_MS", "100"))
 
 # Number of messages to read per batch
 DEFAULT_READ_COUNT = 32
