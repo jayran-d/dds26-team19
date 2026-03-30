@@ -110,7 +110,7 @@ services:
     build:
       context: .
       dockerfile: payment/Dockerfile
-    image: user:latest
+    image: payment:latest
     restart: unless-stopped
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092

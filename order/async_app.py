@@ -207,8 +207,6 @@ async def order_status(order_id: str):
 
 async def _send_post_request(url: str):
     try:
-        # Using blocking httpx.Client for consistency (prevents race conditions)
-        # Blocking inside async function just blocks that coroutine, not the entire server
         return _http_client.post(url)
     except httpx.RequestError:
         abort(400, REQ_ERROR_STR)
@@ -216,7 +214,6 @@ async def _send_post_request(url: str):
 
 async def _send_get_request(url: str):
     try:
-        # Using blocking httpx.Client for consistency
         return _http_client.get(url)
     except httpx.RequestError:
         abort(400, REQ_ERROR_STR)
