@@ -97,7 +97,7 @@ def saga_start_checkout(
 
     if not ok:
         if active_tx_id:
-            logger.info(
+            logger.debug(
                 f"[Saga] checkout already in progress for order={order_id} active_tx={active_tx_id}"
             )
             return {
@@ -117,9 +117,17 @@ def saga_start_checkout(
     # Important: the Saga record was already durably written before this publish.
     # If publish fails or the service crashes now, recovery can replay RESERVE_STOCK.
     cmd = build_reserve_stock(tx_id, order_id, items)
-    publish(STOCK_COMMANDS_TOPIC, cmd)
+    try:
+        publish(STOCK_COMMANDS_TOPIC, cmd)
+    except Exception as exc:
+        logger.warning(
+            f"[Saga] initial RESERVE_STOCK publish failed for tx={tx_id} order={order_id}: {exc}"
+        )
+        # The Saga record and visible status are already durable. Recovery and
+        # timeout replay can safely re-send the first command once the
+        # transport/store comes back.
 
-    logger.info(f"[Saga] started tx={tx_id} order={order_id}")
+    logger.debug(f"[Saga] started tx={tx_id} order={order_id}")
     return {"started": True, "reason": "started", "tx_id": tx_id}
 
 
@@ -203,7 +211,7 @@ def saga_on_stock_reserved(record, msg, db, publish, logger):
     amount = record["amount"]
 
     if record["state"] != SagaOrderStatus.RESERVING_STOCK:
-        logger.info(
+        logger.debug(
             f"[Saga] STOCK_RESERVED in unexpected state={record['state']} tx={tx_id}"
         )
         return
@@ -222,7 +230,7 @@ def saga_on_stock_reserved(record, msg, db, publish, logger):
 
     cmd = build_process_payment(tx_id, order_id, user_id, amount)
     publish(PAYMENT_COMMANDS_TOPIC, cmd)
-    logger.info(f"[Saga] stock reserved → processing payment tx={tx_id}")
+    logger.debug(f"[Saga] stock reserved → processing payment tx={tx_id}")
 
 
 def saga_on_stock_reservation_failed(record, msg, db, logger):
@@ -250,7 +258,7 @@ def saga_on_stock_reservation_failed(record, msg, db, logger):
     # can start a fresh transaction if the user wants to try again.
     saga_record.clear_active_tx_id(db, order_id, tx_id)
 
-    logger.info(f"[Saga] stock reservation failed tx={tx_id}: {reason}")
+    logger.debug(f"[Saga] stock reservation failed tx={tx_id}: {reason}")
 
 
 def saga_on_payment_success(record, msg, db, logger):
@@ -258,7 +266,7 @@ def saga_on_payment_success(record, msg, db, logger):
     order_id = record["order_id"]
 
     if record["state"] != SagaOrderStatus.PROCESSING_PAYMENT:
-        logger.info(
+        logger.debug(
             f"[Saga] PAYMENT_SUCCESS in unexpected state={record['state']} tx={tx_id}"
         )
         return
@@ -290,7 +298,7 @@ def saga_on_payment_success(record, msg, db, logger):
     # Terminal success: free the active-order slot.
     saga_record.clear_active_tx_id(db, order_id, tx_id)
 
-    logger.info(f"[Saga] completed tx={tx_id} order={order_id}")
+    logger.debug(f"[Saga] completed tx={tx_id} order={order_id}")
 
 
 
@@ -300,7 +308,7 @@ def saga_on_payment_failed(record, msg, db, publish, logger):
     reason = msg.get("payload", {}).get("reason", "unknown")
 
     if record["state"] != SagaOrderStatus.PROCESSING_PAYMENT:
-        logger.info(
+        logger.debug(
             f"[Saga] PAYMENT_FAILED in unexpected state={record['state']} tx={tx_id}"
         )
         return
@@ -322,7 +330,7 @@ def saga_on_payment_failed(record, msg, db, publish, logger):
 
     cmd = build_release_stock(tx_id, order_id, items)
     publish(STOCK_COMMANDS_TOPIC, cmd)
-    logger.info(f"[Saga] payment failed → compensating tx={tx_id}: {reason}")
+    logger.debug(f"[Saga] payment failed → compensating tx={tx_id}: {reason}")
 
 
 def saga_on_stock_released(record, msg, db, logger):
@@ -347,7 +355,7 @@ def saga_on_stock_released(record, msg, db, logger):
     # Compensation finished: the order is no longer active.
     saga_record.clear_active_tx_id(db, order_id, tx_id)
 
-    logger.info(f"[Saga] compensation done → failed tx={tx_id}")
+    logger.debug(f"[Saga] compensation done → failed tx={tx_id}")
 
 
 

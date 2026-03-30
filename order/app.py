@@ -1,15 +1,15 @@
+import asyncio
+import atexit
 import logging
 import os
-import atexit
 import random
-import threading
 import uuid
 from collections import defaultdict
 
 import redis
 import requests
 from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
+from quart import Quart, jsonify, abort, Response
 
 from streams_worker import (
     init_streams,
@@ -37,7 +37,7 @@ TERMINAL_STATUSES = {
     SagaOrderStatus.FAILED,
 }
 
-app = Flask("order-service")
+app = Quart("order-service")
 
 db: redis.Redis = redis.Redis(
     host=os.environ['REDIS_HOST'],
@@ -85,24 +85,41 @@ def get_order_status(order_id: str) -> str | None:
         return None
 
 
+async def get_order_from_db_async(order_id: str) -> OrderValue | None:
+    try:
+        entry = await asyncio.to_thread(db.get, order_id)
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+    order_entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
+    if order_entry is None:
+        abort(400, f"Order: {order_id} not found!")
+    return order_entry
+
+
+async def get_order_status_async(order_id: str) -> str | None:
+    try:
+        val = await asyncio.to_thread(db.get, f"order:{order_id}:status")
+        return val.decode() if val else None
+    except redis.exceptions.RedisError:
+        return None
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
-def _build_terminal_checkout_response(order_id: str, ev: threading.Event) -> Response:
-    """
-    Block until the Saga reaches a terminal state (via threading.Event)
-    then return the appropriate HTTP response.
-    Replaces 50ms polling with immediate in-process notification.
-    """
-    completed = ev.wait(timeout=CHECKOUT_WAIT_TIMEOUT_SECONDS)
-
-    if not completed:
+async def _build_terminal_checkout_response(
+    order_id: str,
+    waiter: asyncio.Future,
+) -> Response:
+    try:
+        await asyncio.wait_for(waiter, timeout=CHECKOUT_WAIT_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
         return Response(
             "Checkout timed out before reaching a terminal state",
             status=400,
             headers={"Location": f"/orders/status/{order_id}"},
         )
 
-    final_status = get_order_status(order_id) or SagaOrderStatus.PENDING
+    final_status = await get_order_status_async(order_id) or SagaOrderStatus.PENDING
 
     if final_status == SagaOrderStatus.COMPLETED:
         return Response(
@@ -111,6 +128,21 @@ def _build_terminal_checkout_response(order_id: str, ev: threading.Event) -> Res
             headers={"Location": f"/orders/status/{order_id}"},
         )
 
+    return Response(
+        "Checkout failed",
+        status=400,
+        headers={"Location": f"/orders/status/{order_id}"},
+    )
+
+
+def _response_from_status(order_id: str, status: str | None) -> Response:
+    final_status = status or SagaOrderStatus.PENDING
+    if final_status == SagaOrderStatus.COMPLETED:
+        return Response(
+            "Checkout successful",
+            status=200,
+            headers={"Location": f"/orders/status/{order_id}"},
+        )
     return Response(
         "Checkout failed",
         status=400,
@@ -211,41 +243,40 @@ def add_item(order_id: str, item_id: str, quantity: int):
 
 
 @app.post('/checkout/<order_id>')
-def checkout(order_id: str):
-    order_entry: OrderValue = get_order_from_db(order_id)
-    status = get_order_status(order_id)
+async def checkout(order_id: str):
+    waiter = checkout_notify.register_async(order_id)
+    try:
+        order_entry: OrderValue = await get_order_from_db_async(order_id)
+        status = await get_order_status_async(order_id)
 
-    if order_entry.paid or status == SagaOrderStatus.COMPLETED:
-        return Response(
-            "Order already completed",
-            status=200,
-            headers={"Location": f"/orders/status/{order_id}"},
-        )
+        if order_entry.paid or status == SagaOrderStatus.COMPLETED:
+            return Response(
+                "Order already completed",
+                status=200,
+                headers={"Location": f"/orders/status/{order_id}"},
+            )
 
-    if is_available():
-        # Register BEFORE starting to avoid race where saga completes before ev.wait()
-        ev = checkout_notify.register(order_id)
-        try:
+        if is_available():
+            # Register BEFORE reading terminal state to avoid missing a fast
+            # transition that happens between the status check and wait().
             if status in IN_PROGRESS_STATUSES:
-                return _build_terminal_checkout_response(order_id, ev)
+                return await _build_terminal_checkout_response(order_id, waiter)
 
             try:
-                result = start_checkout(order_id, order_entry)
+                result = await asyncio.to_thread(start_checkout, order_id, order_entry)
             except Exception as exc:
-                checkout_notify.unregister(order_id, ev)
                 app.logger.error(f"[checkout] failed to start: {exc}")
                 abort(400, str(exc))
 
             if isinstance(result, dict) and result.get("reason") == "already_in_progress":
-                return _build_terminal_checkout_response(order_id, ev)
+                return await _build_terminal_checkout_response(order_id, waiter)
 
             if isinstance(result, dict) and result.get("reason") == "error":
-                checkout_notify.unregister(order_id, ev)
                 abort(400, "Failed to start checkout")
 
-            return _build_terminal_checkout_response(order_id, ev)
-        finally:
-            checkout_notify.unregister(order_id, ev)
+            return await _build_terminal_checkout_response(order_id, waiter)
+    finally:
+        checkout_notify.unregister_async(order_id, waiter)
 
     # ── HTTP fallback ──────────────────────────────────────────────────────────
     items_quantities: dict[str, int] = defaultdict(int)
@@ -285,7 +316,8 @@ if __name__ == '__main__':
     init_streams(app.logger, db)
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
-    gunicorn_logger = logging.getLogger('gunicorn.error')
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
+    server_logger = logging.getLogger("hypercorn.error")
+    if server_logger.handlers:
+        app.logger.handlers = server_logger.handlers
+        app.logger.setLevel(server_logger.level)
     init_streams(app.logger, db)

@@ -14,7 +14,6 @@ Each handler follows the ledger pattern:
     4. if no entry → process normally, write ledger at each stage
 """
 
-from collections import defaultdict
 import json
 import time
 import redis as redis_module
@@ -63,9 +62,17 @@ def _handle_reserve_stock(
     order_id = msg.get("order_id")
     items = msg.get("payload", {}).get("items", [])
 
-    entry = stock_ledger.get_entry(db, tx_id, RESERVE_STOCK)
-
-    if entry:
+    created = stock_ledger.create_entry(
+        db=db,
+        tx_id=tx_id,
+        action_type=RESERVE_STOCK,
+        business_snapshot={"items": items},
+    )
+    if not created:
+        entry = stock_ledger.get_entry(db, tx_id, RESERVE_STOCK)
+        if not entry:
+            logger.error(f"[StockSaga] Failed to create/read RESERVE_STOCK ledger tx={tx_id}")
+            return
         state = entry.get("local_state")
         if state == LedgerState.REPLIED:
             logger.debug(f"[StockSaga] RESERVE_STOCK duplicate (replied) tx={tx_id}")
@@ -76,19 +83,6 @@ def _handle_reserve_stock(
             _republish(entry, publish)
             stock_ledger.mark_replied(db, tx_id, RESERVE_STOCK)
             return
-
-    if not entry:
-        created = stock_ledger.create_entry(
-            db=db,
-            tx_id=tx_id,
-            action_type=RESERVE_STOCK,
-            business_snapshot={"items": items},
-        )
-        if not created:
-            entry = stock_ledger.get_entry(db, tx_id, RESERVE_STOCK)
-            if not entry:
-                logger.error(f"[StockSaga] Failed to create/read RESERVE_STOCK ledger tx={tx_id}")
-                return
 
     try:
         reply, result = _reserve_stock_atomically(
@@ -105,7 +99,7 @@ def _handle_reserve_stock(
     # Mark replied only after publish succeeds so restart replay can recover
     # the "applied locally, reply not sent" crash window.
     stock_ledger.mark_replied(db, tx_id, RESERVE_STOCK)
-    logger.info(f"[StockSaga] RESERVE_STOCK {result} tx={tx_id} order={order_id}")
+    logger.debug(f"[StockSaga] RESERVE_STOCK {result} tx={tx_id} order={order_id}")
 
 
 
@@ -124,9 +118,17 @@ def _handle_release_stock(
     order_id = msg.get("order_id")
     items = msg.get("payload", {}).get("items", [])
 
-    entry = stock_ledger.get_entry(db, tx_id, RELEASE_STOCK)
-
-    if entry:
+    created = stock_ledger.create_entry(
+        db=db,
+        tx_id=tx_id,
+        action_type=RELEASE_STOCK,
+        business_snapshot={"items": items},
+    )
+    if not created:
+        entry = stock_ledger.get_entry(db, tx_id, RELEASE_STOCK)
+        if not entry:
+            logger.error(f"[StockSaga] Failed to create/read RELEASE_STOCK ledger tx={tx_id}")
+            return
         state = entry.get("local_state")
         if state == LedgerState.REPLIED:
             logger.debug(f"[StockSaga] RELEASE_STOCK duplicate (replied) tx={tx_id}")
@@ -137,19 +139,6 @@ def _handle_release_stock(
             _republish(entry, publish)
             stock_ledger.mark_replied(db, tx_id, RELEASE_STOCK)
             return
-
-    if not entry:
-        created = stock_ledger.create_entry(
-            db=db,
-            tx_id=tx_id,
-            action_type=RELEASE_STOCK,
-            business_snapshot={"items": items},
-        )
-        if not created:
-            entry = stock_ledger.get_entry(db, tx_id, RELEASE_STOCK)
-            if not entry:
-                logger.error(f"[StockSaga] Failed to create/read RELEASE_STOCK ledger tx={tx_id}")
-                return
 
     try:
         reply, _ = _release_stock_atomically(
@@ -166,7 +155,7 @@ def _handle_release_stock(
     # Compensation uses the same applied/replied split as reserve so duplicate
     # delivery and restart replay stay deterministic.
     stock_ledger.mark_replied(db, tx_id, RELEASE_STOCK)
-    logger.info(f"[StockSaga] RELEASE_STOCK done tx={tx_id} order={order_id}")
+    logger.debug(f"[StockSaga] RELEASE_STOCK done tx={tx_id} order={order_id}")
 
 
 # ============================================================
@@ -207,7 +196,8 @@ def _reserve_stock_atomically(
             # changed stock after we validated but before we commit.
             pipe.watch(ledger_key, *item_ids)
 
-            raw_entry = pipe.get(ledger_key)
+            raw_values = pipe.mget([ledger_key, *item_ids])
+            raw_entry = raw_values[0]
             if not raw_entry:
                 pipe.unwatch()
                 raise RuntimeError(f"Missing RESERVE_STOCK ledger entry for tx={tx_id}")
@@ -228,6 +218,7 @@ def _reserve_stock_atomically(
                 return reply, "failure"
 
             updated_items = {}
+            raw_items_by_id = dict(zip(item_ids, raw_values[1:]))
 
             for item_entry in items:
                 item_id = str(item_entry.get("item_id", ""))
@@ -242,7 +233,7 @@ def _reserve_stock_atomically(
                     pipe.execute()
                     return reply, "failure"
 
-                raw_item = pipe.get(item_id)
+                raw_item = raw_items_by_id.get(item_id)
                 if not raw_item:
                     reply = build_stock_reservation_failed(tx_id, order_id, f"Item {item_id} not found")
                     updated_entry = _build_applied_entry(entry, "failure", reply)
@@ -311,7 +302,8 @@ def _release_stock_atomically(
             # current item rows, so they all need to be observed together.
             pipe.watch(release_key, reserve_key, *item_ids)
 
-            raw_release = pipe.get(release_key)
+            raw_values = pipe.mget([release_key, reserve_key, *item_ids])
+            raw_release = raw_values[0]
             if not raw_release:
                 pipe.unwatch()
                 raise RuntimeError(f"Missing RELEASE_STOCK ledger entry for tx={tx_id}")
@@ -322,7 +314,7 @@ def _release_stock_atomically(
                 pipe.unwatch()
                 return release_entry["reply_message"], release_entry.get("result", "success")
 
-            raw_reserve = pipe.get(reserve_key)
+            raw_reserve = raw_values[1]
             reserve_entry = json.loads(raw_reserve) if raw_reserve else None
             reserve_succeeded = reserve_entry is not None and reserve_entry.get("result") == "success"
 
@@ -339,12 +331,13 @@ def _release_stock_atomically(
                 return reply, "success"
 
             updated_items = {}
+            raw_items_by_id = dict(zip(item_ids, raw_values[2:]))
 
             for item_entry in items:
                 item_id = str(item_entry.get("item_id", ""))
                 quantity = int(item_entry.get("quantity", 0))
 
-                raw_item = pipe.get(item_id)
+                raw_item = raw_items_by_id.get(item_id)
                 if not raw_item:
                     pipe.unwatch()
                     raise RuntimeError(f"Missing item {item_id} during RELEASE_STOCK for tx={tx_id}")

@@ -34,6 +34,14 @@ _available = False
 _logger = None
 
 
+class _StreamProducer:
+    def __init__(self, publish_fn):
+        self._publish_fn = publish_fn
+
+    def publish(self, stream: str, message: dict) -> None:
+        self._publish_fn(stream, message)
+
+
 def _replay_unreplied_entries(sc: StreamsClient) -> None:
     if TRANSACTION_MODE != "saga" or _db is None:
         return
@@ -51,7 +59,7 @@ def _replay_unreplied_entries(sc: StreamsClient) -> None:
 def _route_command(msg: dict, publish_fn) -> None:
     msg_type = msg.get("type")
     if TRANSACTION_MODE == "simple":
-        simple_route_payment(None, _logger, msg, msg_type)
+        simple_route_payment(_StreamProducer(publish_fn), _logger, msg, msg_type)
     elif TRANSACTION_MODE == "saga":
         saga_route_payment(msg, _db, publish_fn, _logger)
     elif TRANSACTION_MODE == "2pc":

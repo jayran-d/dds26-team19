@@ -13,9 +13,9 @@ Consumer groups give equivalent exactly-once delivery guarantees to Kafka's
 manual offset commit, with much lower per-message latency.
 """
 
-import json
 from typing import Optional, List, Tuple
 import redis as redis_module
+from msgspec import msgpack
 
 
 STREAM_MAXLEN = 100_000
@@ -43,7 +43,7 @@ class StreamsClient:
         """
         self._db.xadd(
             stream,
-            {'d': json.dumps(message)},
+            {'d': msgpack.encode(message)},
             maxlen=STREAM_MAXLEN,
             approximate=True,
         )
@@ -78,9 +78,7 @@ class StreamsClient:
             sname = stream_raw.decode() if isinstance(stream_raw, bytes) else stream_raw
             for msg_id, fields in msgs:
                 raw = fields.get(b'd') or fields.get('d')
-                if isinstance(raw, bytes):
-                    raw = raw.decode()
-                return sname, msg_id, json.loads(raw)
+                return sname, msg_id, msgpack.decode(raw)
         return None
 
     def ack(self, stream: str, group: str, msg_id) -> None:
@@ -110,9 +108,7 @@ class StreamsClient:
                 )
                 for msg_id, fields in msgs:
                     raw = fields.get(b'd') or fields.get('d')
-                    if isinstance(raw, bytes):
-                        raw = raw.decode()
-                    recovered.append((stream, msg_id, json.loads(raw)))
+                    recovered.append((stream, msg_id, msgpack.decode(raw)))
             except Exception:
                 pass
         return recovered

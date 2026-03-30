@@ -16,7 +16,7 @@ from common.messages import (
 )
 
 from redis_helpers import get_order, set_status
-from common.kafka_client import KafkaProducerClient
+import checkout_notify
 
 # ============================================================
 # SIMPLE  (no orchestration — Kafka equivalent of the HTTP template)
@@ -24,7 +24,7 @@ from common.kafka_client import KafkaProducerClient
 
 
 def simple_start_checkout(
-    producer: KafkaProducerClient,
+    producer,
     db: redis_module.Redis,
     logger,
     order_id: str,
@@ -55,7 +55,7 @@ def simple_start_checkout(
 
 
 def simple_route_order(
-    producer: KafkaProducerClient,
+    producer,
     db: redis_module.Redis,
     logger,
     msg: dict,
@@ -76,7 +76,7 @@ def simple_route_order(
 
 
 def simple_on_stock_reserved(
-    producer: KafkaProducerClient, db: redis_module.Redis, logger, msg: dict
+    producer, db: redis_module.Redis, logger, msg: dict
 ) -> None:
     """Stock reserved — now charge the user."""
     from msgspec import msgpack
@@ -104,7 +104,7 @@ def simple_on_stock_reserved(
 
 
 def simple_on_stock_reservation_failed(
-    producer: KafkaProducerClient, db: redis_module.Redis, logger, msg: dict
+    producer, db: redis_module.Redis, logger, msg: dict
 ) -> None:
     """Stock reservation failed — nothing was reserved, just mark failed."""
     order_id = msg.get("order_id")
@@ -112,19 +112,21 @@ def simple_on_stock_reservation_failed(
         f"[Simple] order={order_id} stock reservation failed — no rollback needed"
     )
     set_status(logger, db, order_id, "failed")
+    checkout_notify.notify(order_id)
 
 
 def simple_on_stock_released(
-    producer: KafkaProducerClient, db: redis_module.Redis, logger, msg: dict
+    producer, db: redis_module.Redis, logger, msg: dict
 ) -> None:
     """Stock successfully released after a payment failure — mark order failed."""
     order_id = msg.get("order_id")
     logger.info(f"[Simple] order={order_id} stock released — marking failed")
     set_status(logger, db, order_id, "failed")
+    checkout_notify.notify(order_id)
 
 
 def simple_on_payment_success(
-    producer: KafkaProducerClient, db: redis_module.Redis, logger, msg: dict
+    producer, db: redis_module.Redis, logger, msg: dict
 ) -> None:
     """Payment succeeded — mark order as paid."""
     from msgspec import msgpack
@@ -146,11 +148,12 @@ def simple_on_payment_success(
     )
     db.set(order_id, msgpack.encode(order))
     set_status(logger, db, order_id, "completed")
+    checkout_notify.notify(order_id)
     logger.info(f"[Simple] order={order_id} marked paid — COMPLETED")
 
 
 def simple_on_payment_failed(
-    producer: KafkaProducerClient, db: redis_module.Redis, logger, msg: dict
+    producer, db: redis_module.Redis, logger, msg: dict
 ) -> None:
     """Payment failed — release the reserved stock."""
     from msgspec import msgpack

@@ -56,6 +56,14 @@ _available = False
 _logger = None
 
 
+class _StreamProducer:
+    def __init__(self, publish_fn):
+        self._publish_fn = publish_fn
+
+    def publish(self, stream: str, message: dict) -> None:
+        self._publish_fn(stream, message)
+
+
 def _make_stock_db() -> redis_module.Redis:
     return redis_module.Redis(
         host=os.environ['STOCK_REDIS_HOST'],
@@ -88,7 +96,7 @@ def _route_event(msg: dict, publish_fn) -> None:
         saga_route_order(msg, _order_db, publish_fn, _logger)
     elif TRANSACTION_MODE == "simple":
         from transactions_modes.simple import simple_route_order
-        simple_route_order(None, _order_db, _logger, msg, msg_type)
+        simple_route_order(_StreamProducer(publish_fn), _order_db, _logger, msg, msg_type)
     elif TRANSACTION_MODE == "2pc":
         from transactions_modes.two_pc import _2pc_route_order
         _2pc_route_order(msg)
@@ -258,7 +266,7 @@ def start_checkout(order_id: str, order_entry) -> dict:
 
     if TRANSACTION_MODE == "simple":
         from transactions_modes.simple import simple_start_checkout
-        simple_start_checkout(None, _order_db, _logger, order_id, order_entry)
+        simple_start_checkout(_StreamProducer(publish_fn), _order_db, _logger, order_id, order_entry)
         return {"started": True, "reason": "started"}
 
     if TRANSACTION_MODE == "2pc":

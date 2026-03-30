@@ -1,50 +1,70 @@
 """
 order/checkout_notify.py
 
-In-process notification for checkout completion.
+In-process checkout completion notification.
 
-Replaces the 50ms polling loop in app.py with threading.Event waits.
-The event loop thread sets the event as soon as the saga reaches a terminal
-state, so the HTTP handler unblocks within microseconds instead of up to 50ms.
+Supports both:
+    - threading.Event waiters for synchronous callers
+    - asyncio.Future waiters for async order-service checkout handlers
 
-Thread safety: all state is protected by a single lock.
-Multiple concurrent requesters for the same order_id each get their own event.
+The saga event loop runs in background threads, so notify() resolves async
+waiters via loop.call_soon_threadsafe().
 """
 
+import asyncio
 import threading
 
 _lock = threading.Lock()
-_waiting: dict[str, list[threading.Event]] = {}
+_thread_waiting: dict[str, list[threading.Event]] = {}
+_async_waiting: dict[str, list[tuple[asyncio.AbstractEventLoop, asyncio.Future]]] = {}
 
 
 def register(order_id: str) -> threading.Event:
-    """
-    Register a waiter for order_id. Call this BEFORE starting checkout
-    to avoid a race where the saga completes before ev.wait() is called.
-    threading.Event.wait() on an already-set event returns immediately.
-    """
     ev = threading.Event()
     with _lock:
-        _waiting.setdefault(order_id, []).append(ev)
+        _thread_waiting.setdefault(order_id, []).append(ev)
     return ev
 
 
-def notify(order_id: str) -> None:
-    """
-    Signal all waiters for order_id that the saga has reached a terminal state.
-    Called by the saga event handlers in saga.py.
-    """
-    with _lock:
-        events = _waiting.pop(order_id, [])
-    for ev in events:
-        ev.set()
-
-
 def unregister(order_id: str, ev: threading.Event) -> None:
-    """Remove a specific waiter, e.g. on timeout cleanup."""
     with _lock:
-        events = _waiting.get(order_id)
+        events = _thread_waiting.get(order_id)
         if events and ev in events:
             events.remove(ev)
             if not events:
-                _waiting.pop(order_id, None)
+                _thread_waiting.pop(order_id, None)
+
+
+def register_async(order_id: str) -> asyncio.Future:
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    with _lock:
+        _async_waiting.setdefault(order_id, []).append((loop, fut))
+    return fut
+
+
+def unregister_async(order_id: str, fut: asyncio.Future) -> None:
+    with _lock:
+        waiters = _async_waiting.get(order_id)
+        if not waiters:
+            return
+        waiters[:] = [(loop, entry) for loop, entry in waiters if entry is not fut]
+        if not waiters:
+            _async_waiting.pop(order_id, None)
+
+
+def _resolve_future(fut: asyncio.Future) -> None:
+    if not fut.done():
+        fut.set_result(True)
+
+
+def notify(order_id: str) -> None:
+    with _lock:
+        events = _thread_waiting.pop(order_id, [])
+        futures = _async_waiting.pop(order_id, [])
+
+    for ev in events:
+        ev.set()
+
+    for loop, fut in futures:
+        loop.call_soon_threadsafe(_resolve_future, fut)
