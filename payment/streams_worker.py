@@ -19,7 +19,6 @@ from common.messages import PAYMENT_COMMANDS_TOPIC, PAYMENT_EVENTS_TOPIC
 
 import ledger as payment_ledger
 from transactions_modes.saga import saga_route_payment
-from transactions_modes.simple import simple_route_payment
 from transactions_modes.two_pc import _2pc_route_payment
 
 TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "saga")
@@ -34,14 +33,12 @@ _db: redis_module.Redis | None = None
 _available = False
 _logger = None
 
-
 class _StreamProducer:
     def __init__(self, publish_fn):
         self._publish_fn = publish_fn
 
     def publish(self, stream: str, message: dict) -> None:
         self._publish_fn(stream, message)
-
 
 def _replay_unreplied_entries(sc: StreamsClient) -> None:
     if TRANSACTION_MODE != "saga" or _db is None:
@@ -57,11 +54,8 @@ def _replay_unreplied_entries(sc: StreamsClient) -> None:
             payment_ledger.mark_replied(_db, entry["tx_id"], entry["action_type"])
 
 
-def _route_command(msg: dict, publish_fn) -> None:
-    msg_type = msg.get("type")
-    if TRANSACTION_MODE == "simple":
-        simple_route_payment(_StreamProducer(publish_fn), _logger, msg, msg_type)
-    elif TRANSACTION_MODE == "saga":
+def _route_command(msg: dict, publish_fn) -> None:  
+    if TRANSACTION_MODE == "saga":
         saga_route_payment(msg, _db, publish_fn, _logger)
     elif TRANSACTION_MODE == "2pc":
         _2pc_route_payment(msg)

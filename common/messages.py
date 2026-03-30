@@ -26,7 +26,7 @@ import os
 import uuid
 import time
 
-TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "simple")  # "simple" | "saga" | "2pc"
+TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "saga")  # "saga" | "2pc"
 
 
 # ============================================================

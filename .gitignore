@@ -3,3 +3,4 @@
 
 broker_logs.txt
 test/__pycache__
+.env

@@ -38,7 +38,6 @@ from transactions_modes.saga.saga import (
     recover as saga_recover,
     check_timeouts as saga_check_timeouts,
 )
-# simple/2pc imported lazily to avoid kafka_client import chain when not used
 
 
 TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "saga")
@@ -94,12 +93,8 @@ def _make_payment_db() -> redis_module.Redis:
 
 
 def _route_event(msg: dict, publish_fn) -> None:
-    msg_type = msg.get("type")
     if TRANSACTION_MODE == "saga":
         saga_route_order(msg, _order_db, publish_fn, _logger)
-    elif TRANSACTION_MODE == "simple":
-        from transactions_modes.simple import simple_route_order
-        simple_route_order(_StreamProducer(publish_fn), _order_db, _logger, msg, msg_type)
     elif TRANSACTION_MODE == "2pc":
         from transactions_modes.two_pc import _2pc_route_order
         _2pc_route_order(msg)
@@ -298,11 +293,6 @@ def start_checkout(order_id: str, order_entry) -> dict:
 
     if TRANSACTION_MODE == "saga":
         return saga_start_checkout(publish_fn, _order_db, _logger, order_id, order_entry)
-
-    if TRANSACTION_MODE == "simple":
-        from transactions_modes.simple import simple_start_checkout
-        simple_start_checkout(_StreamProducer(publish_fn), _order_db, _logger, order_id, order_entry)
-        return {"started": True, "reason": "started"}
 
     if TRANSACTION_MODE == "2pc":
         from transactions_modes.two_pc import _2pc_start_checkout
