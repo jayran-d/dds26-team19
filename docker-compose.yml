@@ -44,6 +44,10 @@ services:
     env_file:
       - env/order_redis.env
       - env/transaction.env
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     depends_on:
       order-db:
         condition: service_healthy
@@ -84,6 +88,10 @@ services:
     env_file:
       - env/stock_redis.env
       - env/transaction.env
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     depends_on:
       stock-db:
         condition: service_healthy
@@ -120,6 +128,10 @@ services:
     env_file:
       - env/payment_redis.env
       - env/transaction.env
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     depends_on:
       payment-db:
         condition: service_healthy
