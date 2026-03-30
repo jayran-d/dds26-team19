@@ -39,12 +39,36 @@ class StockValue(Struct):
     price: int
 
 
+def _decode_legacy_item(raw: bytes | None) -> StockValue | None:
+    return msgpack.decode(raw, type=StockValue) if raw else None
+
+
+def _write_item_to_db(item_id: str, item_entry: StockValue) -> None:
+    mapping = {
+        "stock": int(item_entry.stock),
+        "price": int(item_entry.price),
+    }
+    try:
+        db.hset(item_id, mapping=mapping)
+    except redis.exceptions.ResponseError:
+        # Local dev may still have old string/msgpack keys from before the storage
+        # change. Replace them lazily the first time we write.
+        db.delete(item_id)
+        db.hset(item_id, mapping=mapping)
+
+
 def get_item_from_db(item_id: str) -> StockValue | None:
+    try:
+        stock_raw, price_raw = db.hmget(item_id, "stock", "price")
+        if stock_raw is not None and price_raw is not None:
+            return StockValue(stock=int(stock_raw), price=int(price_raw))
+    except redis.exceptions.ResponseError:
+        pass
     try:
         entry: bytes = db.get(item_id)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
+    entry: StockValue | None = _decode_legacy_item(entry)
     if entry is None:
         abort(400, f"Item: {item_id} not found!")
     return entry
@@ -65,7 +89,7 @@ def apply_stock_delta(item_id: str, delta: int) -> tuple[bool, str | None, int |
     if item_entry.stock < 0:
         return False, f"Item: {item_id} stock cannot get reduced below zero!", None
     try:
-        db.set(item_id, msgpack.encode(item_entry))
+        _write_item_to_db(item_id, item_entry)
     except redis.exceptions.RedisError:
         return False, DB_ERROR_STR, None
     return True, None, item_entry.stock
@@ -77,9 +101,8 @@ def apply_stock_delta(item_id: str, delta: int) -> tuple[bool, str | None, int |
 def create_item(price: int):
     key = str(uuid.uuid4())
     app.logger.info(f"Item: {key} created")
-    value = msgpack.encode(StockValue(stock=0, price=int(price)))
     try:
-        db.set(key, value)
+        _write_item_to_db(key, StockValue(stock=0, price=int(price)))
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({'item_id': key})
@@ -90,12 +113,19 @@ def batch_init_users(n: int, starting_stock: int, item_price: int):
     n = int(n)
     starting_stock = int(starting_stock)
     item_price = int(item_price)
-    kv_pairs: dict[str, bytes] = {
-        f"{i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
-        for i in range(n)
-    }
     try:
-        db.mset(kv_pairs)
+        pipe = db.pipeline(transaction=False)
+        for i in range(n):
+            key = f"{i}"
+            pipe.delete(key)
+            pipe.hset(
+                key,
+                mapping={
+                    "stock": starting_stock,
+                    "price": item_price,
+                },
+            )
+        pipe.execute()
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for stock successful"})

@@ -3,21 +3,14 @@ stock/transaction_modes/saga.py
 
 Saga command handlers for the stock service.
 
-Handles:
-    RESERVE_STOCK  → all-or-nothing stock reservation
-    RELEASE_STOCK  → stock compensation (release previously reserved stock)
-
-Each handler follows the ledger pattern:
-    1. check ledger for (tx_id, action_type)
-    2. if already replied  → re-emit stored reply, return
-    3. if applied but not replied → publish stored reply, mark replied, return
-    4. if no entry → process normally, write ledger at each stage
+The hot path is executed inside Redis Lua so that:
+    - stock validation + mutation + ledger write happen in one atomic step
+    - we avoid Python WATCH/MULTI retry loops on every command
+    - the ledger still stores an APPLIED reply payload for crash recovery
 """
 
 import json
-import time
 import redis as redis_module
-from msgspec import msgpack
 
 from common.messages import (
     RESERVE_STOCK,
@@ -32,9 +25,148 @@ import ledger as stock_ledger
 from ledger import LedgerState
 
 
-# ============================================================
-# PUBLIC ROUTE
-# ============================================================
+_RESERVE_STOCK_LUA = """
+local ledger_key = KEYS[1]
+local tx_id = ARGV[1]
+local items = cjson.decode(ARGV[2])
+local success_reply = cjson.decode(ARGV[3])
+local failure_reply = cjson.decode(ARGV[4])
+local ttl = tonumber(ARGV[5])
+
+local now = redis.call('TIME')
+local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+
+local created_at_ms = now_ms
+local raw_entry = redis.call('GET', ledger_key)
+if raw_entry then
+    local entry = cjson.decode(raw_entry)
+    local state = entry['local_state']
+    if state == 'applied' or state == 'replied' then
+        return {state or '', entry['result'] or '', cjson.encode(entry['reply_message'])}
+    end
+    if entry['created_at_ms'] then
+        created_at_ms = entry['created_at_ms']
+    end
+end
+
+local function persist(result, reply)
+    local entry = {
+        tx_id = tx_id,
+        action_type = 'RESERVE_STOCK',
+        local_state = 'applied',
+        result = result,
+        reply_message = reply,
+        business_snapshot = { items = items },
+        created_at_ms = created_at_ms,
+        updated_at_ms = now_ms,
+    }
+    redis.call('SET', ledger_key, cjson.encode(entry), 'EX', ttl)
+    return {'applied', result, cjson.encode(reply)}
+end
+
+if next(items) == nil then
+    failure_reply['payload']['reason'] = 'No items in payload'
+    return persist('failure', failure_reply)
+end
+
+for _, item in ipairs(items) do
+    local item_id = tostring(item['item_id'] or '')
+    local quantity = tonumber(item['quantity'])
+
+    if item_id == '' or not quantity then
+        failure_reply['payload']['reason'] = 'Invalid item payload'
+        return persist('failure', failure_reply)
+    end
+
+    local stock_raw = redis.call('HGET', item_id, 'stock')
+    if not stock_raw then
+        failure_reply['payload']['reason'] = 'Item ' .. item_id .. ' not found'
+        return persist('failure', failure_reply)
+    end
+
+    local stock = tonumber(stock_raw)
+    if not stock or stock < quantity then
+        failure_reply['payload']['reason'] =
+            'Insufficient stock for item ' .. item_id ..
+            ' (have ' .. tostring(stock or 0) ..
+            ', need ' .. tostring(quantity) .. ')'
+        return persist('failure', failure_reply)
+    end
+end
+
+for _, item in ipairs(items) do
+    redis.call('HINCRBY', tostring(item['item_id']), 'stock', -tonumber(item['quantity']))
+end
+
+return persist('success', success_reply)
+"""
+
+_RELEASE_STOCK_LUA = """
+local release_key = KEYS[1]
+local reserve_key = KEYS[2]
+local tx_id = ARGV[1]
+local items = cjson.decode(ARGV[2])
+local success_reply = cjson.decode(ARGV[3])
+local ttl = tonumber(ARGV[4])
+
+local now = redis.call('TIME')
+local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+
+local created_at_ms = now_ms
+local raw_release = redis.call('GET', release_key)
+if raw_release then
+    local release_entry = cjson.decode(raw_release)
+    local state = release_entry['local_state']
+    if state == 'applied' or state == 'replied' then
+        return {state or '', release_entry['result'] or '', cjson.encode(release_entry['reply_message'])}
+    end
+    if release_entry['created_at_ms'] then
+        created_at_ms = release_entry['created_at_ms']
+    end
+end
+
+local function persist(reply)
+    local entry = {
+        tx_id = tx_id,
+        action_type = 'RELEASE_STOCK',
+        local_state = 'applied',
+        result = 'success',
+        reply_message = reply,
+        business_snapshot = { items = items },
+        created_at_ms = created_at_ms,
+        updated_at_ms = now_ms,
+    }
+    redis.call('SET', release_key, cjson.encode(entry), 'EX', ttl)
+    return {'applied', 'success', cjson.encode(reply)}
+end
+
+local raw_reserve = redis.call('GET', reserve_key)
+if raw_reserve then
+    local reserve_entry = cjson.decode(raw_reserve)
+    if reserve_entry['result'] ~= 'success' then
+        return persist(success_reply)
+    end
+else
+    return persist(success_reply)
+end
+
+for _, item in ipairs(items) do
+    local item_id = tostring(item['item_id'] or '')
+    local quantity = tonumber(item['quantity']) or 0
+    local stock_raw = redis.call('HGET', item_id, 'stock')
+
+    if item_id == '' or not stock_raw then
+        return {'error', 'missing_item', item_id}
+    end
+
+    redis.call('HINCRBY', item_id, 'stock', quantity)
+end
+
+return persist(success_reply)
+"""
+
+_reserve_stock_script = None
+_release_stock_script = None
 
 
 def saga_route_stock(msg: dict, db: redis_module.Redis, publish, logger) -> None:
@@ -47,11 +179,6 @@ def saga_route_stock(msg: dict, db: redis_module.Redis, publish, logger) -> None
         logger.info(f"[StockSaga] Unknown command type: {msg_type!r} — dropping")
 
 
-# ============================================================
-# RESERVE_STOCK
-# ============================================================
-
-
 def _handle_reserve_stock(
     msg: dict,
     db: redis_module.Redis,
@@ -62,30 +189,8 @@ def _handle_reserve_stock(
     order_id = msg.get("order_id")
     items = msg.get("payload", {}).get("items", [])
 
-    created = stock_ledger.create_entry(
-        db=db,
-        tx_id=tx_id,
-        action_type=RESERVE_STOCK,
-        business_snapshot={"items": items},
-    )
-    if not created:
-        entry = stock_ledger.get_entry(db, tx_id, RESERVE_STOCK)
-        if not entry:
-            logger.error(f"[StockSaga] Failed to create/read RESERVE_STOCK ledger tx={tx_id}")
-            return
-        state = entry.get("local_state")
-        if state == LedgerState.REPLIED:
-            logger.debug(f"[StockSaga] RESERVE_STOCK duplicate (replied) tx={tx_id}")
-            _republish(entry, publish)
-            return
-        if state == LedgerState.APPLIED:
-            logger.debug(f"[StockSaga] RESERVE_STOCK duplicate (applied) tx={tx_id}")
-            _republish(entry, publish)
-            stock_ledger.mark_replied(db, tx_id, RESERVE_STOCK)
-            return
-
     try:
-        reply, result = _reserve_stock_atomically(
+        state, reply, result = _reserve_stock_atomically(
             db=db,
             tx_id=tx_id,
             order_id=order_id,
@@ -96,16 +201,9 @@ def _handle_reserve_stock(
         return
 
     publish(STOCK_EVENTS_TOPIC, reply)
-    # Mark replied only after publish succeeds so restart replay can recover
-    # the "applied locally, reply not sent" crash window.
-    stock_ledger.mark_replied(db, tx_id, RESERVE_STOCK)
+    if state != LedgerState.REPLIED:
+        stock_ledger.mark_replied(db, tx_id, RESERVE_STOCK)
     logger.debug(f"[StockSaga] RESERVE_STOCK {result} tx={tx_id} order={order_id}")
-
-
-
-# ============================================================
-# RELEASE_STOCK  (compensation)
-# ============================================================
 
 
 def _handle_release_stock(
@@ -118,30 +216,8 @@ def _handle_release_stock(
     order_id = msg.get("order_id")
     items = msg.get("payload", {}).get("items", [])
 
-    created = stock_ledger.create_entry(
-        db=db,
-        tx_id=tx_id,
-        action_type=RELEASE_STOCK,
-        business_snapshot={"items": items},
-    )
-    if not created:
-        entry = stock_ledger.get_entry(db, tx_id, RELEASE_STOCK)
-        if not entry:
-            logger.error(f"[StockSaga] Failed to create/read RELEASE_STOCK ledger tx={tx_id}")
-            return
-        state = entry.get("local_state")
-        if state == LedgerState.REPLIED:
-            logger.debug(f"[StockSaga] RELEASE_STOCK duplicate (replied) tx={tx_id}")
-            _republish(entry, publish)
-            return
-        if state == LedgerState.APPLIED:
-            logger.debug(f"[StockSaga] RELEASE_STOCK duplicate (applied) tx={tx_id}")
-            _republish(entry, publish)
-            stock_ledger.mark_replied(db, tx_id, RELEASE_STOCK)
-            return
-
     try:
-        reply, _ = _release_stock_atomically(
+        state, reply, _ = _release_stock_atomically(
             db=db,
             tx_id=tx_id,
             order_id=order_id,
@@ -152,29 +228,27 @@ def _handle_release_stock(
         return
 
     publish(STOCK_EVENTS_TOPIC, reply)
-    # Compensation uses the same applied/replied split as reserve so duplicate
-    # delivery and restart replay stay deterministic.
-    stock_ledger.mark_replied(db, tx_id, RELEASE_STOCK)
+    if state != LedgerState.REPLIED:
+        stock_ledger.mark_replied(db, tx_id, RELEASE_STOCK)
     logger.debug(f"[StockSaga] RELEASE_STOCK done tx={tx_id} order={order_id}")
 
 
-# ============================================================
-# INTERNAL HELPERS
-# ============================================================
+def _get_reserve_stock_script(db: redis_module.Redis):
+    global _reserve_stock_script
+    if _reserve_stock_script is None:
+        _reserve_stock_script = db.register_script(_RESERVE_STOCK_LUA)
+    return _reserve_stock_script
 
-def _republish(entry: dict, publish) -> None:
-    """Re-publish the stored reply event saved in the ledger entry."""
-    reply_message = entry.get("reply_message")
-    if reply_message:
-        publish(STOCK_EVENTS_TOPIC, reply_message)
 
-def _build_applied_entry(entry: dict, result: str, reply_message: dict) -> dict:
-    updated = dict(entry)
-    updated["local_state"] = LedgerState.APPLIED
-    updated["result"] = result
-    updated["reply_message"] = reply_message
-    updated["updated_at_ms"] = int(time.time() * 1000)
-    return updated
+def _get_release_stock_script(db: redis_module.Redis):
+    global _release_stock_script
+    if _release_stock_script is None:
+        _release_stock_script = db.register_script(_RELEASE_STOCK_LUA)
+    return _release_stock_script
+
+
+def _decode_scalar(value) -> str:
+    return value.decode() if isinstance(value, bytes) else value
 
 
 def _reserve_stock_atomically(
@@ -182,105 +256,28 @@ def _reserve_stock_atomically(
     tx_id: str,
     order_id: str,
     items: list[dict],
-) -> tuple[dict, str]:
-    from app import StockValue
-
+) -> tuple[str, dict, str]:
     ledger_key = f"stock:ledger:{tx_id}:{RESERVE_STOCK}"
-    item_ids = sorted({str(item.get('item_id', '')) for item in items if item.get("item_id") is not None})
+    success_reply = build_stock_reserved(tx_id, order_id)
+    failure_reply = build_stock_reservation_failed(tx_id, order_id, "")
+    script = _get_reserve_stock_script(db)
 
-    while True:
-        pipe = db.pipeline()
-        try:
-            # Every item touched by the reservation participates in the watch.
-            # That lets Redis reject the transaction if concurrent activity
-            # changed stock after we validated but before we commit.
-            pipe.watch(ledger_key, *item_ids)
+    result = script(
+        keys=[ledger_key],
+        args=[
+            tx_id,
+            json.dumps(items),
+            json.dumps(success_reply),
+            json.dumps(failure_reply),
+            stock_ledger.LEDGER_TTL_SECONDS,
+        ],
+        client=db,
+    )
 
-            raw_values = pipe.mget([ledger_key, *item_ids])
-            raw_entry = raw_values[0]
-            if not raw_entry:
-                pipe.unwatch()
-                raise RuntimeError(f"Missing RESERVE_STOCK ledger entry for tx={tx_id}")
-
-            entry = json.loads(raw_entry)
-            state = entry.get("local_state")
-            if state in (LedgerState.APPLIED, LedgerState.REPLIED):
-                pipe.unwatch()
-                return entry["reply_message"], entry.get("result", "failure")
-
-            if not items:
-                reply = build_stock_reservation_failed(tx_id, order_id, "No items in payload")
-                updated_entry = _build_applied_entry(entry, "failure", reply)
-
-                pipe.multi()
-                pipe.set(ledger_key, json.dumps(updated_entry), ex=stock_ledger.LEDGER_TTL_SECONDS)
-                pipe.execute()
-                return reply, "failure"
-
-            updated_items = {}
-            raw_items_by_id = dict(zip(item_ids, raw_values[1:]))
-
-            for item_entry in items:
-                item_id = str(item_entry.get("item_id", ""))
-                quantity = item_entry.get("quantity")
-
-                if not item_id or quantity is None:
-                    reply = build_stock_reservation_failed(tx_id, order_id, "Invalid item payload")
-                    updated_entry = _build_applied_entry(entry, "failure", reply)
-
-                    pipe.multi()
-                    pipe.set(ledger_key, json.dumps(updated_entry), ex=stock_ledger.LEDGER_TTL_SECONDS)
-                    pipe.execute()
-                    return reply, "failure"
-
-                raw_item = raw_items_by_id.get(item_id)
-                if not raw_item:
-                    reply = build_stock_reservation_failed(tx_id, order_id, f"Item {item_id} not found")
-                    updated_entry = _build_applied_entry(entry, "failure", reply)
-
-                    pipe.multi()
-                    pipe.set(ledger_key, json.dumps(updated_entry), ex=stock_ledger.LEDGER_TTL_SECONDS)
-                    pipe.execute()
-                    return reply, "failure"
-
-                stock_entry = msgpack.decode(raw_item, type=StockValue)
-                quantity = int(quantity)
-
-                if stock_entry.stock < quantity:
-                    reply = build_stock_reservation_failed(
-                        tx_id,
-                        order_id,
-                        f"Insufficient stock for item {item_id} (have {stock_entry.stock}, need {quantity})",
-                    )
-                    updated_entry = _build_applied_entry(entry, "failure", reply)
-
-                    pipe.multi()
-                    pipe.set(ledger_key, json.dumps(updated_entry), ex=stock_ledger.LEDGER_TTL_SECONDS)
-                    pipe.execute()
-                    return reply, "failure"
-
-                updated_items[item_id] = StockValue(
-                    stock=stock_entry.stock - quantity,
-                    price=stock_entry.price,
-                )
-
-            reply = build_stock_reserved(tx_id, order_id)
-            updated_entry = _build_applied_entry(entry, "success", reply)
-
-            # Commit the entire reservation and the ledger transition in one
-            # EXEC so stock is never partially deducted without a matching
-            # durable participant state.
-            pipe.multi()
-            for item_id, updated_item in updated_items.items():
-                pipe.set(item_id, msgpack.encode(updated_item))
-            pipe.set(ledger_key, json.dumps(updated_entry), ex=stock_ledger.LEDGER_TTL_SECONDS)
-            pipe.execute()
-            return reply, "success"
-
-        except redis_module.exceptions.WatchError:
-            continue
-        finally:
-            pipe.reset()
+    state = _decode_scalar(result[0])
+    if state == "error":
+        raise RuntimeError(_decode_scalar(result[1]))
+    return state, json.loads(result[2]), _decode_scalar(result[1])
 
 
 def _release_stock_atomically(
@@ -288,74 +285,24 @@ def _release_stock_atomically(
     tx_id: str,
     order_id: str,
     items: list[dict],
-) -> tuple[dict, str]:
-    from app import StockValue
-
+) -> tuple[str, dict, str]:
     release_key = f"stock:ledger:{tx_id}:{RELEASE_STOCK}"
     reserve_key = f"stock:ledger:{tx_id}:{RESERVE_STOCK}"
-    item_ids = sorted({str(item.get('item_id', '')) for item in items if item.get("item_id") is not None})
+    success_reply = build_stock_released(tx_id, order_id)
+    script = _get_release_stock_script(db)
 
-    while True:
-        pipe = db.pipeline()
-        try:
-            # Compensation depends on both the original reserve result and the
-            # current item rows, so they all need to be observed together.
-            pipe.watch(release_key, reserve_key, *item_ids)
+    result = script(
+        keys=[release_key, reserve_key],
+        args=[
+            tx_id,
+            json.dumps(items),
+            json.dumps(success_reply),
+            stock_ledger.LEDGER_TTL_SECONDS,
+        ],
+        client=db,
+    )
 
-            raw_values = pipe.mget([release_key, reserve_key, *item_ids])
-            raw_release = raw_values[0]
-            if not raw_release:
-                pipe.unwatch()
-                raise RuntimeError(f"Missing RELEASE_STOCK ledger entry for tx={tx_id}")
-
-            release_entry = json.loads(raw_release)
-            release_state = release_entry.get("local_state")
-            if release_state in (LedgerState.APPLIED, LedgerState.REPLIED):
-                pipe.unwatch()
-                return release_entry["reply_message"], release_entry.get("result", "success")
-
-            raw_reserve = raw_values[1]
-            reserve_entry = json.loads(raw_reserve) if raw_reserve else None
-            reserve_succeeded = reserve_entry is not None and reserve_entry.get("result") == "success"
-
-            reply = build_stock_released(tx_id, order_id)
-            updated_release = _build_applied_entry(release_entry, "success", reply)
-
-            if not reserve_succeeded:
-                # If RESERVE_STOCK never succeeded, RELEASE_STOCK is a no-op
-                # compensation. We still persist the terminal participant state
-                # so retries remain idempotent.
-                pipe.multi()
-                pipe.set(release_key, json.dumps(updated_release), ex=stock_ledger.LEDGER_TTL_SECONDS)
-                pipe.execute()
-                return reply, "success"
-
-            updated_items = {}
-            raw_items_by_id = dict(zip(item_ids, raw_values[2:]))
-
-            for item_entry in items:
-                item_id = str(item_entry.get("item_id", ""))
-                quantity = int(item_entry.get("quantity", 0))
-
-                raw_item = raw_items_by_id.get(item_id)
-                if not raw_item:
-                    pipe.unwatch()
-                    raise RuntimeError(f"Missing item {item_id} during RELEASE_STOCK for tx={tx_id}")
-
-                stock_entry = msgpack.decode(raw_item, type=StockValue)
-                updated_items[item_id] = StockValue(
-                    stock=stock_entry.stock + quantity,
-                    price=stock_entry.price,
-                )
-
-            pipe.multi()
-            for item_id, updated_item in updated_items.items():
-                pipe.set(item_id, msgpack.encode(updated_item))
-            pipe.set(release_key, json.dumps(updated_release), ex=stock_ledger.LEDGER_TTL_SECONDS)
-            pipe.execute()
-            return reply, "success"
-
-        except redis_module.exceptions.WatchError:
-            continue
-        finally:
-            pipe.reset()
+    state = _decode_scalar(result[0])
+    if state == "error":
+        raise RuntimeError(f"Missing item during RELEASE_STOCK: {_decode_scalar(result[2])}")
+    return state, json.loads(result[2]), _decode_scalar(result[1])
