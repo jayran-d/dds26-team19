@@ -241,6 +241,10 @@ def init_streams(logger, order_db: redis_module.Redis) -> None:
     if TRANSACTION_MODE == "saga":
         saga_recover(_order_db, publish_fn, logger)
         threading.Thread(target=_timeout_loop, args=(publish_fn,), daemon=True).start()
+    elif TRANSACTION_MODE == "2pc":
+        from transactions_modes.two_pc import init_2pc, recover_incomplete_2pc
+        init_2pc(_order_db, publish_fn, logger)
+        recover_incomplete_2pc()
 
     # Start stock.events consumer workers (share stock_sc; pool is thread-safe)
     for i in range(CONSUMER_WORKERS):

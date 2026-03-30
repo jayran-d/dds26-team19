@@ -50,7 +50,7 @@ class _StreamProducer:
 
 def _replay_unreplied_entries(sc: StreamsClient) -> None:
     """Re-publish any replies that were applied but not sent before a crash."""
-    if TRANSACTION_MODE != "saga" or _db is None:
+    if TRANSACTION_MODE not in {"saga", "2pc"} or _db is None:
         return
     entries = stock_ledger.get_unreplied_entries(_db)
     if not entries:
@@ -155,6 +155,10 @@ def init_streams(logger, db: redis_module.Redis) -> None:
 
     def publish_fn(stream: str, message: dict) -> None:
         main_sc.publish(stream, message)
+
+    if TRANSACTION_MODE == "2pc":
+        from transaction_modes.two_pc import init_2pc
+        init_2pc(db, publish_fn, logger)
 
     _replay_unreplied_entries(main_sc)
 

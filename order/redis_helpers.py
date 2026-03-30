@@ -24,3 +24,7 @@ def get_order(logger, db, order_id: str):
 #         return val.decode() if val else None
 #     except Exception:
 #         return None
+
+
+def _2pc_key(order_id: str) -> str:
+    return f"order:{order_id}:2pcstate"

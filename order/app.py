@@ -18,7 +18,7 @@ from streams_worker import (
     start_checkout,
 )
 import checkout_notify
-from common.messages import SagaOrderStatus
+from common.messages import SagaOrderStatus, TwoPhaseOrderStatus
 
 DB_ERROR_STR  = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -27,16 +27,30 @@ GATEWAY_URL = os.environ['GATEWAY_URL']
 CHECKOUT_WAIT_TIMEOUT_SECONDS = float(os.getenv("CHECKOUT_WAIT_TIMEOUT_SECONDS", "45"))
 VERBOSE_LOGS = os.getenv("VERBOSE_LOGS", "false").lower() == "true"
 
-IN_PROGRESS_STATUSES = {
-    SagaOrderStatus.RESERVING_STOCK,
-    SagaOrderStatus.PROCESSING_PAYMENT,
-    SagaOrderStatus.COMPENSATING,
-}
+TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "saga")
 
-TERMINAL_STATUSES = {
-    SagaOrderStatus.COMPLETED,
-    SagaOrderStatus.FAILED,
-}
+if TRANSACTION_MODE == "2pc":
+    IN_PROGRESS_STATUSES = {
+        TwoPhaseOrderStatus.PREPARING_STOCK,
+        TwoPhaseOrderStatus.PREPARING_PAYMENT,
+        TwoPhaseOrderStatus.COMMITTING,
+        TwoPhaseOrderStatus.ABORTING,
+    }
+    TERMINAL_STATUSES = {
+        TwoPhaseOrderStatus.COMPLETED,
+        TwoPhaseOrderStatus.FAILED,
+    }
+else:
+    IN_PROGRESS_STATUSES = {
+        SagaOrderStatus.RESERVING_STOCK,
+        SagaOrderStatus.PROCESSING_PAYMENT,
+        SagaOrderStatus.COMPENSATING,
+    }
+
+    TERMINAL_STATUSES = {
+        SagaOrderStatus.COMPLETED,
+        SagaOrderStatus.FAILED,
+    }
 
 app = Quart("order-service")
 
@@ -120,9 +134,9 @@ async def _build_terminal_checkout_response(
             headers={"Location": f"/orders/status/{order_id}"},
         )
 
-    final_status = await get_order_status_async(order_id) or SagaOrderStatus.PENDING
+    final_status = await get_order_status_async(order_id) or (TwoPhaseOrderStatus.PENDING if TRANSACTION_MODE == "2pc" else SagaOrderStatus.PENDING)
 
-    if final_status == SagaOrderStatus.COMPLETED:
+    if final_status in {SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED}:
         return Response(
             "Checkout successful",
             status=200,
@@ -137,8 +151,8 @@ async def _build_terminal_checkout_response(
 
 
 def _response_from_status(order_id: str, status: str | None) -> Response:
-    final_status = status or SagaOrderStatus.PENDING
-    if final_status == SagaOrderStatus.COMPLETED:
+    final_status = status or (TwoPhaseOrderStatus.PENDING if TRANSACTION_MODE == "2pc" else SagaOrderStatus.PENDING)
+    if final_status in {SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED}:
         return Response(
             "Checkout successful",
             status=200,
@@ -250,7 +264,7 @@ async def checkout(order_id: str):
         order_entry: OrderValue = await get_order_from_db_async(order_id)
         status = await get_order_status_async(order_id)
 
-        if order_entry.paid or status == SagaOrderStatus.COMPLETED:
+        if order_entry.paid or status in {SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED}:
             return Response(
                 "Order already completed",
                 status=200,
