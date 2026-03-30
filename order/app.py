@@ -25,6 +25,7 @@ REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
 CHECKOUT_WAIT_TIMEOUT_SECONDS = float(os.getenv("CHECKOUT_WAIT_TIMEOUT_SECONDS", "45"))
+VERBOSE_LOGS = os.getenv("VERBOSE_LOGS", "false").lower() == "true"
 
 IN_PROGRESS_STATUSES = {
     SagaOrderStatus.RESERVING_STOCK,
@@ -313,11 +314,12 @@ async def checkout(order_id: str):
 # ── Startup ────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
+    app.logger.setLevel(logging.DEBUG if VERBOSE_LOGS else logging.INFO)
     init_streams(app.logger, db)
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    app.run(host="0.0.0.0", port=8000, debug=VERBOSE_LOGS)
 else:
     server_logger = logging.getLogger("hypercorn.error")
     if server_logger.handlers:
         app.logger.handlers = server_logger.handlers
-        app.logger.setLevel(server_logger.level)
+        app.logger.setLevel(logging.DEBUG if VERBOSE_LOGS else server_logger.level)
     init_streams(app.logger, db)

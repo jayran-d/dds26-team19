@@ -33,7 +33,14 @@ services:
       - PAYMENT_REDIS_PASSWORD=redis
       - PAYMENT_REDIS_DB=0
       - CONSUMER_WORKERS=8
-    command: hypercorn -b 0.0.0.0:5000 -w 1 --graceful-timeout 30 --log-level info app:app
+      - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
+    command: >-
+      sh -lc '
+      if [ "$$VERBOSE_LOGS" = "true" ]; then
+        exec hypercorn -b 0.0.0.0:5000 -w 1 --graceful-timeout 30 --log-level debug --access-logfile - app:app;
+      else
+        exec hypercorn -b 0.0.0.0:5000 -w 1 --graceful-timeout 30 --log-level info app:app;
+      fi'
     env_file:
       - env/order_redis.env
       - env/transaction.env
@@ -66,7 +73,14 @@ services:
     restart: unless-stopped
     environment:
       - CONSUMER_WORKERS=8
-    command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
+      - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
+    command: >-
+      sh -lc '
+      if [ "$$VERBOSE_LOGS" = "true" ]; then
+        exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=debug --access-logfile - app:app;
+      else
+        exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app;
+      fi'
     env_file:
       - env/stock_redis.env
       - env/transaction.env
@@ -95,7 +109,14 @@ services:
     restart: unless-stopped
     environment:
       - CONSUMER_WORKERS=8
-    command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
+      - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
+    command: >-
+      sh -lc '
+      if [ "$$VERBOSE_LOGS" = "true" ]; then
+        exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=debug --access-logfile - app:app;
+      else
+        exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app;
+      fi'
     env_file:
       - env/payment_redis.env
       - env/transaction.env

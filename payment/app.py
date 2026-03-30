@@ -10,6 +10,7 @@ from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
 DB_ERROR_STR = "DB error"
+VERBOSE_LOGS = os.getenv("VERBOSE_LOGS", "false").lower() == "true"
 
 app = Flask("payment-service")
 
@@ -131,10 +132,11 @@ def remove_credit(user_id: str, amount: int):
 # ── Startup ────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
+    app.logger.setLevel(logging.DEBUG if VERBOSE_LOGS else logging.INFO)
     init_streams(app.logger, db)
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    app.run(host="0.0.0.0", port=8000, debug=VERBOSE_LOGS)
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
+    app.logger.setLevel(logging.DEBUG if VERBOSE_LOGS else gunicorn_logger.level)
     init_streams(app.logger, db)
