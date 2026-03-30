@@ -104,9 +104,6 @@ async def get_order_status_async(order_id: str) -> str | None:
     except redis.exceptions.RedisError:
         return None
 
-
-# ── Routes ─────────────────────────────────────────────────────────────────────
-
 async def _build_terminal_checkout_response(
     order_id: str,
     waiter: asyncio.Future,
@@ -135,20 +132,7 @@ async def _build_terminal_checkout_response(
         headers={"Location": f"/orders/status/{order_id}"},
     )
 
-
-def _response_from_status(order_id: str, status: str | None) -> Response:
-    final_status = status or SagaOrderStatus.PENDING
-    if final_status == SagaOrderStatus.COMPLETED:
-        return Response(
-            "Checkout successful",
-            status=200,
-            headers={"Location": f"/orders/status/{order_id}"},
-        )
-    return Response(
-        "Checkout failed",
-        status=400,
-        headers={"Location": f"/orders/status/{order_id}"},
-    )
+# ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.post('/create/<user_id>')
 def create_order(user_id: str):

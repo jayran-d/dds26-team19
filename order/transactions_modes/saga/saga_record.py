@@ -61,57 +61,6 @@ def _active_key(order_id: str) -> str:
 
 
 # ============================================================
-# CREATE
-# ============================================================
-
-
-def create(
-    db: redis_module.Redis,
-    tx_id: str,
-    order_id: str,
-    user_id: str,
-    amount: int,
-    items: list,
-) -> bool:
-    """
-    Create a new Saga record in state=pending.
-
-    items: collapsed list of {item_id, quantity} dicts.
-    Returns True on success.
-    """
-    now = int(time.time() * 1000)
-    record = {
-        "tx_id": tx_id,
-        "order_id": order_id,
-        "state": SagaOrderStatus.PENDING,
-        # Transaction data — needed to build commands on recovery
-        "user_id": user_id,
-        "amount": amount,
-        "items": items,
-        # What the orchestrator last did / is waiting for
-        "last_command_type": None,
-        "awaiting_event_type": None,
-        # Compensation flags — set to True once a step succeeds
-        # so recovery knows whether to release/refund
-        "needs_stock_compensation": False,
-        "needs_payment_compensation": False,
-        # Failure info for debugging
-        "failure_reason": None,
-        # Timing
-        "started_at_ms": now,
-        "updated_at_ms": now,
-        "timeout_at_ms": now + TIMEOUT_SECONDS * 1000,
-    }
-    try:
-        db.set(_record_key(tx_id), json.dumps(record), ex=SAGA_RECORD_TTL)
-        # also store tx_id → order_id mapping for recovery scan
-        db.set(_active_key(order_id), tx_id, ex=SAGA_RECORD_TTL)
-        return True
-    except Exception:
-        return False
-
-
-# ============================================================
 # READ
 # ============================================================
 
