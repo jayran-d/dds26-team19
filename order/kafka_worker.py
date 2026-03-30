@@ -17,6 +17,7 @@ import os
 import uuid
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import redis as redis_module
 
@@ -43,6 +44,7 @@ _consumer: KafkaConsumerClient | None = None
 _db: redis_module.Redis | None = None
 _available: bool = False
 _logger = None
+_event_executor: ThreadPoolExecutor | None = None
 
 
 
@@ -56,7 +58,7 @@ def init_kafka(logger, db: redis_module.Redis) -> None:
     Initialise producer, consumer, and start the event loop thread.
     Called once at gunicorn startup. Does nothing if USE_KAFKA=false.
     """
-    global _producer, _consumer, _db, _available, _logger
+    global _producer, _consumer, _db, _available, _logger, _event_executor
 
     if not USE_KAFKA:
         return
@@ -76,6 +78,9 @@ def init_kafka(logger, db: redis_module.Redis) -> None:
     )
 
     _available = True
+    
+    # Create thread pool for parallel event processing (up to 8 concurrent events)
+    _event_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="event-worker")
 
     if TRANSACTION_MODE == "saga":
         # Recover before the event loop starts consuming new events. That keeps
@@ -92,8 +97,10 @@ def init_kafka(logger, db: redis_module.Redis) -> None:
 
 
 def close_kafka() -> None:
-    global _available
+    global _available, _event_executor
     _available = False
+    if _event_executor is not None:
+        _event_executor.shutdown(wait=True)
     if _consumer is not None:
         _consumer.close()
     if _producer is not None:
@@ -143,7 +150,7 @@ def start_checkout(order_id: str, order_entry):
 def _event_loop() -> None:
     while True:
         try:
-            result = _consumer.poll(timeout=1.0)
+            result = _consumer.poll(timeout=0.1)
 
             if result.error:
                 _logger.error(f"[OrderKafka] Poll error: {result.error}")
@@ -153,14 +160,8 @@ def _event_loop() -> None:
             if not result.ok:
                 continue
 
-            _route_event(result.msg)
-
-            # Commit only after Saga event handling returned successfully.
-            # By this point the order service should already have:
-            # 1. durably updated the Saga record,
-            # 2. published the next command if needed,
-            # 3. marked the incoming event as seen.
-            _consumer.commit()
+            # Submit event processing to thread pool instead of blocking
+            _event_executor.submit(_process_event_async, result.msg)
 
         except Exception as exc:
             # No commit here.
@@ -168,6 +169,17 @@ def _event_loop() -> None:
             # redeliver the event and let the orchestrator try again.
             _logger.error(f"[OrderKafka] Event loop crashed: {exc}")
             time.sleep(1)
+
+
+def _process_event_async(msg: dict) -> None:
+    """Process event in thread pool and commit after successful handling."""
+    try:
+        _route_event(msg)
+        # Commit only after event handling returned successfully.
+        _consumer.commit()
+    except Exception as exc:
+        # No commit on error - let Kafka redeliver
+        _logger.error(f"[OrderKafka] Event processing failed: {exc}")
 
 def _timeout_loop() -> None:
     while _available and TRANSACTION_MODE == "saga":

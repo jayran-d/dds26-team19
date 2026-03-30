@@ -14,6 +14,7 @@ Handles:
 import os
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import redis as redis_module
 
@@ -38,6 +39,7 @@ _producer: KafkaProducerClient | None = None
 _consumer: KafkaConsumerClient | None = None
 _logger = None
 _db: redis_module.Redis | None = None
+_event_executor: ThreadPoolExecutor | None = None
 
 
 
@@ -51,7 +53,7 @@ def init_kafka(logger, db) -> None:
     Initialise Kafka clients and start the background consumer thread.
     Does nothing if USE_KAFKA=false.
     """
-    global _producer, _consumer, _logger, _db
+    global _producer, _consumer, _logger, _db, _event_executor
 
     if not USE_KAFKA:
         return
@@ -71,6 +73,9 @@ def init_kafka(logger, db) -> None:
     )
 
     _replay_unreplied_entries()
+    
+    # Create thread pool for parallel event processing
+    _event_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="event-worker")
 
     thread = threading.Thread(target=_consumer_loop, daemon=True)
     thread.start()
@@ -79,6 +84,9 @@ def init_kafka(logger, db) -> None:
 
 
 def close_kafka() -> None:
+    global _event_executor
+    if _event_executor is not None:
+        _event_executor.shutdown(wait=True)
     if _consumer is not None:
         _consumer.close()
     if _producer is not None:
@@ -112,12 +120,8 @@ def _consumer_loop() -> None:
             if not result.ok:
                 continue
 
-            _route_command(result.msg)
-
-            # Only acknowledge Kafka after the handler returned successfully.
-            # In Saga mode this means the participant has already durably written
-            # its ledger/business state, so a crash after this point is recoverable.
-            _consumer.commit()
+            # Submit event processing to thread pool instead of blocking
+            _event_executor.submit(_process_event_async, result.msg)
 
         except Exception as exc:
             # Intentionally do NOT commit here.
@@ -125,6 +129,17 @@ def _consumer_loop() -> None:
             # to redeliver the command after restart.
             _logger.info(f"[PaymentKafka] Consumer loop crashed: {exc}")
             time.sleep(1)
+
+
+def _process_event_async(msg: dict) -> None:
+    """Process event in thread pool and commit after successful handling."""
+    try:
+        _route_command(msg)
+        # Only acknowledge Kafka after the handler returned successfully.
+        _consumer.commit()
+    except Exception as exc:
+        # No commit on error - let Kafka redeliver
+        _logger.error(f"[PaymentKafka] Event processing failed: {exc}")
 
 
 def _route_command(msg: dict) -> None:

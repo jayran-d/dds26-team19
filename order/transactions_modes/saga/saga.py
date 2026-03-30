@@ -33,6 +33,9 @@ import uuid
 import redis as redis_module
 from msgspec import msgpack
 
+_on_checkout_complete = None  # Callback to notify HTTP layer
+
+
 from . import saga_record
 from common.messages import (
     SagaOrderStatus,
@@ -286,6 +289,11 @@ def saga_on_payment_success(record, msg, db, logger):
 
     # Terminal success: free the active-order slot.
     saga_record.clear_active_tx_id(db, order_id, tx_id)
+    
+    # Notify waiting HTTP clients
+    global _on_checkout_complete
+    if _on_checkout_complete:
+        _on_checkout_complete(order_id)
 
     logger.info(f"[Saga] completed tx={tx_id} order={order_id}")
 
@@ -443,3 +451,9 @@ def check_timeouts(db: redis_module.Redis, publish, logger) -> None:
 def _set_status(db: redis_module.Redis, order_id: str, status: str) -> None:
     """Write the human-facing order status that GET /orders/status/<id> reads."""
     db.set(f"order:{order_id}:status", status)
+
+
+def _set_completion_hook(callback):
+    """Register a callback to be called when a saga completes."""
+    global _on_checkout_complete
+    _on_checkout_complete = callback

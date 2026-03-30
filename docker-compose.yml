@@ -45,9 +45,10 @@ services:
       - GATEWAY_URL=http://gateway:80
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - USE_KAFKA=true
+      - USE_REDIS_STREAMS=false
       - KAFKA_NUM_PARTITIONS=4
       - KAFKA_REPLICATION_FACTOR=2
-    command: gunicorn -b 0.0.0.0:5000 -k gthread --threads 32 -w 1 --timeout 90 --log-level=info app:app
+    command: hypercorn -b 0.0.0.0:5000 -w 1 async_app:app
     env_file:
       - env/order_redis.env
       - env/transaction.env
@@ -79,9 +80,10 @@ services:
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - USE_KAFKA=true
+      - USE_REDIS_STREAMS=false
       - KAFKA_NUM_PARTITIONS=4
       - KAFKA_REPLICATION_FACTOR=1
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: hypercorn -b 0.0.0.0:5000 -w 1 async_app:app
     env_file:
       - env/stock_redis.env
       - env/transaction.env
@@ -113,9 +115,10 @@ services:
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - USE_KAFKA=true
+      - USE_REDIS_STREAMS=false
       - KAFKA_NUM_PARTITIONS=4
       - KAFKA_REPLICATION_FACTOR=1
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: hypercorn -b 0.0.0.0:5000 -w 1 async_app:app
     env_file:
       - env/payment_redis.env
       - env/transaction.env
