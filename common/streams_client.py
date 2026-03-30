@@ -13,13 +13,14 @@ Consumer groups give equivalent exactly-once delivery guarantees to Kafka's
 manual offset commit, with much lower per-message latency.
 """
 
-from typing import Optional, List, Tuple
+from typing import List, Tuple
 import redis as redis_module
 from msgspec import msgpack
 
 
 STREAM_MAXLEN = 100_000
 CONSUMER_BLOCK_MS = 500
+DEFAULT_READ_COUNT = 32
 
 
 class StreamsClient:
@@ -48,18 +49,19 @@ class StreamsClient:
             approximate=True,
         )
 
-    def read_one(
+    def read_many(
         self,
         streams: List[str],
         group: str,
         consumer: str,
         block_ms: int = CONSUMER_BLOCK_MS,
         pending: bool = False,
-    ) -> Optional[Tuple[str, bytes, dict]]:
+        count: int = DEFAULT_READ_COUNT,
+    ) -> List[Tuple[str, bytes, dict]]:
         """
-        Read one message. Blocks up to block_ms if no message available.
+        Read up to ``count`` messages. Blocks up to block_ms if no message available.
         pending=True reads from PEL (unacked messages from previous run).
-        Returns (stream_name, msg_id, message_dict) or None on timeout.
+        Returns [(stream_name, msg_id, message_dict), ...].
         """
         start = '0' if pending else '>'
         # PEL reads must not block: if PEL is empty, return None immediately.
@@ -69,21 +71,45 @@ class StreamsClient:
             groupname=group,
             consumername=consumer,
             streams={s: start for s in streams},
-            count=1,
+            count=count,
             block=block_arg,
         )
         if not result:
-            return None
+            return []
+        decoded = []
         for stream_raw, msgs in result:
             sname = stream_raw.decode() if isinstance(stream_raw, bytes) else stream_raw
             for msg_id, fields in msgs:
                 raw = fields.get(b'd') or fields.get('d')
-                return sname, msg_id, msgpack.decode(raw)
-        return None
+                decoded.append((sname, msg_id, msgpack.decode(raw)))
+        return decoded
+
+    def read_one(
+        self,
+        streams: List[str],
+        group: str,
+        consumer: str,
+        block_ms: int = CONSUMER_BLOCK_MS,
+        pending: bool = False,
+    ) -> Tuple[str, bytes, dict] | None:
+        batch = self.read_many(
+            streams=streams,
+            group=group,
+            consumer=consumer,
+            block_ms=block_ms,
+            pending=pending,
+            count=1,
+        )
+        return batch[0] if batch else None
 
     def ack(self, stream: str, group: str, msg_id) -> None:
         """Acknowledge message, removing it from the PEL."""
         self._db.xack(stream, group, msg_id)
+
+    def ack_many(self, stream: str, group: str, msg_ids: List[bytes]) -> None:
+        """Acknowledge multiple messages in one round trip."""
+        if msg_ids:
+            self._db.xack(stream, group, *msg_ids)
 
     def claim_orphans(
         self,

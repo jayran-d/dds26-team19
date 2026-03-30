@@ -43,6 +43,7 @@ from transactions_modes.saga.saga import (
 
 TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "saga")
 CONSUMER_WORKERS = int(os.getenv("CONSUMER_WORKERS", "4"))
+STREAM_BATCH_SIZE = int(os.getenv("STREAM_BATCH_SIZE", "32"))
 TIMEOUT_SCAN_INTERVAL = 5
 ORPHAN_CLAIM_INTERVAL = 30
 ORPHAN_MIN_IDLE_MS = 30_000
@@ -52,6 +53,8 @@ ORDER_GROUP = "order-service"
 _order_db: redis_module.Redis | None = None
 _stock_db: redis_module.Redis | None = None
 _payment_db: redis_module.Redis | None = None
+_stock_sc: StreamsClient | None = None
+_payment_sc: StreamsClient | None = None
 _available = False
 _logger = None
 
@@ -102,6 +105,33 @@ def _route_event(msg: dict, publish_fn) -> None:
         _2pc_route_order(msg)
 
 
+def _ack_processed(
+    streams_client: StreamsClient,
+    group: str,
+    processed: list[tuple[str, bytes]],
+) -> None:
+    by_stream: dict[str, list[bytes]] = {}
+    for stream, msg_id in processed:
+        by_stream.setdefault(stream, []).append(msg_id)
+    for stream, msg_ids in by_stream.items():
+        streams_client.ack_many(stream, group, msg_ids)
+
+
+def _process_batch(
+    streams_client: StreamsClient,
+    group: str,
+    batch: list[tuple[str, bytes, dict]],
+    publish_fn,
+) -> None:
+    processed: list[tuple[str, bytes]] = []
+    try:
+        for stream, msg_id, msg in batch:
+            _route_event(msg, publish_fn)
+            processed.append((stream, msg_id))
+    finally:
+        _ack_processed(streams_client, group, processed)
+
+
 def _event_worker(
     worker_id: str,
     streams_client: StreamsClient,
@@ -113,13 +143,17 @@ def _event_worker(
 
     # Drain our own PEL first (messages from our previous run that weren't acked)
     while True:
-        result = streams_client.read_one(streams, group, consumer_name, pending=True)
-        if not result:
+        batch = streams_client.read_many(
+            streams,
+            group,
+            consumer_name,
+            pending=True,
+            count=STREAM_BATCH_SIZE,
+        )
+        if not batch:
             break
-        stream, msg_id, msg = result
         try:
-            _route_event(msg, publish_fn)
-            streams_client.ack(stream, group, msg_id)
+            _process_batch(streams_client, group, batch, publish_fn)
         except Exception as exc:
             _logger.error(f"[OrderStreams] {consumer_name} PEL recovery error: {exc}")
             break
@@ -127,12 +161,15 @@ def _event_worker(
     # Normal consume loop
     while _available:
         try:
-            result = streams_client.read_one(streams, group, consumer_name)
-            if not result:
+            batch = streams_client.read_many(
+                streams,
+                group,
+                consumer_name,
+                count=STREAM_BATCH_SIZE,
+            )
+            if not batch:
                 continue
-            stream, msg_id, msg = result
-            _route_event(msg, publish_fn)
-            streams_client.ack(stream, group, msg_id)
+            _process_batch(streams_client, group, batch, publish_fn)
         except Exception as exc:
             _logger.error(f"[OrderStreams] {consumer_name} crashed: {exc}")
             time.sleep(0.5)
@@ -150,12 +187,12 @@ def _orphan_recovery_worker(
         time.sleep(ORPHAN_CLAIM_INTERVAL)
         try:
             orphans = streams_client.claim_orphans(streams, group, consumer_name, ORPHAN_MIN_IDLE_MS)
-            for stream, msg_id, msg in orphans:
-                try:
-                    _route_event(msg, publish_fn)
-                    streams_client.ack(stream, group, msg_id)
-                except Exception as exc:
-                    _logger.error(f"[OrderStreams] orphan recovery error for msg: {exc}")
+            if not orphans:
+                continue
+            try:
+                _process_batch(streams_client, group, orphans, publish_fn)
+            except Exception as exc:
+                _logger.error(f"[OrderStreams] orphan recovery error: {exc}")
         except Exception as exc:
             _logger.error(f"[OrderStreams] orphan recovery worker crashed: {exc}")
 
@@ -174,7 +211,7 @@ def init_streams(logger, order_db: redis_module.Redis) -> None:
     Initialise Redis Streams consumers and start background worker threads.
     Called once at gunicorn startup.
     """
-    global _order_db, _stock_db, _payment_db, _available, _logger
+    global _order_db, _stock_db, _payment_db, _stock_sc, _payment_sc, _available, _logger
 
     _logger = logger
     _order_db = order_db
@@ -184,6 +221,8 @@ def init_streams(logger, order_db: redis_module.Redis) -> None:
 
     stock_sc = StreamsClient(_stock_db)
     payment_sc = StreamsClient(_payment_db)
+    _stock_sc = stock_sc
+    _payment_sc = payment_sc
 
     # Ensure consumer groups exist
     stock_sc.ensure_group(STOCK_EVENTS_TOPIC, ORDER_GROUP)
@@ -250,10 +289,6 @@ def start_checkout(order_id: str, order_entry) -> dict:
     """Kick off a checkout transaction. Called by app.py."""
     if not _available:
         raise RuntimeError("Streams worker not available")
-
-    # Reuse module-level StreamsClients backed by the shared connection pools
-    _stock_sc = StreamsClient(_stock_db)
-    _payment_sc = StreamsClient(_payment_db)
 
     def publish_fn(stream: str, message: dict) -> None:
         if 'stock' in stream:

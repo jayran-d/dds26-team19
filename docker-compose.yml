@@ -33,6 +33,7 @@ services:
       - PAYMENT_REDIS_PASSWORD=redis
       - PAYMENT_REDIS_DB=0
       - CONSUMER_WORKERS=8
+      - STREAM_BATCH_SIZE=32
       - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
     command: >-
       sh -lc '
@@ -59,7 +60,13 @@ services:
   order-db:
     image: redis:7.2-bookworm
     restart: unless-stopped
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec --dir /data
+    command: >-
+      redis-server --requirepass redis --maxmemory 512mb
+      --appendonly yes --appendfsync everysec
+      --save ""
+      --auto-aof-rewrite-min-size 256mb
+      --auto-aof-rewrite-percentage 200
+      --dir /data
     volumes:
       - order-db-data:/data
     healthcheck:
@@ -77,6 +84,7 @@ services:
     restart: unless-stopped
     environment:
       - CONSUMER_WORKERS=8
+      - STREAM_BATCH_SIZE=32
       - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
     command: >-
       sh -lc '
@@ -99,7 +107,13 @@ services:
   stock-db:
     image: redis:7.2-bookworm
     restart: unless-stopped
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec --dir /data
+    command: >-
+      redis-server --requirepass redis --maxmemory 512mb
+      --appendonly yes --appendfsync everysec
+      --save ""
+      --auto-aof-rewrite-min-size 256mb
+      --auto-aof-rewrite-percentage 200
+      --dir /data
     volumes:
       - stock-db-data:/data
     healthcheck:
@@ -117,6 +131,7 @@ services:
     restart: unless-stopped
     environment:
       - CONSUMER_WORKERS=8
+      - STREAM_BATCH_SIZE=32
       - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
     command: >-
       sh -lc '
@@ -139,7 +154,13 @@ services:
   payment-db:
     image: redis:7.2-bookworm
     restart: unless-stopped
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec --dir /data
+    command: >-
+      redis-server --requirepass redis --maxmemory 512mb
+      --appendonly yes --appendfsync everysec
+      --save ""
+      --auto-aof-rewrite-min-size 256mb
+      --auto-aof-rewrite-percentage 200
+      --dir /data
     volumes:
       - payment-db-data:/data
     healthcheck:

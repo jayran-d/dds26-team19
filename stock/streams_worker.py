@@ -28,6 +28,7 @@ from transaction_modes.two_pc import _2pc_route_stock
 
 TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "saga")
 CONSUMER_WORKERS = int(os.getenv("CONSUMER_WORKERS", "4"))
+STREAM_BATCH_SIZE = int(os.getenv("STREAM_BATCH_SIZE", "32"))
 ORPHAN_CLAIM_INTERVAL = 30
 ORPHAN_MIN_IDLE_MS = 30_000
 
@@ -72,30 +73,55 @@ def _route_command(msg: dict, publish_fn) -> None:
         _2pc_route_stock(msg, msg_type)
 
 
+def _ack_processed(sc: StreamsClient, group: str, processed: list[tuple[str, bytes]]) -> None:
+    by_stream: dict[str, list[bytes]] = {}
+    for stream, msg_id in processed:
+        by_stream.setdefault(stream, []).append(msg_id)
+    for stream, msg_ids in by_stream.items():
+        sc.ack_many(stream, group, msg_ids)
+
+
+def _process_batch(sc: StreamsClient, batch: list[tuple[str, bytes, dict]], publish_fn) -> None:
+    processed: list[tuple[str, bytes]] = []
+    try:
+        for stream, msg_id, msg in batch:
+            _route_command(msg, publish_fn)
+            processed.append((stream, msg_id))
+    finally:
+        _ack_processed(sc, STOCK_GROUP, processed)
+
+
 def _consumer_worker(worker_id: str, sc: StreamsClient, publish_fn) -> None:
     consumer_name = f"stock-worker-{os.getpid()}-{worker_id}"
 
     # Drain own PEL first
     while True:
-        result = sc.read_one([STOCK_COMMANDS_TOPIC], STOCK_GROUP, consumer_name, pending=True)
-        if not result:
+        batch = sc.read_many(
+            [STOCK_COMMANDS_TOPIC],
+            STOCK_GROUP,
+            consumer_name,
+            pending=True,
+            count=STREAM_BATCH_SIZE,
+        )
+        if not batch:
             break
-        stream, msg_id, msg = result
         try:
-            _route_command(msg, publish_fn)
-            sc.ack(stream, STOCK_GROUP, msg_id)
+            _process_batch(sc, batch, publish_fn)
         except Exception as exc:
             _logger.error(f"[StockStreams] {consumer_name} PEL recovery error: {exc}")
             break
 
     while _available:
         try:
-            result = sc.read_one([STOCK_COMMANDS_TOPIC], STOCK_GROUP, consumer_name)
-            if not result:
+            batch = sc.read_many(
+                [STOCK_COMMANDS_TOPIC],
+                STOCK_GROUP,
+                consumer_name,
+                count=STREAM_BATCH_SIZE,
+            )
+            if not batch:
                 continue
-            stream, msg_id, msg = result
-            _route_command(msg, publish_fn)
-            sc.ack(stream, STOCK_GROUP, msg_id)
+            _process_batch(sc, batch, publish_fn)
         except Exception as exc:
             _logger.error(f"[StockStreams] {consumer_name} crashed: {exc}")
             time.sleep(0.5)
@@ -107,12 +133,12 @@ def _orphan_recovery_worker(sc: StreamsClient, publish_fn) -> None:
         time.sleep(ORPHAN_CLAIM_INTERVAL)
         try:
             orphans = sc.claim_orphans([STOCK_COMMANDS_TOPIC], STOCK_GROUP, consumer_name, ORPHAN_MIN_IDLE_MS)
-            for stream, msg_id, msg in orphans:
-                try:
-                    _route_command(msg, publish_fn)
-                    sc.ack(stream, STOCK_GROUP, msg_id)
-                except Exception as exc:
-                    _logger.error(f"[StockStreams] orphan recovery error: {exc}")
+            if not orphans:
+                continue
+            try:
+                _process_batch(sc, orphans, publish_fn)
+            except Exception as exc:
+                _logger.error(f"[StockStreams] orphan recovery error: {exc}")
         except Exception as exc:
             _logger.error(f"[StockStreams] orphan recovery worker crashed: {exc}")
 
