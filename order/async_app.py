@@ -61,7 +61,7 @@ db: aioredis.Redis = aioredis.Redis(
     health_check_interval=30,
 )
 
-_http_client: httpx.AsyncClient | None = None
+_http_client: httpx.Client | None = None
 
 
 async def close_connections_async():
@@ -207,17 +207,17 @@ async def order_status(order_id: str):
 
 async def _send_post_request(url: str):
     try:
-        # Using httpx - it's already opened as AsyncClient but we call post() synchronously
-        # which returns immediately (not awaited). We need to make the actual request.
-        return await _http_client.post(url)
+        # Using blocking httpx.Client for consistency (prevents race conditions)
+        # Blocking inside async function just blocks that coroutine, not the entire server
+        return _http_client.post(url)
     except httpx.RequestError:
         abort(400, REQ_ERROR_STR)
 
 
 async def _send_get_request(url: str):
     try:
-        # Using httpx AsyncClient - make actual requests
-        return await _http_client.get(url)
+        # Using blocking httpx.Client for consistency
+        return _http_client.get(url)
     except httpx.RequestError:
         abort(400, REQ_ERROR_STR)
 
@@ -336,7 +336,7 @@ async def health():
 async def startup():
     """Initialize HTTP client and Kafka worker on startup."""
     global _http_client
-    _http_client = httpx.AsyncClient(timeout=10.0)
+    _http_client = httpx.Client(timeout=10.0)
     if USE_KAFKA:
         from async_kafka_worker import init_kafka_async
         await init_kafka_async(app.logger, db)
@@ -347,7 +347,7 @@ async def shutdown():
     """Clean up on shutdown."""
     global _http_client
     if _http_client:
-        await _http_client.aclose()
+        _http_client.close()
     await db.aclose()
     if USE_KAFKA:
         from async_kafka_worker import close_kafka_async
