@@ -4,7 +4,7 @@ import atexit
 import uuid
 
 import redis
-from kafka_worker import init_kafka, close_kafka
+from streams_worker import init_streams, close_streams
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
@@ -27,7 +27,7 @@ db: redis.Redis = redis.Redis(
 
 def close_connections():
     db.close()
-    close_kafka()
+    close_streams()
 
 
 atexit.register(close_connections)
@@ -49,7 +49,7 @@ def get_item_from_db(item_id: str) -> StockValue | None:
     return entry
 
 
-# ── Business logic (also called directly by kafka_worker) ──────────────────────
+# ── Business logic (also called directly by streams_worker) ────────────────────
 
 def apply_stock_delta(item_id: str, delta: int) -> tuple[bool, str | None, int | None]:
     """
@@ -126,10 +126,10 @@ def remove_stock(item_id: str, amount: int):
 # ── Startup ────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    init_kafka(app.logger)
+    init_streams(app.logger, db)
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
-    init_kafka(app.logger, db)
+    init_streams(app.logger, db)

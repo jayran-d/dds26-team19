@@ -34,6 +34,7 @@ import redis as redis_module
 from msgspec import msgpack
 
 from . import saga_record
+import checkout_notify
 from common.messages import (
     SagaOrderStatus,
     STOCK_RESERVED,
@@ -243,6 +244,7 @@ def saga_on_stock_reservation_failed(record, msg, db, logger):
         reset_timeout=False,
     )
     _set_status(db, order_id, SagaOrderStatus.FAILED)
+    checkout_notify.notify(order_id)
 
     # Terminal state reached: release the active-order claim so a later retry
     # can start a fresh transaction if the user wants to try again.
@@ -283,6 +285,7 @@ def saga_on_payment_success(record, msg, db, logger):
         reset_timeout=False,
     )
     _set_status(db, order_id, SagaOrderStatus.COMPLETED)
+    checkout_notify.notify(order_id)
 
     # Terminal success: free the active-order slot.
     saga_record.clear_active_tx_id(db, order_id, tx_id)
@@ -339,6 +342,7 @@ def saga_on_stock_released(record, msg, db, logger):
         reset_timeout=False,
     )
     _set_status(db, order_id, SagaOrderStatus.FAILED)
+    checkout_notify.notify(order_id)
 
     # Compensation finished: the order is no longer active.
     saga_record.clear_active_tx_id(db, order_id, tx_id)

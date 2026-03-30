@@ -2,30 +2,29 @@ import logging
 import os
 import atexit
 import random
+import threading
 import uuid
 from collections import defaultdict
-import time
 
 import redis
 import requests
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
-from kafka_worker import (
-    init_kafka,
-    close_kafka,
+from streams_worker import (
+    init_streams,
+    close_streams,
     is_available,
     start_checkout,
 )
+import checkout_notify
 from common.messages import SagaOrderStatus
 
 DB_ERROR_STR  = "DB error"
 REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
-USE_KAFKA   = os.getenv("USE_KAFKA", "false").lower() == "true"
 CHECKOUT_WAIT_TIMEOUT_SECONDS = float(os.getenv("CHECKOUT_WAIT_TIMEOUT_SECONDS", "45"))
-CHECKOUT_POLL_INTERVAL_SECONDS = float(os.getenv("CHECKOUT_POLL_INTERVAL_SECONDS", "0.05"))
 
 IN_PROGRESS_STATUSES = {
     SagaOrderStatus.RESERVING_STOCK,
@@ -54,7 +53,7 @@ db: redis.Redis = redis.Redis(
 
 def close_connections():
     db.close()
-    close_kafka()
+    close_streams()
 
 
 atexit.register(close_connections)
@@ -88,26 +87,22 @@ def get_order_status(order_id: str) -> str | None:
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
-def _wait_for_terminal_checkout_status(order_id: str) -> str | None:
+def _build_terminal_checkout_response(order_id: str, ev: threading.Event) -> Response:
     """
-    Block until the Saga reaches a terminal state or the timeout expires.
-
-    This keeps the distributed transaction asynchronous internally, but gives
-    the external HTTP API a final success/failure result.
+    Block until the Saga reaches a terminal state (via threading.Event)
+    then return the appropriate HTTP response.
+    Replaces 50ms polling with immediate in-process notification.
     """
-    deadline = time.time() + CHECKOUT_WAIT_TIMEOUT_SECONDS
+    completed = ev.wait(timeout=CHECKOUT_WAIT_TIMEOUT_SECONDS)
 
-    while time.time() < deadline:
-        status = get_order_status(order_id) or SagaOrderStatus.PENDING
-        if status in TERMINAL_STATUSES:
-            return status
-        time.sleep(CHECKOUT_POLL_INTERVAL_SECONDS)
+    if not completed:
+        return Response(
+            "Checkout timed out before reaching a terminal state",
+            status=400,
+            headers={"Location": f"/orders/status/{order_id}"},
+        )
 
-    return None
-
-
-def _build_terminal_checkout_response(order_id: str) -> Response:
-    final_status = _wait_for_terminal_checkout_status(order_id)
+    final_status = get_order_status(order_id) or SagaOrderStatus.PENDING
 
     if final_status == SagaOrderStatus.COMPLETED:
         return Response(
@@ -116,15 +111,8 @@ def _build_terminal_checkout_response(order_id: str) -> Response:
             headers={"Location": f"/orders/status/{order_id}"},
         )
 
-    if final_status == SagaOrderStatus.FAILED:
-        return Response(
-            "Checkout failed",
-            status=400,
-            headers={"Location": f"/orders/status/{order_id}"},
-        )
-
     return Response(
-        "Checkout timed out before reaching a terminal state",
+        "Checkout failed",
         status=400,
         headers={"Location": f"/orders/status/{order_id}"},
     )
@@ -224,17 +212,7 @@ def add_item(order_id: str, item_id: str, quantity: int):
 
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
-    """
-    Kafka path:
-        - return a terminal HTTP result after the Saga finishes
-        - duplicate concurrent requests wait for the same active Saga instead of
-          starting a second checkout
-
-    HTTP path:
-        - synchronous fallback when USE_KAFKA=false
-    """
     order_entry: OrderValue = get_order_from_db(order_id)
-
     status = get_order_status(order_id)
 
     if order_entry.paid or status == SagaOrderStatus.COMPLETED:
@@ -244,25 +222,30 @@ def checkout(order_id: str):
             headers={"Location": f"/orders/status/{order_id}"},
         )
 
-    if USE_KAFKA and is_available():
-        # If another request already started the Saga for this order,
-        # wait for its final result instead of starting a second one.
-        if status in IN_PROGRESS_STATUSES:
-            return _build_terminal_checkout_response(order_id)
-
+    if is_available():
+        # Register BEFORE starting to avoid race where saga completes before ev.wait()
+        ev = checkout_notify.register(order_id)
         try:
-            result = start_checkout(order_id, order_entry)
-        except Exception as exc:
-            app.logger.error(f"[checkout] failed to start: {exc}")
-            abort(400, str(exc))
+            if status in IN_PROGRESS_STATUSES:
+                return _build_terminal_checkout_response(order_id, ev)
 
-        if isinstance(result, dict) and result.get("reason") == "already_in_progress":
-            return _build_terminal_checkout_response(order_id)
+            try:
+                result = start_checkout(order_id, order_entry)
+            except Exception as exc:
+                checkout_notify.unregister(order_id, ev)
+                app.logger.error(f"[checkout] failed to start: {exc}")
+                abort(400, str(exc))
 
-        if isinstance(result, dict) and result.get("reason") == "error":
-            abort(400, "Failed to start checkout")
+            if isinstance(result, dict) and result.get("reason") == "already_in_progress":
+                return _build_terminal_checkout_response(order_id, ev)
 
-        return _build_terminal_checkout_response(order_id)
+            if isinstance(result, dict) and result.get("reason") == "error":
+                checkout_notify.unregister(order_id, ev)
+                abort(400, "Failed to start checkout")
+
+            return _build_terminal_checkout_response(order_id, ev)
+        finally:
+            checkout_notify.unregister(order_id, ev)
 
     # ── HTTP fallback ──────────────────────────────────────────────────────────
     items_quantities: dict[str, int] = defaultdict(int)
@@ -299,10 +282,10 @@ def checkout(order_id: str):
 # ── Startup ────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    init_kafka(app.logger, db)
+    init_streams(app.logger, db)
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
-    init_kafka(app.logger, db)
+    init_streams(app.logger, db)

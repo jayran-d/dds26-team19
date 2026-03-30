@@ -1,28 +1,5 @@
 services:
 
-  kafka:
-    image: apache/kafka:4.1.1
-    restart: unless-stopped
-    environment:
-      - KAFKA_NODE_ID=1
-      - KAFKA_PROCESS_ROLES=broker,controller
-      - KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
-      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
-      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
-      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
-      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
-      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
-      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
-      - KAFKA_MIN_INSYNC_REPLICAS=2
-      - KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
-    healthcheck:
-      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
-      interval: 5s
-      timeout: 10s
-      retries: 10
-      start_period: 15s
-
   gateway:
     image: nginx:1.25-bookworm
     restart: unless-stopped
@@ -43,24 +20,31 @@ services:
     restart: unless-stopped
     environment:
       - GATEWAY_URL=http://gateway:80
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - USE_KAFKA=true
-      - KAFKA_NUM_PARTITIONS=4
-      - KAFKA_REPLICATION_FACTOR=2
-    command: gunicorn -b 0.0.0.0:5000 -k gthread --threads 32 -w 1 --timeout 90 --log-level=info app:app
+      - STOCK_REDIS_HOST=stock-db
+      - STOCK_REDIS_PORT=6379
+      - STOCK_REDIS_PASSWORD=redis
+      - STOCK_REDIS_DB=0
+      - PAYMENT_REDIS_HOST=payment-db
+      - PAYMENT_REDIS_PORT=6379
+      - PAYMENT_REDIS_PASSWORD=redis
+      - PAYMENT_REDIS_DB=0
+      - CONSUMER_WORKERS=4
+    command: gunicorn -b 0.0.0.0:5000 -k gthread --threads 64 -w 1 --timeout 90 --log-level=info app:app
     env_file:
       - env/order_redis.env
       - env/transaction.env
     depends_on:
       order-db:
         condition: service_healthy
-      kafka:
+      stock-db:
+        condition: service_healthy
+      payment-db:
         condition: service_healthy
 
   order-db:
     image: redis:7.2-bookworm
     restart: unless-stopped
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync always --dir /data
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec --dir /data
     volumes:
       - order-db-data:/data
     healthcheck:
@@ -77,10 +61,7 @@ services:
     image: stock:latest
     restart: unless-stopped
     environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - USE_KAFKA=true
-      - KAFKA_NUM_PARTITIONS=4
-      - KAFKA_REPLICATION_FACTOR=1
+      - CONSUMER_WORKERS=4
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
@@ -88,13 +69,11 @@ services:
     depends_on:
       stock-db:
         condition: service_healthy
-      kafka:
-        condition: service_healthy
 
   stock-db:
     image: redis:7.2-bookworm
     restart: unless-stopped
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync always --dir /data
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec --dir /data
     volumes:
       - stock-db-data:/data
     healthcheck:
@@ -111,10 +90,7 @@ services:
     image: user:latest
     restart: unless-stopped
     environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - USE_KAFKA=true
-      - KAFKA_NUM_PARTITIONS=4
-      - KAFKA_REPLICATION_FACTOR=1
+      - CONSUMER_WORKERS=4
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
@@ -122,13 +98,11 @@ services:
     depends_on:
       payment-db:
         condition: service_healthy
-      kafka:
-        condition: service_healthy
 
   payment-db:
     image: redis:7.2-bookworm
     restart: unless-stopped
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync always --dir /data
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec --dir /data
     volumes:
       - payment-db-data:/data
     healthcheck:
