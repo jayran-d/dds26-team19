@@ -350,6 +350,9 @@ def _wait_for_service_http(service: str, timeout: int = RECOVERY_WAIT) -> None:
 
 
 def _refresh_gateway() -> None:
+    # Nginx resolves the compose service names on startup. After a participant
+    # restart we bounce the gateway so it picks up the current container IPs
+    # while still benefiting from upstream keepalive during normal operation.
     _compose("restart", GATEWAY_SERVICE)
     time.sleep(1)
 
