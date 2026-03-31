@@ -1,5 +1,6 @@
 services:
 
+  # Single ingress container for local development.
   gateway:
     image: nginx:1.25-bookworm
     restart: unless-stopped
@@ -21,6 +22,8 @@ services:
       orchestrator-service:
         condition: service_healthy
 
+  # Extracted coordinator: owns Saga records, 2PC state, timeout handling,
+  # and recovery logic outside of order-service.
   orchestrator-service:
     build:
       context: .
@@ -77,6 +80,8 @@ services:
       payment-db:
         condition: service_healthy
 
+  # Thin external API facade: owns order data, but no longer coordinates
+  # distributed transactions directly.
   order-service:
     build:
       context: .
@@ -120,6 +125,7 @@ services:
   order-db:
     image: redis:7.2-bookworm
     restart: unless-stopped
+    # AOF everysec gives durable writes without full fsync-on-every-write cost.
     command: >-
       redis-server --requirepass redis --maxmemory 512mb
       --appendonly yes --appendfsync everysec
