@@ -197,10 +197,10 @@ def find_order(order_id: str):
     order_entry, status = get_order_and_status(order_id)
     return jsonify({
         "order_id":   order_id,
-        # Saga mode now treats the terminal order status as the canonical signal
-        # that checkout finished successfully. The stored order blob may still
+        # The terminal order status is the canonical external signal that
+        # checkout finished successfully. The stored order blob may still
         # contain paid=False because we no longer rewrite it on the hot path.
-        "paid":       order_entry.paid or status == SagaOrderStatus.COMPLETED,
+        "paid":       order_entry.paid or status in {SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED},
         "items":      order_entry.items,
         "user_id":    order_entry.user_id,
         "total_cost": order_entry.total_cost,

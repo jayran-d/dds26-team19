@@ -2,10 +2,8 @@ import uuid
 from collections import defaultdict
 
 import redis as redis_module
-from msgspec import msgpack
 
 import checkout_notify
-from app import OrderValue
 from common.messages import (
     STOCK_COMMANDS_TOPIC,
     PAYMENT_COMMANDS_TOPIC,
@@ -40,11 +38,91 @@ from common.messages import (
     DECISION_COMMIT,
     DECISION_ABORT,
 )
-from redis_helpers import _2pc_key, set_status, get_order
+from redis_helpers import _2pc_key, set_status
 
 _db: redis_module.Redis | None = None
 _publish = None
 _logger = None
+_participant_update_script = None
+_commit_state_update_script = None
+
+
+_PARTICIPANT_UPDATE_LUA = """
+local state_key = KEYS[1]
+local status_key = KEYS[2]
+local tx_key = KEYS[3]
+
+local participant_field = ARGV[1]
+local participant_value = ARGV[2]
+local committing_status = ARGV[3]
+local aborting_status = ARGV[4]
+local decision_none = ARGV[5]
+local stock_ready = ARGV[6]
+local payment_ready = ARGV[7]
+local stock_failed = ARGV[8]
+local payment_failed = ARGV[9]
+local decision_commit = ARGV[10]
+local decision_abort = ARGV[11]
+
+redis.call('HSET', state_key, participant_field, participant_value)
+
+local tx_id = redis.call('GET', tx_key)
+if not tx_id then
+    return {'missing_tx_id', '', ''}
+end
+
+local decision = redis.call('HGET', state_key, 'decision') or decision_none
+if decision ~= decision_none then
+    return {'noop', tx_id, decision}
+end
+
+local stock_state = redis.call('HGET', state_key, 'stock_state') or ''
+local payment_state = redis.call('HGET', state_key, 'payment_state') or ''
+
+if stock_state == stock_failed or payment_state == payment_failed then
+    redis.call('HSET', state_key, 'decision', decision_abort)
+    redis.call('SET', status_key, aborting_status)
+    return {'publish_abort', tx_id, ''}
+end
+
+if stock_state == stock_ready and payment_state == payment_ready then
+    redis.call('HSET', state_key, 'decision', decision_commit)
+    redis.call('SET', status_key, committing_status)
+    return {'publish_commit', tx_id, ''}
+end
+
+return {'wait', tx_id, ''}
+"""
+
+
+_COMMIT_STATE_UPDATE_LUA = """
+local state_key = KEYS[1]
+
+local commit_field = ARGV[1]
+local commit_value = ARGV[2]
+local decision_commit = ARGV[3]
+local decision_abort = ARGV[4]
+local stock_commit_confirmed = ARGV[5]
+local payment_commit_confirmed = ARGV[6]
+local stock_abort_confirmed = ARGV[7]
+local payment_abort_confirmed = ARGV[8]
+
+redis.call('HSET', state_key, commit_field, commit_value)
+
+local decision = redis.call('HGET', state_key, 'decision') or ''
+local stock_commit_state = redis.call('HGET', state_key, 'stock_commit_state') or ''
+local payment_commit_state = redis.call('HGET', state_key, 'payment_commit_state') or ''
+
+if decision == decision_commit and stock_commit_state == stock_commit_confirmed and payment_commit_state == payment_commit_confirmed then
+    return 'finish_success'
+end
+
+if decision == decision_abort and stock_commit_state == stock_abort_confirmed and payment_commit_state == payment_abort_confirmed then
+    return 'finish_failed'
+end
+
+return 'wait'
+"""
 
 
 def init_2pc(db: redis_module.Redis, publish_fn, logger) -> None:
@@ -70,23 +148,22 @@ def _publish_payment(msg: dict) -> None:
     _publish(PAYMENT_COMMANDS_TOPIC, msg)
 
 
-def _mark_paid(order_id: str) -> None:
-    raw = get_order(_logger, _db, order_id)
-    if not raw:
-        return
-    order_entry = msgpack.decode(raw, type=OrderValue)
-    if not order_entry.paid:
-        _db.set(order_id, msgpack.encode(OrderValue(
-            paid=True,
-            items=order_entry.items,
-            user_id=order_entry.user_id,
-            total_cost=order_entry.total_cost,
-        )))
+def _get_participant_update_script():
+    global _participant_update_script
+    if _participant_update_script is None:
+        _participant_update_script = _db.register_script(_PARTICIPANT_UPDATE_LUA)
+    return _participant_update_script
+
+
+def _get_commit_state_update_script():
+    global _commit_state_update_script
+    if _commit_state_update_script is None:
+        _commit_state_update_script = _db.register_script(_COMMIT_STATE_UPDATE_LUA)
+    return _commit_state_update_script
 
 
 def _finish(order_id: str, success: bool) -> None:
     if success:
-        _mark_paid(order_id)
         set_status(_logger, _db, order_id, TwoPhaseOrderStatus.COMPLETED)
     else:
         set_status(_logger, _db, order_id, TwoPhaseOrderStatus.FAILED)
@@ -94,13 +171,19 @@ def _finish(order_id: str, success: bool) -> None:
 
 
 def _evaluate_2pc(order_id: str) -> None:
-    state = _db.hgetall(_2pc_key(order_id))
+    state_key = _2pc_key(order_id)
+    state = _db.hmget(
+        state_key,
+        "stock_state",
+        "payment_state",
+        "decision",
+    )
     if not state:
         return
 
-    stock_state = _decode(state.get(b"stock_state"), STOCK_UNKNOWN)
-    payment_state = _decode(state.get(b"payment_state"), PAYMENT_UNKNOWN)
-    decision = _decode(state.get(b"decision"), DECISION_NONE)
+    stock_state = _decode(state[0], STOCK_UNKNOWN)
+    payment_state = _decode(state[1], PAYMENT_UNKNOWN)
+    decision = _decode(state[2], DECISION_NONE)
 
     tx_id = _decode(_db.get(f"order:{order_id}:tx_id"))
     if not tx_id:
@@ -111,40 +194,74 @@ def _evaluate_2pc(order_id: str) -> None:
         return
 
     if stock_state == STOCK_FAILED or payment_state == PAYMENT_FAILED:
-        _logger.info(f"[Order2PC] order={order_id} ABORT")
-        _db.hset(_2pc_key(order_id), mapping={"decision": DECISION_ABORT})
-        set_status(_logger, _db, order_id, TwoPhaseOrderStatus.ABORTING)
+        _logger.debug(f"[Order2PC] order={order_id} ABORT")
+        pipe = _db.pipeline(transaction=False)
+        pipe.hset(state_key, mapping={"decision": DECISION_ABORT})
+        pipe.set(f"order:{order_id}:status", TwoPhaseOrderStatus.ABORTING)
+        pipe.execute()
         _publish_stock(build_abort_stock(tx_id, order_id))
         _publish_payment(build_abort_payment(tx_id, order_id))
         return
 
     if stock_state == STOCK_READY and payment_state == PAYMENT_READY:
-        _logger.info(f"[Order2PC] order={order_id} COMMIT")
-        _db.hset(_2pc_key(order_id), mapping={"decision": DECISION_COMMIT})
-        set_status(_logger, _db, order_id, TwoPhaseOrderStatus.COMMITTING)
+        _logger.debug(f"[Order2PC] order={order_id} COMMIT")
+        pipe = _db.pipeline(transaction=False)
+        pipe.hset(state_key, mapping={"decision": DECISION_COMMIT})
+        pipe.set(f"order:{order_id}:status", TwoPhaseOrderStatus.COMMITTING)
+        pipe.execute()
         _publish_stock(build_commit_stock(tx_id, order_id))
         _publish_payment(build_commit_payment(tx_id, order_id))
+
+
+def _update_participant_and_maybe_decide(
+    order_id: str,
+    participant_field: str,
+    participant_state: str,
+) -> tuple[str, str]:
+    result = _get_participant_update_script()(
+        keys=[
+            _2pc_key(order_id),
+            f"order:{order_id}:status",
+            f"order:{order_id}:tx_id",
+        ],
+        args=[
+            participant_field,
+            participant_state,
+            TwoPhaseOrderStatus.COMMITTING,
+            TwoPhaseOrderStatus.ABORTING,
+            DECISION_NONE,
+            STOCK_READY,
+            PAYMENT_READY,
+            STOCK_FAILED,
+            PAYMENT_FAILED,
+            DECISION_COMMIT,
+            DECISION_ABORT,
+        ],
+        client=_db,
+    )
+    action = _decode(result[0])
+    tx_id = _decode(result[1])
+    return action, tx_id
 
 
 def recover_incomplete_2pc() -> None:
     for key in _db.scan_iter("order:*:2pcstate"):
         order_id = _decode(key).split(":")[1]
-        state = _db.hgetall(key)
-        decision = _decode(state.get(b"decision"), DECISION_NONE)
+        decision = _decode(_db.hget(key, "decision"), DECISION_NONE)
         tx_id = _decode(_db.get(f"order:{order_id}:tx_id"))
         if not tx_id:
             continue
         if decision == DECISION_NONE:
             _evaluate_2pc(order_id)
         elif decision == DECISION_COMMIT:
-            if _decode(state.get(b"stock_commit_state"), STOCK_NOT_COMMITTED) != STOCK_COMMIT_CONFIRMED:
+            if _decode(_db.hget(key, "stock_commit_state"), STOCK_NOT_COMMITTED) != STOCK_COMMIT_CONFIRMED:
                 _publish_stock(build_commit_stock(tx_id, order_id))
-            if _decode(state.get(b"payment_commit_state"), PAYMENT_NOT_COMMITTED) != PAYMENT_COMMIT_CONFIRMED:
+            if _decode(_db.hget(key, "payment_commit_state"), PAYMENT_NOT_COMMITTED) != PAYMENT_COMMIT_CONFIRMED:
                 _publish_payment(build_commit_payment(tx_id, order_id))
         elif decision == DECISION_ABORT:
-            if _decode(state.get(b"stock_commit_state"), STOCK_NOT_COMMITTED) != STOCK_ABORT_CONFIRMED:
+            if _decode(_db.hget(key, "stock_commit_state"), STOCK_NOT_COMMITTED) != STOCK_ABORT_CONFIRMED:
                 _publish_stock(build_abort_stock(tx_id, order_id))
-            if _decode(state.get(b"payment_commit_state"), PAYMENT_NOT_COMMITTED) != PAYMENT_ABORT_CONFIRMED:
+            if _decode(_db.hget(key, "payment_commit_state"), PAYMENT_NOT_COMMITTED) != PAYMENT_ABORT_CONFIRMED:
                 _publish_payment(build_abort_payment(tx_id, order_id))
 
 
@@ -159,8 +276,9 @@ def _2pc_start_checkout(_producer_unused, db: redis_module.Redis, logger, order_
     items = [{"item_id": iid, "quantity": qty} for iid, qty in items_quantities.items()]
 
     tx_id = str(uuid.uuid4())
-    _db.set(f"order:{order_id}:tx_id", tx_id)
-    _db.hset(
+    pipe = _db.pipeline(transaction=False)
+    pipe.set(f"order:{order_id}:tx_id", tx_id)
+    pipe.hset(
         _2pc_key(order_id),
         mapping={
             "stock_state": STOCK_UNKNOWN,
@@ -170,25 +288,11 @@ def _2pc_start_checkout(_producer_unused, db: redis_module.Redis, logger, order_
             "payment_commit_state": PAYMENT_NOT_COMMITTED,
         },
     )
-    set_status(_logger, _db, order_id, TwoPhaseOrderStatus.PREPARING_STOCK)
+    pipe.set(f"order:{order_id}:status", TwoPhaseOrderStatus.PREPARING_STOCK)
+    pipe.execute()
 
     _publish_stock(build_prepare_stock(tx_id, order_id, items))
     _publish_payment(build_prepare_payment(tx_id, order_id, order_entry.user_id, order_entry.total_cost))
-
-
-def _handle_prepare_result(msg: dict, key: str, ready_value: str, failed_value: str, preparing_status: str) -> None:
-    order_id = msg.get("order_id")
-    tx_id = msg.get("tx_id")
-    if not order_id or not tx_id:
-        return
-    event_type = msg.get("type")
-    new_state = ready_value if event_type in {STOCK_PREPARED, PAYMENT_PREPARED} else failed_value
-    _db.hset(_2pc_key(order_id), mapping={key: new_state})
-    if event_type in {PAYMENT_PREPARED}:
-        set_status(_logger, _db, order_id, TwoPhaseOrderStatus.PREPARING_PAYMENT)
-    elif event_type in {STOCK_PREPARED}:
-        set_status(_logger, _db, order_id, preparing_status)
-    _evaluate_2pc(order_id)
 
 
 def _handle_commit_confirmation(msg: dict, key: str, confirmed_value: str, abort_value: str | None = None) -> None:
@@ -196,36 +300,73 @@ def _handle_commit_confirmation(msg: dict, key: str, confirmed_value: str, abort
     if not order_id:
         return
     event_type = msg.get("type")
-    if event_type in {STOCK_COMMITTED, PAYMENT_COMMITTED}:
-        _db.hset(_2pc_key(order_id), mapping={key: confirmed_value})
-    else:
-        _db.hset(_2pc_key(order_id), mapping={key: abort_value})
+    state_key = _2pc_key(order_id)
+    new_value = confirmed_value if event_type in {STOCK_COMMITTED, PAYMENT_COMMITTED} else abort_value
+    outcome = _decode(
+        _get_commit_state_update_script()(
+            keys=[state_key],
+            args=[
+                key,
+                new_value,
+                DECISION_COMMIT,
+                DECISION_ABORT,
+                STOCK_COMMIT_CONFIRMED,
+                PAYMENT_COMMIT_CONFIRMED,
+                STOCK_ABORT_CONFIRMED,
+                PAYMENT_ABORT_CONFIRMED,
+            ],
+            client=_db,
+        )
+    )
 
-    state = _db.hgetall(_2pc_key(order_id))
-    decision = _decode(state.get(b"decision"), DECISION_NONE)
-    stock_commit = _decode(state.get(b"stock_commit_state"), STOCK_NOT_COMMITTED)
-    payment_commit = _decode(state.get(b"payment_commit_state"), PAYMENT_NOT_COMMITTED)
-
-    if decision == DECISION_COMMIT and stock_commit == STOCK_COMMIT_CONFIRMED and payment_commit == PAYMENT_COMMIT_CONFIRMED:
+    if outcome == "finish_success":
         _finish(order_id, True)
-    elif decision == DECISION_ABORT and stock_commit == STOCK_ABORT_CONFIRMED and payment_commit == PAYMENT_ABORT_CONFIRMED:
+    elif outcome == "finish_failed":
         _finish(order_id, False)
 
 
 def _2pc_route_order(msg: dict) -> None:
     msg_type = msg.get("type")
     if msg_type == STOCK_PREPARED:
-        _db.hset(_2pc_key(msg["order_id"]), mapping={"stock_state": STOCK_READY})
-        _evaluate_2pc(msg["order_id"])
+        action, tx_id = _update_participant_and_maybe_decide(msg["order_id"], "stock_state", STOCK_READY)
+        if action == "publish_commit":
+            _logger.debug(f"[Order2PC] order={msg['order_id']} COMMIT")
+            _publish_stock(build_commit_stock(tx_id, msg["order_id"]))
+            _publish_payment(build_commit_payment(tx_id, msg["order_id"]))
+        elif action == "publish_abort":
+            _logger.debug(f"[Order2PC] order={msg['order_id']} ABORT")
+            _publish_stock(build_abort_stock(tx_id, msg["order_id"]))
+            _publish_payment(build_abort_payment(tx_id, msg["order_id"]))
+        elif action == "missing_tx_id":
+            _logger.warning(f"[Order2PC] order={msg['order_id']} missing tx_id")
     elif msg_type == STOCK_PREPARE_FAILED:
-        _db.hset(_2pc_key(msg["order_id"]), mapping={"stock_state": STOCK_FAILED})
-        _evaluate_2pc(msg["order_id"])
+        action, tx_id = _update_participant_and_maybe_decide(msg["order_id"], "stock_state", STOCK_FAILED)
+        if action == "publish_abort":
+            _logger.debug(f"[Order2PC] order={msg['order_id']} ABORT")
+            _publish_stock(build_abort_stock(tx_id, msg["order_id"]))
+            _publish_payment(build_abort_payment(tx_id, msg["order_id"]))
+        elif action == "missing_tx_id":
+            _logger.warning(f"[Order2PC] order={msg['order_id']} missing tx_id")
     elif msg_type == PAYMENT_PREPARED:
-        _db.hset(_2pc_key(msg["order_id"]), mapping={"payment_state": PAYMENT_READY})
-        _evaluate_2pc(msg["order_id"])
+        action, tx_id = _update_participant_and_maybe_decide(msg["order_id"], "payment_state", PAYMENT_READY)
+        if action == "publish_commit":
+            _logger.debug(f"[Order2PC] order={msg['order_id']} COMMIT")
+            _publish_stock(build_commit_stock(tx_id, msg["order_id"]))
+            _publish_payment(build_commit_payment(tx_id, msg["order_id"]))
+        elif action == "publish_abort":
+            _logger.debug(f"[Order2PC] order={msg['order_id']} ABORT")
+            _publish_stock(build_abort_stock(tx_id, msg["order_id"]))
+            _publish_payment(build_abort_payment(tx_id, msg["order_id"]))
+        elif action == "missing_tx_id":
+            _logger.warning(f"[Order2PC] order={msg['order_id']} missing tx_id")
     elif msg_type == PAYMENT_PREPARE_FAILED:
-        _db.hset(_2pc_key(msg["order_id"]), mapping={"payment_state": PAYMENT_FAILED})
-        _evaluate_2pc(msg["order_id"])
+        action, tx_id = _update_participant_and_maybe_decide(msg["order_id"], "payment_state", PAYMENT_FAILED)
+        if action == "publish_abort":
+            _logger.debug(f"[Order2PC] order={msg['order_id']} ABORT")
+            _publish_stock(build_abort_stock(tx_id, msg["order_id"]))
+            _publish_payment(build_abort_payment(tx_id, msg["order_id"]))
+        elif action == "missing_tx_id":
+            _logger.warning(f"[Order2PC] order={msg['order_id']} missing tx_id")
     elif msg_type == STOCK_COMMITTED:
         _handle_commit_confirmation(msg, "stock_commit_state", STOCK_COMMIT_CONFIRMED, STOCK_ABORT_CONFIRMED)
     elif msg_type == PAYMENT_COMMITTED:
@@ -235,4 +376,4 @@ def _2pc_route_order(msg: dict) -> None:
     elif msg_type == PAYMENT_ABORTED:
         _handle_commit_confirmation(msg, "payment_commit_state", PAYMENT_COMMIT_CONFIRMED, PAYMENT_ABORT_CONFIRMED)
     else:
-        _logger.info(f"[Order2PC] Unknown event type: {msg_type!r}")
+        _logger.debug(f"[Order2PC] Unknown event type: {msg_type!r}")
