@@ -1,11 +1,10 @@
 """
 test_2pc.py
 
-Tests for the 2PC Kafka checkout mode.
+Tests for the 2PC checkout mode.
 
 Assumes:
-    - Services are running with USE_KAFKA=true
-    - TRANSACTION_MODE=2pc
+    - Services are running with TRANSACTION_MODE=2pc
     - Gateway is reachable at the URL configured in utils.py
 """
 
@@ -18,7 +17,6 @@ from pathlib import Path
 from typing import Optional
 
 import requests
-import utils as tu
 
 TEST_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TEST_DIR.parent
@@ -27,6 +25,8 @@ if str(TEST_DIR) not in sys.path:
     sys.path.insert(0, str(TEST_DIR))
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+import utils as tu
 
 
 # Max seconds to wait for a checkout to reach a terminal state.

@@ -2,7 +2,6 @@
 payment-service/streams_worker.py
 
 Redis Streams transport for the payment service.
-Replaces kafka_worker.py.
 
 Consumes from : payment.commands (on payment-db)
 Publishes to  : payment.events   (on payment-db)
@@ -15,6 +14,7 @@ import time
 import redis as redis_module
 
 from common.streams_client import StreamsClient
+from common.worker_logging import log_worker_exception
 from common.messages import PAYMENT_COMMANDS_TOPIC, PAYMENT_EVENTS_TOPIC
 
 import ledger as payment_ledger
@@ -32,13 +32,6 @@ PAYMENT_GROUP = "payment-service"
 _db: redis_module.Redis | None = None
 _available = False
 _logger = None
-
-class _StreamProducer:
-    def __init__(self, publish_fn):
-        self._publish_fn = publish_fn
-
-    def publish(self, stream: str, message: dict) -> None:
-        self._publish_fn(stream, message)
 
 def _replay_unreplied_entries(sc: StreamsClient) -> None:
     if TRANSACTION_MODE not in {"saga", "2pc"} or _db is None:
@@ -96,7 +89,7 @@ def _consumer_worker(worker_id: str, sc: StreamsClient, publish_fn) -> None:
         try:
             _process_batch(sc, batch, publish_fn)
         except Exception as exc:
-            _logger.error(f"[PaymentStreams] {consumer_name} PEL recovery error: {exc}")
+            log_worker_exception(_logger, "PaymentStreams", f"{consumer_name} PEL recovery", exc)
             break
 
     while _available:
@@ -111,7 +104,7 @@ def _consumer_worker(worker_id: str, sc: StreamsClient, publish_fn) -> None:
                 continue
             _process_batch(sc, batch, publish_fn)
         except Exception as exc:
-            _logger.error(f"[PaymentStreams] {consumer_name} crashed: {exc}")
+            log_worker_exception(_logger, "PaymentStreams", consumer_name, exc)
             time.sleep(0.5)
 
 
@@ -126,9 +119,9 @@ def _orphan_recovery_worker(sc: StreamsClient, publish_fn) -> None:
             try:
                 _process_batch(sc, orphans, publish_fn)
             except Exception as exc:
-                _logger.error(f"[PaymentStreams] orphan recovery error: {exc}")
+                log_worker_exception(_logger, "PaymentStreams", "orphan recovery", exc)
         except Exception as exc:
-            _logger.error(f"[PaymentStreams] orphan recovery worker crashed: {exc}")
+            log_worker_exception(_logger, "PaymentStreams", "orphan recovery worker", exc)
 
 
 def init_streams(logger, db: redis_module.Redis) -> None:

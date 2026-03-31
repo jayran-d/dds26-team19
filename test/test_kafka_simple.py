@@ -14,7 +14,6 @@ import unittest
 import sys
 from pathlib import Path
 
-
 TEST_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TEST_DIR.parent
 

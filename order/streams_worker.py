@@ -2,7 +2,6 @@
 order-service/streams_worker.py
 
 Redis Streams transport for the order service.
-Replaces kafka_worker.py with much lower latency.
 
 Architecture:
     - Order service connects to THREE Redis instances:
@@ -15,7 +14,7 @@ Architecture:
     - publish() routes to the right Redis based on stream name
 
     - checkout_notify.notify() is called by saga.py on terminal states,
-      unblocking the HTTP handler via threading.Event instead of polling.
+      unblocking the waiting HTTP request via checkout_notify.
 """
 
 import os
@@ -25,8 +24,8 @@ import time
 import redis as redis_module
 
 from common.streams_client import StreamsClient
+from common.worker_logging import log_worker_exception
 from common.messages import (
-    ALL_TOPICS,
     STOCK_EVENTS_TOPIC,
     PAYMENT_EVENTS_TOPIC,
     STOCK_COMMANDS_TOPIC,
@@ -56,14 +55,6 @@ _stock_sc: StreamsClient | None = None
 _payment_sc: StreamsClient | None = None
 _available = False
 _logger = None
-
-
-class _StreamProducer:
-    def __init__(self, publish_fn):
-        self._publish_fn = publish_fn
-
-    def publish(self, stream: str, message: dict) -> None:
-        self._publish_fn(stream, message)
 
 
 def _make_stock_db() -> redis_module.Redis:
@@ -150,7 +141,7 @@ def _event_worker(
         try:
             _process_batch(streams_client, group, batch, publish_fn)
         except Exception as exc:
-            _logger.error(f"[OrderStreams] {consumer_name} PEL recovery error: {exc}")
+            log_worker_exception(_logger, "OrderStreams", f"{consumer_name} PEL recovery", exc)
             break
 
     # Normal consume loop
@@ -166,7 +157,7 @@ def _event_worker(
                 continue
             _process_batch(streams_client, group, batch, publish_fn)
         except Exception as exc:
-            _logger.error(f"[OrderStreams] {consumer_name} crashed: {exc}")
+            log_worker_exception(_logger, "OrderStreams", consumer_name, exc)
             time.sleep(0.5)
 
 
@@ -187,9 +178,9 @@ def _orphan_recovery_worker(
             try:
                 _process_batch(streams_client, group, orphans, publish_fn)
             except Exception as exc:
-                _logger.error(f"[OrderStreams] orphan recovery error: {exc}")
+                log_worker_exception(_logger, "OrderStreams", "orphan recovery", exc)
         except Exception as exc:
-            _logger.error(f"[OrderStreams] orphan recovery worker crashed: {exc}")
+            log_worker_exception(_logger, "OrderStreams", "orphan recovery worker", exc)
 
 
 def _timeout_loop(publish_fn) -> None:
@@ -197,7 +188,7 @@ def _timeout_loop(publish_fn) -> None:
         try:
             saga_check_timeouts(_order_db, publish_fn, _logger)
         except Exception as exc:
-            _logger.error(f"[OrderStreams] Timeout loop crashed: {exc}")
+            log_worker_exception(_logger, "OrderStreams", "timeout loop", exc)
         time.sleep(TIMEOUT_SCAN_INTERVAL)
 
 

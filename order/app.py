@@ -36,20 +36,11 @@ if TRANSACTION_MODE == "2pc":
         TwoPhaseOrderStatus.COMMITTING,
         TwoPhaseOrderStatus.ABORTING,
     }
-    TERMINAL_STATUSES = {
-        TwoPhaseOrderStatus.COMPLETED,
-        TwoPhaseOrderStatus.FAILED,
-    }
 else:
     IN_PROGRESS_STATUSES = {
         SagaOrderStatus.RESERVING_STOCK,
         SagaOrderStatus.PROCESSING_PAYMENT,
         SagaOrderStatus.COMPENSATING,
-    }
-
-    TERMINAL_STATUSES = {
-        SagaOrderStatus.COMPLETED,
-        SagaOrderStatus.FAILED,
     }
 
 app = Quart("order-service")
@@ -110,17 +101,6 @@ def get_order_and_status(order_id: str) -> tuple[OrderValue | None, str | None]:
         abort(400, f"Order: {order_id} not found!")
     status = raw_status.decode() if raw_status else None
     return order_entry, status
-
-
-async def get_order_from_db_async(order_id: str) -> OrderValue | None:
-    try:
-        entry = await asyncio.to_thread(db.get, order_id)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    order_entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
-    if order_entry is None:
-        abort(400, f"Order: {order_id} not found!")
-    return order_entry
 
 
 async def get_order_status_async(order_id: str) -> str | None:
@@ -217,6 +197,9 @@ def find_order(order_id: str):
     order_entry, status = get_order_and_status(order_id)
     return jsonify({
         "order_id":   order_id,
+        # Saga mode now treats the terminal order status as the canonical signal
+        # that checkout finished successfully. The stored order blob may still
+        # contain paid=False because we no longer rewrite it on the hot path.
         "paid":       order_entry.paid or status == SagaOrderStatus.COMPLETED,
         "items":      order_entry.items,
         "user_id":    order_entry.user_id,
