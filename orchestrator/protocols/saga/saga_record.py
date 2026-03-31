@@ -4,9 +4,11 @@ orchestrator/protocols/saga/saga_record.py
 Durable Saga record stored in the orchestrator's own Redis (coord_db).
 
 Key space (all in orchestrator-db, not order-db):
-    saga:record:<tx_id>   → msgpack-encoded record dict
+    saga:record:<tx_id>    → msgpack-encoded record dict
     saga:active:<order_id> → active tx_id string
-    saga:seen:<message_id> → "1"  (TTL 24h, dedup)
+    saga:seen:<message_id>  → "1"  (TTL 24h, dedup)
+    saga:incomplete         → set(tx_id) for in-flight Sagas
+    saga:timeouts           → zset(tx_id -> timeout_at_ms) for timeout scans
 """
 
 import time
@@ -19,6 +21,7 @@ from common.messages import SagaOrderStatus
 SAGA_RECORD_TTL = 86400   # 24 hours
 SEEN_EVENT_TTL  = 86400   # 24 hours
 TIMEOUT_SECONDS = 30
+TERMINAL_STATES = {SagaOrderStatus.COMPLETED, SagaOrderStatus.FAILED}
 
 
 def _record_key(tx_id: str) -> str:
@@ -31,6 +34,14 @@ def _seen_key(message_id: str) -> str:
 
 def _active_key(order_id: str) -> str:
     return f"saga:active:{order_id}"
+
+
+def _incomplete_key() -> str:
+    return "saga:incomplete"
+
+
+def _timeout_index_key() -> str:
+    return "saga:timeouts"
 
 
 def _decode_record(raw: bytes | None) -> dict | None:
@@ -87,21 +98,32 @@ def load_event_context(
 
 
 def get_all_active(db: redis_module.Redis) -> list[dict]:
-    terminal = {SagaOrderStatus.COMPLETED, SagaOrderStatus.FAILED}
     try:
-        keys = db.keys("saga:record:*")
-        if not keys:
+        raw_tx_ids = db.smembers(_incomplete_key())
+        if not raw_tx_ids:
             return []
-        raws = db.mget(keys)
+        tx_ids = [tx_id.decode() if isinstance(tx_id, bytes) else str(tx_id) for tx_id in raw_tx_ids]
+        raws = db.mget([_record_key(tx_id) for tx_id in tx_ids])
         records = []
-        for raw in raws:
+        stale_tx_ids = []
+        for tx_id, raw in zip(tx_ids, raws):
             if not raw:
+                stale_tx_ids.append(tx_id)
                 continue
             record = _decode_record(raw)
             if not record:
+                stale_tx_ids.append(tx_id)
                 continue
-            if record.get("state") not in terminal:
-                records.append(record)
+            if record.get("state") in TERMINAL_STATES:
+                stale_tx_ids.append(tx_id)
+                continue
+            records.append(record)
+
+        if stale_tx_ids:
+            pipe = db.pipeline(transaction=False)
+            pipe.srem(_incomplete_key(), *stale_tx_ids)
+            pipe.zrem(_timeout_index_key(), *stale_tx_ids)
+            pipe.execute()
         return records
     except Exception:
         return []
@@ -143,7 +165,15 @@ def transition(
         if reset_timeout:
             record_obj["timeout_at_ms"] = now_ms + TIMEOUT_SECONDS * 1000
 
-        db.set(_record_key(tx_id), _encode_record(record_obj), ex=SAGA_RECORD_TTL)
+        pipe = db.pipeline(transaction=False)
+        pipe.set(_record_key(tx_id), _encode_record(record_obj), ex=SAGA_RECORD_TTL)
+        if new_state in TERMINAL_STATES:
+            pipe.srem(_incomplete_key(), tx_id)
+            pipe.zrem(_timeout_index_key(), tx_id)
+        else:
+            pipe.sadd(_incomplete_key(), tx_id)
+            pipe.zadd(_timeout_index_key(), {tx_id: record_obj["timeout_at_ms"]})
+        pipe.execute()
         if record is not None:
             record.clear()
             record.update(record_obj)
@@ -168,23 +198,40 @@ def mark_seen(db: redis_module.Redis, message_id: str) -> None:
 
 def get_timed_out(db: redis_module.Redis) -> list[dict]:
     now = int(time.time() * 1000)
-    terminal = {SagaOrderStatus.COMPLETED, SagaOrderStatus.FAILED}
     try:
-        keys = db.keys("saga:record:*")
-        if not keys:
+        raw_tx_ids = db.zrangebyscore(_timeout_index_key(), min=0, max=now)
+        if not raw_tx_ids:
             return []
-        raws = db.mget(keys)
+        tx_ids = [tx_id.decode() if isinstance(tx_id, bytes) else str(tx_id) for tx_id in raw_tx_ids]
+        raws = db.mget([_record_key(tx_id) for tx_id in tx_ids])
         timed_out = []
-        for raw in raws:
+        stale_tx_ids = []
+        refresh_scores = {}
+        for tx_id, raw in zip(tx_ids, raws):
             if not raw:
+                stale_tx_ids.append(tx_id)
                 continue
             record = _decode_record(raw)
             if not record:
+                stale_tx_ids.append(tx_id)
                 continue
-            if record.get("state") in terminal:
+            if record.get("state") in TERMINAL_STATES:
+                stale_tx_ids.append(tx_id)
                 continue
-            if record.get("timeout_at_ms", 0) < now:
+            timeout_at_ms = int(record.get("timeout_at_ms", 0))
+            if timeout_at_ms <= now:
                 timed_out.append(record)
+            else:
+                refresh_scores[tx_id] = timeout_at_ms
+
+        if refresh_scores:
+            db.zadd(_timeout_index_key(), refresh_scores)
+
+        if stale_tx_ids:
+            pipe = db.pipeline(transaction=False)
+            pipe.srem(_incomplete_key(), *stale_tx_ids)
+            pipe.zrem(_timeout_index_key(), *stale_tx_ids)
+            pipe.execute()
         return timed_out
     except Exception:
         return []
@@ -220,7 +267,6 @@ def create_if_no_active(
     }
 
     active_key = _active_key(order_id)
-    terminal = {SagaOrderStatus.COMPLETED, SagaOrderStatus.FAILED}
 
     while True:
         pipe = db.pipeline()
@@ -236,13 +282,15 @@ def create_if_no_active(
                     if not active_record:
                         pipe.unwatch()
                         return False, None
-                    if active_record.get("state") not in terminal:
+                    if active_record.get("state") not in TERMINAL_STATES:
                         pipe.unwatch()
                         return False, active_tx_id
 
             pipe.multi()
             pipe.set(_record_key(tx_id), _encode_record(new_record), ex=SAGA_RECORD_TTL)
             pipe.set(active_key, tx_id, ex=SAGA_RECORD_TTL)
+            pipe.sadd(_incomplete_key(), tx_id)
+            pipe.zadd(_timeout_index_key(), {tx_id: new_record["timeout_at_ms"]})
             pipe.execute()
             return True, None
 

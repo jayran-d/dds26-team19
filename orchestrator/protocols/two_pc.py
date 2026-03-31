@@ -65,6 +65,11 @@ def _tx_key(order_id: str) -> str:
     return f"order:{order_id}:tx_id"
 
 
+def _incomplete_key() -> str:
+    # Recovery iterates this set instead of scanning every historical 2PC state key.
+    return "2pc:incomplete"
+
+
 _coord_db: redis_module.Redis | None = None
 _order_db: redis_module.Redis | None = None
 _publish = None
@@ -243,6 +248,15 @@ def _clear_active_tx_id(order_id: str, tx_id: str) -> None:
         pass
 
 
+def _clear_incomplete(order_id: str) -> None:
+    if _coord_db is None:
+        return
+    try:
+        _coord_db.srem(_incomplete_key(), order_id)
+    except Exception:
+        pass
+
+
 def _decode_items(raw: bytes | str | None) -> list[dict]:
     if raw is None:
         return []
@@ -284,6 +298,8 @@ def _create_if_no_active(
             elif current_status in IN_PROGRESS_STATUSES and current_tx_id:
                 pipe.multi()
                 pipe.set(active_key, current_tx_id)
+                # Restore the recovery index if a previous crash left only the durable state behind.
+                pipe.sadd(_incomplete_key(), order_id)
                 pipe.execute()
                 return False, current_tx_id
 
@@ -292,6 +308,8 @@ def _create_if_no_active(
             pipe.set(tx_key, tx_id)
             pipe.hset(_2pc_key(order_id), mapping=state_mapping)
             pipe.set(status_key, initial_status)
+            # New transactions become recoverable as part of the same atomic write.
+            pipe.sadd(_incomplete_key(), order_id)
             pipe.execute()
             return True, None
 
@@ -309,6 +327,7 @@ def _finish(order_id: str, success: bool) -> None:
     tx_id = _decode(_coord_db.get(_tx_key(order_id)))
     if tx_id:
         _clear_active_tx_id(order_id, tx_id)
+    _clear_incomplete(order_id)
 
 
 def _update_participant_and_maybe_decide(
@@ -350,18 +369,33 @@ def _update_participant_and_maybe_decide(
 
 
 def recover_incomplete_2pc() -> None:
-    for key in _coord_db.scan_iter("order:*:2pcstate"):
-        order_id = _decode(key).split(":")[1]
+    # Only unfinished orders stay in 2pc:incomplete, so recovery work stays bounded.
+    try:
+        raw_order_ids = _coord_db.smembers(_incomplete_key())
+    except Exception:
+        return
+
+    for raw_order_id in raw_order_ids:
+        order_id = _decode(raw_order_id)
+        key = _2pc_key(order_id)
         decision = _decode(_coord_db.hget(key, "decision"), DECISION_NONE)
         tx_id = _decode(_coord_db.get(_tx_key(order_id)))
         status = _decode(_coord_db.get(_status_key(order_id)))
+        if not _coord_db.exists(key):
+            _clear_incomplete(order_id)
+            continue
         if not tx_id:
+            if status in TERMINAL_STATUSES:
+                _clear_incomplete(order_id)
             continue
         if status in TERMINAL_STATUSES:
             _clear_active_tx_id(order_id, tx_id)
+            _clear_incomplete(order_id)
+            continue
         else:
             try:
                 _coord_db.set(_active_key(order_id), tx_id)
+                _coord_db.sadd(_incomplete_key(), order_id)
             except Exception:
                 pass
         if decision == DECISION_NONE:

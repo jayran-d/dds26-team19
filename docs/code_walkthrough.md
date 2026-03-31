@@ -104,7 +104,7 @@ Focus on:
 - `_route_event()`
 - `_event_worker()`
 - `_orphan_recovery_worker()`
-- `_timeout_loop()`
+- `_recovery_loop()`
 - `start_checkout()`
 
 This is the real coordinator runtime shell. It:
@@ -131,6 +131,7 @@ Focus in `saga_record.py` on:
 - `load_event_context()`
 - `transition()`
 - `mark_seen()`
+- `get_all_active()`
 - `get_timed_out()`
 
 Focus in `saga.py` on:
@@ -145,6 +146,8 @@ Focus in `saga.py` on:
 Key mental model:
 
 - the saga record is the durable coordinator state
+- `saga:incomplete` tracks only in-flight transactions
+- `saga:timeouts` keeps timeout checks bounded to active work
 - state is written before the next command is published
 - duplicate and stale events are dropped
 - timeout recovery republishes the intended next command
@@ -168,6 +171,7 @@ Focus on:
 Key mental model:
 
 - `2pc:active:<order_id>` prevents duplicate active checkouts
+- `2pc:incomplete` tracks only unfinished orders for recovery
 - `order:<order_id>:2pcstate` stores participant readiness and decision state
 - prepare replies drive `COMMIT` or `ABORT`
 - commit/abort confirmations finalize the transaction
