@@ -98,6 +98,8 @@ def _make_payment_db() -> redis_module.Redis:
 
 
 def _route_event(msg: dict, publish_fn) -> None:
+    # The orchestrator owns the protocol logic, so event workers only decode
+    # transport messages and forward them into the active coordinator mode.
     if TRANSACTION_MODE == "saga":
         saga_route_order(msg, _coord_db, publish_fn, _logger)
     elif TRANSACTION_MODE == "2pc":
@@ -129,6 +131,8 @@ def _process_batch(
             _route_event(msg, publish_fn)
             processed.append((stream, msg_id))
     finally:
+        # Ack only messages that reached protocol handling. If the worker crashes
+        # before this point, Redis keeps them pending so they can be retried.
         _ack_processed(streams_client, group, processed)
 
 
@@ -141,7 +145,8 @@ def _event_worker(
 ) -> None:
     consumer_name = f"orch-worker-{os.getpid()}-{worker_id}"
 
-    # Drain PEL first
+    # On restart, first replay this worker's own Pending Entries List (PEL):
+    # messages it had already read earlier but never acked.
     while True:
         batch = streams_client.read_many(
             streams, group, consumer_name, pending=True, count=STREAM_BATCH_SIZE,
@@ -154,6 +159,8 @@ def _event_worker(
             log_worker_exception(_logger, "OrchestratorStreams", f"{consumer_name} PEL", exc)
             break
 
+    # After local pending work is drained, switch to normal streaming mode and
+    # consume only new messages delivered to this consumer group member.
     while _available:
         try:
             batch = streams_client.read_many(
@@ -177,6 +184,9 @@ def _orphan_recovery_worker(
     while _available:
         time.sleep(ORPHAN_CLAIM_INTERVAL)
         try:
+            # Orphans are pending messages left behind by some other crashed
+            # consumer. XAUTOCLAIM moves them to this recovery worker so they
+            # are not stuck forever in the group's PEL.
             orphans = streams_client.claim_orphans(streams, group, consumer_name, ORPHAN_MIN_IDLE_MS)
             if not orphans:
                 continue
@@ -192,9 +202,13 @@ def _recovery_loop(publish_fn) -> None:
     while _available:
         try:
             if TRANSACTION_MODE == "saga":
+                # Saga uses timeouts to republish the next expected command when
+                # a previous command/event exchange was interrupted by a crash.
                 saga_check_timeouts(_coord_db, publish_fn, _logger)
             elif TRANSACTION_MODE == "2pc":
                 from protocols.two_pc import recover_incomplete_2pc
+                # 2PC recovery walks only unfinished coordinator state and
+                # re-emits prepare/commit/abort work that was not confirmed yet.
                 recover_incomplete_2pc()
         except Exception as exc:
             log_worker_exception(_logger, "OrchestratorStreams", "recovery loop", exc)
@@ -224,6 +238,8 @@ def init_streams(logger, coord_db: redis_module.Redis) -> None:
     payment_sc.ensure_group(PAYMENT_COMMANDS_TOPIC, "payment-service")
 
     def publish_fn(stream: str, message: dict) -> None:
+        # Commands are stored in the participant's own Redis because each
+        # participant owns its command log, consumer group, and local replay.
         if 'stock' in stream:
             stock_sc.publish(stream, message)
         else:
@@ -231,10 +247,13 @@ def init_streams(logger, coord_db: redis_module.Redis) -> None:
 
     if TRANSACTION_MODE == "saga":
         init_saga(_order_db)
+        # On orchestrator restart, recover all in-flight Sagas before workers
+        # start reading fresh participant events.
         saga_recover(_coord_db, publish_fn, logger)
     elif TRANSACTION_MODE == "2pc":
         from protocols.two_pc import init_2pc, recover_incomplete_2pc
         init_2pc(_coord_db, _order_db, publish_fn, logger)
+        # Reconstruct any unfinished 2PC transactions from durable coordinator state.
         recover_incomplete_2pc()
 
     threading.Thread(target=_recovery_loop, args=(publish_fn,), daemon=True).start()
@@ -284,6 +303,8 @@ def start_checkout(order_id: str, user_id: str, total_cost: int, items: list) ->
         raise RuntimeError("Streams worker not available")
 
     def publish_fn(stream: str, message: dict) -> None:
+        # The HTTP layer does not talk to stock/payment directly anymore. It
+        # always enters the system through the orchestrator runtime.
         if 'stock' in stream:
             _stock_sc.publish(stream, message)
         else:

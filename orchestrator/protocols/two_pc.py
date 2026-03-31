@@ -296,6 +296,9 @@ def _create_if_no_active(
                     pipe.unwatch()
                     return False, active_tx_id
             elif current_status in IN_PROGRESS_STATUSES and current_tx_id:
+                # If the active marker was lost but durable order/2PC state says
+                # checkout is still running, rebuild the marker instead of
+                # starting a second coordinator instance for the same order.
                 pipe.multi()
                 pipe.set(active_key, current_tx_id)
                 # Restore the recovery index if a previous crash left only the durable state behind.
@@ -399,6 +402,8 @@ def recover_incomplete_2pc() -> None:
             except Exception:
                 pass
         if decision == DECISION_NONE:
+            # A coordinator crash can happen before either PREPARE command was
+            # actually delivered. Rebuild those messages from durable inputs.
             stock_state = _decode(_coord_db.hget(key, "stock_state"), STOCK_UNKNOWN)
             payment_state = _decode(_coord_db.hget(key, "payment_state"), PAYMENT_UNKNOWN)
             if stock_state == STOCK_UNKNOWN:
