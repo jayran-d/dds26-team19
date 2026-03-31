@@ -100,6 +100,18 @@ def get_order_status(order_id: str) -> str | None:
         return None
 
 
+def get_order_and_status(order_id: str) -> tuple[OrderValue | None, str | None]:
+    try:
+        raw_order, raw_status = db.mget(order_id, f"order:{order_id}:status")
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+    order_entry: OrderValue | None = msgpack.decode(raw_order, type=OrderValue) if raw_order else None
+    if order_entry is None:
+        abort(400, f"Order: {order_id} not found!")
+    status = raw_status.decode() if raw_status else None
+    return order_entry, status
+
+
 async def get_order_from_db_async(order_id: str) -> OrderValue | None:
     try:
         entry = await asyncio.to_thread(db.get, order_id)
@@ -119,7 +131,20 @@ async def get_order_status_async(order_id: str) -> str | None:
         return None
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
+async def get_order_and_status_async(order_id: str) -> tuple[OrderValue | None, str | None]:
+    try:
+        raw_order, raw_status = await asyncio.to_thread(
+            db.mget,
+            order_id,
+            f"order:{order_id}:status",
+        )
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+    order_entry: OrderValue | None = msgpack.decode(raw_order, type=OrderValue) if raw_order else None
+    if order_entry is None:
+        abort(400, f"Order: {order_id} not found!")
+    status = raw_status.decode() if raw_status else None
+    return order_entry, status
 
 async def _build_terminal_checkout_response(
     order_id: str,
@@ -149,20 +174,6 @@ async def _build_terminal_checkout_response(
         headers={"Location": f"/orders/status/{order_id}"},
     )
 
-
-def _response_from_status(order_id: str, status: str | None) -> Response:
-    final_status = status or (TwoPhaseOrderStatus.PENDING if TRANSACTION_MODE == "2pc" else SagaOrderStatus.PENDING)
-    if final_status in {SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED}:
-        return Response(
-            "Checkout successful",
-            status=200,
-            headers={"Location": f"/orders/status/{order_id}"},
-        )
-    return Response(
-        "Checkout failed",
-        status=400,
-        headers={"Location": f"/orders/status/{order_id}"},
-    )
 
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
@@ -203,10 +214,10 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
 
 @app.get('/find/<order_id>')
 def find_order(order_id: str):
-    order_entry: OrderValue = get_order_from_db(order_id)
+    order_entry, status = get_order_and_status(order_id)
     return jsonify({
         "order_id":   order_id,
-        "paid":       order_entry.paid,
+        "paid":       order_entry.paid or status == SagaOrderStatus.COMPLETED,
         "items":      order_entry.items,
         "user_id":    order_entry.user_id,
         "total_cost": order_entry.total_cost,
@@ -261,8 +272,7 @@ def add_item(order_id: str, item_id: str, quantity: int):
 async def checkout(order_id: str):
     waiter = checkout_notify.register_async(order_id)
     try:
-        order_entry: OrderValue = await get_order_from_db_async(order_id)
-        status = await get_order_status_async(order_id)
+        order_entry, status = await get_order_and_status_async(order_id)
 
         if order_entry.paid or status in {SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED}:
             return Response(

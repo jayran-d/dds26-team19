@@ -31,8 +31,6 @@ Design rules:
 
 import uuid
 import redis as redis_module
-from msgspec import msgpack
-
 from . import saga_record
 import checkout_notify
 from common.messages import (
@@ -111,8 +109,10 @@ def saga_start_checkout(
 
     # This pointer is redundant with the full saga record, but very convenient
     # for tests, debugging, and tracing one order through the system.
-    db.set(f"order:{order_id}:tx_id", tx_id)
-    _set_status(db, order_id, SagaOrderStatus.RESERVING_STOCK)
+    pipe = db.pipeline(transaction=False)
+    pipe.set(f"order:{order_id}:tx_id", tx_id)
+    pipe.set(f"order:{order_id}:status", SagaOrderStatus.RESERVING_STOCK)
+    pipe.execute()
 
     # Important: the Saga record was already durably written before this publish.
     # If publish fails or the service crashes now, recovery can replay RESERVE_STOCK.
@@ -155,18 +155,19 @@ def saga_route_order(
         logger.warning(f"[Saga] malformed event: {msg}")
         return
 
-    if saga_record.is_seen(db, message_id):
+    seen, active_tx_id, record = saga_record.load_event_context(db, message_id, order_id, tx_id)
+
+    if seen:
         logger.debug(f"[Saga] duplicate message_id={message_id} — dropping")
         return
 
-    if saga_record.is_stale(db, order_id, tx_id):
+    if active_tx_id != tx_id:
         # A later checkout attempt for the same order may already own a newer
         # tx_id. Old events must be ignored so they cannot advance the wrong saga.
         logger.debug(f"[Saga] stale tx_id={tx_id} for order={order_id} — dropping")
         saga_record.mark_seen(db, message_id)
         return
 
-    record = saga_record.get(db, tx_id)
     if not record:
         logger.warning(f"[Saga] no record found for tx_id={tx_id} — dropping")
         return
@@ -225,6 +226,7 @@ def saga_on_stock_reserved(record, msg, db, publish, logger):
         last_command_type=PROCESS_PAYMENT,
         awaiting_event_type=PAYMENT_SUCCESS,
         needs_stock_comp=True,  # stock is reserved — must release if we abort
+        record=record,
     )
     _set_status(db, order_id, SagaOrderStatus.PROCESSING_PAYMENT)
 
@@ -250,6 +252,7 @@ def saga_on_stock_reservation_failed(record, msg, db, logger):
         new_state=SagaOrderStatus.FAILED,
         failure_reason=reason,
         reset_timeout=False,
+        record=record,
     )
     _set_status(db, order_id, SagaOrderStatus.FAILED)
     checkout_notify.notify(order_id)
@@ -271,26 +274,15 @@ def saga_on_payment_success(record, msg, db, logger):
         )
         return
 
-    from app import OrderValue
-
-    raw = db.get(order_id)
-    if raw:
-        # The order row is user-facing state. We only flip it to paid after the
-        # payment success event arrives, not when the command is sent.
-        order_entry = msgpack.decode(raw, type=OrderValue)
-        updated = order_entry.__class__(
-            user_id=order_entry.user_id,
-            items=order_entry.items,
-            total_cost=order_entry.total_cost,
-            paid=True,
-        )
-        db.set(order_id, msgpack.encode(updated))
-
+    # Keep the external API truthful via order:<id>:status and derive `paid`
+    # from that at read time. Rewriting the full order blob here is expensive
+    # and does not strengthen the checkout correctness guarantee.
     saga_record.transition(
         db=db,
         tx_id=tx_id,
         new_state=SagaOrderStatus.COMPLETED,
         reset_timeout=False,
+        record=record,
     )
     _set_status(db, order_id, SagaOrderStatus.COMPLETED)
     checkout_notify.notify(order_id)
@@ -325,6 +317,7 @@ def saga_on_payment_failed(record, msg, db, publish, logger):
         last_command_type=RELEASE_STOCK,
         awaiting_event_type=STOCK_RELEASED,
         failure_reason=reason,
+        record=record,
     )
     _set_status(db, order_id, SagaOrderStatus.COMPENSATING)
 
@@ -348,6 +341,7 @@ def saga_on_stock_released(record, msg, db, logger):
         tx_id=tx_id,
         new_state=SagaOrderStatus.FAILED,
         reset_timeout=False,
+        record=record,
     )
     _set_status(db, order_id, SagaOrderStatus.FAILED)
     checkout_notify.notify(order_id)

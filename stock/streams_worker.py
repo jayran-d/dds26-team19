@@ -23,7 +23,6 @@ from common.messages import STOCK_COMMANDS_TOPIC, STOCK_EVENTS_TOPIC
 
 import ledger as stock_ledger
 from transaction_modes.saga import saga_route_stock
-from transaction_modes.simple import simple_route_stock
 from transaction_modes.two_pc import _2pc_route_stock
 
 TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "saga")
@@ -65,9 +64,7 @@ def _replay_unreplied_entries(sc: StreamsClient) -> None:
 
 def _route_command(msg: dict, publish_fn) -> None:
     msg_type = msg.get("type")
-    if TRANSACTION_MODE == "simple":
-        simple_route_stock(_StreamProducer(publish_fn), _logger, msg)
-    elif TRANSACTION_MODE == "saga":
+    if TRANSACTION_MODE == "saga":
         saga_route_stock(msg, _db, publish_fn, _logger)
     elif TRANSACTION_MODE == "2pc":
         _2pc_route_stock(msg, msg_type)

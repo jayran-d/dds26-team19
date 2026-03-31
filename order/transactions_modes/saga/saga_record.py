@@ -22,9 +22,9 @@ Processed event deduplication:
     Used to ignore duplicate events from Kafka.
 """
 
-import json
 import time
 import redis as redis_module
+from msgspec import msgpack
 
 from common.messages import SagaOrderStatus
 
@@ -60,55 +60,23 @@ def _active_key(order_id: str) -> str:
     return f"saga:active:{order_id}"
 
 
-# ============================================================
-# CREATE
-# ============================================================
-
-
-def create(
-    db: redis_module.Redis,
-    tx_id: str,
-    order_id: str,
-    user_id: str,
-    amount: int,
-    items: list,
-) -> bool:
-    """
-    Create a new Saga record in state=pending.
-
-    items: collapsed list of {item_id, quantity} dicts.
-    Returns True on success.
-    """
-    now = int(time.time() * 1000)
-    record = {
-        "tx_id": tx_id,
-        "order_id": order_id,
-        "state": SagaOrderStatus.PENDING,
-        # Transaction data — needed to build commands on recovery
-        "user_id": user_id,
-        "amount": amount,
-        "items": items,
-        # What the orchestrator last did / is waiting for
-        "last_command_type": None,
-        "awaiting_event_type": None,
-        # Compensation flags — set to True once a step succeeds
-        # so recovery knows whether to release/refund
-        "needs_stock_compensation": False,
-        "needs_payment_compensation": False,
-        # Failure info for debugging
-        "failure_reason": None,
-        # Timing
-        "started_at_ms": now,
-        "updated_at_ms": now,
-        "timeout_at_ms": now + TIMEOUT_SECONDS * 1000,
-    }
+def _decode_record(raw: bytes | None) -> dict | None:
+    if not raw:
+        return None
     try:
-        db.set(_record_key(tx_id), json.dumps(record), ex=SAGA_RECORD_TTL)
-        # also store tx_id → order_id mapping for recovery scan
-        db.set(_active_key(order_id), tx_id, ex=SAGA_RECORD_TTL)
-        return True
+        return msgpack.decode(raw)
     except Exception:
-        return False
+        # Backward compatibility for locally persisted volumes created before
+        # saga records switched from JSON to msgpack.
+        try:
+            import json
+            return json.loads(raw)
+        except Exception:
+            return None
+
+
+def _encode_record(record: dict) -> bytes:
+    return msgpack.encode(record)
 
 
 # ============================================================
@@ -119,8 +87,7 @@ def create(
 def get(db: redis_module.Redis, tx_id: str) -> dict | None:
     """Return the Saga record for tx_id, or None if not found."""
     try:
-        raw = db.get(_record_key(tx_id))
-        return json.loads(raw) if raw else None
+        return _decode_record(db.get(_record_key(tx_id)))
     except Exception:
         return None
 
@@ -134,6 +101,30 @@ def get_active_tx_id(db: redis_module.Redis, order_id: str) -> str | None:
         return None
 
 
+def load_event_context(
+    db: redis_module.Redis,
+    message_id: str,
+    order_id: str,
+    tx_id: str,
+) -> tuple[bool, str | None, dict | None]:
+    """
+    Load the hot-path order-event context in one Redis round trip.
+
+    Returns:
+        (seen, active_tx_id, record)
+    """
+    try:
+        raw_seen, raw_active, raw_record = db.mget(
+            _seen_key(message_id),
+            _active_key(order_id),
+            _record_key(tx_id),
+        )
+        active_tx_id = raw_active.decode() if raw_active else None
+        return raw_seen is not None, active_tx_id, _decode_record(raw_record)
+    except Exception:
+        return False, None, None
+
+
 def get_all_active(db: redis_module.Redis) -> list[dict]:
     """
     Return all Saga records that are not in a terminal state.
@@ -142,12 +133,16 @@ def get_all_active(db: redis_module.Redis) -> list[dict]:
     terminal = {SagaOrderStatus.COMPLETED, SagaOrderStatus.FAILED}
     try:
         keys = db.keys("saga:record:*")
+        if not keys:
+            return []
+        raws = db.mget(keys)
         records = []
-        for key in keys:
-            raw = db.get(key)
+        for raw in raws:
             if not raw:
                 continue
-            record = json.loads(raw)
+            record = _decode_record(raw)
+            if not record:
+                continue
             if record.get("state") not in terminal:
                 records.append(record)
         return records
@@ -171,6 +166,7 @@ def transition(
     needs_payment_comp: bool | None = None,
     failure_reason: str | None = None,
     reset_timeout: bool = True,
+    record: dict | None = None,
 ) -> bool:
     """
     Update the Saga record state and optional fields atomically.
@@ -181,28 +177,31 @@ def transition(
     Returns True on success.
     """
     try:
-        raw = db.get(_record_key(tx_id))
-        if not raw:
+        record_obj = dict(record) if record is not None else get(db, tx_id)
+        if not record_obj:
             return False
-        record = json.loads(raw)
 
-        record["state"] = new_state
-        record["updated_at_ms"] = int(time.time() * 1000)
+        now_ms = int(time.time() * 1000)
+        record_obj["state"] = new_state
+        record_obj["updated_at_ms"] = now_ms
 
         if last_command_type is not None:
-            record["last_command_type"] = last_command_type
+            record_obj["last_command_type"] = last_command_type
         if awaiting_event_type is not None:
-            record["awaiting_event_type"] = awaiting_event_type
+            record_obj["awaiting_event_type"] = awaiting_event_type
         if needs_stock_comp is not None:
-            record["needs_stock_compensation"] = needs_stock_comp
+            record_obj["needs_stock_compensation"] = needs_stock_comp
         if needs_payment_comp is not None:
-            record["needs_payment_compensation"] = needs_payment_comp
+            record_obj["needs_payment_compensation"] = needs_payment_comp
         if failure_reason is not None:
-            record["failure_reason"] = failure_reason
+            record_obj["failure_reason"] = failure_reason
         if reset_timeout:
-            record["timeout_at_ms"] = int(time.time() * 1000) + TIMEOUT_SECONDS * 1000
+            record_obj["timeout_at_ms"] = now_ms + TIMEOUT_SECONDS * 1000
 
-        db.set(_record_key(tx_id), json.dumps(record), ex=SAGA_RECORD_TTL)
+        db.set(_record_key(tx_id), _encode_record(record_obj), ex=SAGA_RECORD_TTL)
+        if record is not None:
+            record.clear()
+            record.update(record_obj)
         return True
     except Exception:
         return False
@@ -273,12 +272,16 @@ def get_timed_out(db: redis_module.Redis) -> list[dict]:
     terminal = {SagaOrderStatus.COMPLETED, SagaOrderStatus.FAILED}
     try:
         keys = db.keys("saga:record:*")
+        if not keys:
+            return []
+        raws = db.mget(keys)
         timed_out = []
-        for key in keys:
-            raw = db.get(key)
+        for raw in raws:
             if not raw:
                 continue
-            record = json.loads(raw)
+            record = _decode_record(raw)
+            if not record:
+                continue
             if record.get("state") in terminal:
                 continue
             if record.get("timeout_at_ms", 0) < now:
@@ -341,14 +344,17 @@ def create_if_no_active(
                 raw_active_record = pipe.get(_record_key(active_tx_id))
 
                 if raw_active_record:
-                    active_record = json.loads(raw_active_record)
+                    active_record = _decode_record(raw_active_record)
+                    if not active_record:
+                        pipe.unwatch()
+                        return False, None
                     if active_record.get("state") not in terminal:
                         pipe.unwatch()
                         return False, active_tx_id
 
             # MULTI/EXEC is the atomic "claim this order + create Saga record" step.
             pipe.multi()
-            pipe.set(_record_key(tx_id), json.dumps(new_record), ex=SAGA_RECORD_TTL)
+            pipe.set(_record_key(tx_id), _encode_record(new_record), ex=SAGA_RECORD_TTL)
             pipe.set(active_key, tx_id, ex=SAGA_RECORD_TTL)
             pipe.execute()
             return True, None
@@ -368,8 +374,16 @@ def clear_active_tx_id(db: redis_module.Redis, order_id: str, tx_id: str) -> Non
     This prevents a finished Saga from accidentally deleting a newer claim.
     """
     try:
-        active_tx_id = get_active_tx_id(db, order_id)
-        if active_tx_id == tx_id:
-            db.delete(_active_key(order_id))
+        db.eval(
+            """
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('DEL', KEYS[1])
+            end
+            return 0
+            """,
+            1,
+            _active_key(order_id),
+            tx_id,
+        )
     except Exception:
         pass
