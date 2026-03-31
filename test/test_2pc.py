@@ -8,6 +8,8 @@ Assumes:
     - Gateway is reachable at the URL configured in utils.py
 """
 
+from __future__ import annotations
+
 import subprocess
 import sys
 import threading
@@ -73,16 +75,28 @@ def _wait_for_background_checkout(
     thread: threading.Thread,
     outcome: dict,
     timeout: int = 30,
+    allow_request_error: bool = False,
 ):
     thread.join(timeout)
     if thread.is_alive():
         raise AssertionError("background checkout request did not finish in time")
     if "error" in outcome:
+        if allow_request_error:
+            return None
         raise AssertionError(f"background checkout raised: {outcome['error']}")
     return outcome.get("response")
 
 
 class Test2pc(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _ensure_services_started()
+
+    def setUp(self) -> None:
+        _ensure_services_started()
+
+    def tearDown(self) -> None:
+        _ensure_services_started()
 
     def test_checkout_success(self):
         """
@@ -267,18 +281,74 @@ class Test2pc(unittest.TestCase):
         self.assertEqual(tu.find_item(item_id2)["stock"], 1)
         self.assertEqual(tu.find_user(user_id)["credit"], 100)
 
+    def test_duplicate_checkout_same_order_uses_one_active_transaction(self):
+        user = tu.create_user()
+        user_id = user["user_id"]
+        tu.add_credit_to_user(user_id, 100)
+
+        item = tu.create_item(10)
+        item_id = item["item_id"]
+        tu.add_stock(item_id, 5)
+
+        order = tu.create_order(user_id)
+        order_id = order["order_id"]
+        tu.add_item_to_order(order_id, item_id, 1)
+
+        _stop_service(STOCK_SERVICE)
+
+        thread1, outcome1 = _start_checkout_in_background(order_id)
+        thread2, outcome2 = _start_checkout_in_background(order_id)
+
+        self.assertTrue(
+            _wait_for_2pc_field(order_id, "payment_state", "PAYMENT_READY"),
+            "payment_state did not become PAYMENT_READY while stock-service was stopped",
+        )
+
+        active_tx_id = _get_active_2pc_tx_id(order_id)
+        self.assertTrue(active_tx_id, "2PC active transaction key was not created")
+
+        _start_service(STOCK_SERVICE)
+
+        response1 = _wait_for_background_checkout(thread1, outcome1)
+        response2 = _wait_for_background_checkout(thread2, outcome2)
+
+        self.assertEqual(wait_for_checkout(order_id), "completed")
+        self.assertIn(response1.status_code, {200, 400})
+        self.assertIn(response2.status_code, {200, 400})
+        self.assertEqual(tu.find_item(item_id)["stock"], 4)
+        self.assertEqual(tu.find_user(user_id)["credit"], 90)
+        self.assertEqual(_get_active_2pc_tx_id(order_id), "")
+
 
 # ── Docker / Recovery infrastructure ─────────────────────────────────────────
 
 RECOVERY_CHECKOUT_TIMEOUT = 90
 RECOVERY_WAIT             = 60
 
-ORDER_SERVICE    = "order-service"
-STOCK_SERVICE    = "stock-service"
-PAYMENT_SERVICE  = "payment-service"
+ORDER_SERVICE = "order-service"
+ORCHESTRATOR_SERVICE = "orchestrator-service"
+STOCK_SERVICE = "stock-service"
+PAYMENT_SERVICE = "payment-service"
 ORDER_DB_SERVICE = "order-db"
-GATEWAY_SERVICE  = "gateway"
-REDIS_PASSWORD   = "redis"
+ORCHESTRATOR_DB_SERVICE = "orchestrator-db"
+STOCK_DB_SERVICE = "stock-db"
+PAYMENT_DB_SERVICE = "payment-db"
+GATEWAY_SERVICE = "gateway"
+REDIS_PASSWORD = "redis"
+
+HTTP_SERVICES = {
+    ORDER_SERVICE,
+    ORCHESTRATOR_SERVICE,
+    STOCK_SERVICE,
+    PAYMENT_SERVICE,
+}
+
+REDIS_SERVICES = {
+    ORDER_DB_SERVICE,
+    ORCHESTRATOR_DB_SERVICE,
+    STOCK_DB_SERVICE,
+    PAYMENT_DB_SERVICE,
+}
 
 
 def _compose(*args: str, input_text: Optional[str] = None, check: bool = True) -> subprocess.CompletedProcess:
@@ -305,23 +375,48 @@ def _stop_service(service: str) -> None:
 def _start_service(service: str, timeout: int = RECOVERY_WAIT) -> None:
     _compose("start", service)
     time.sleep(1)
-    _wait_for_service_http(service, timeout=timeout)
-    _refresh_gateway()
+    if service in HTTP_SERVICES:
+        _wait_for_service_http(service, timeout=timeout)
+        _refresh_gateway()
+    elif service in REDIS_SERVICES:
+        _wait_for_redis(service, timeout=timeout)
+    else:
+        raise ValueError(f"Unknown service: {service}")
+    _wait_for_orchestrator_transport_dependencies(timeout=timeout)
 
 
 def _ensure_services_started() -> None:
-    _compose("start", GATEWAY_SERVICE, ORDER_SERVICE, STOCK_SERVICE, PAYMENT_SERVICE)
+    _compose(
+        "up",
+        "-d",
+        ORDER_DB_SERVICE,
+        ORCHESTRATOR_DB_SERVICE,
+        STOCK_DB_SERVICE,
+        PAYMENT_DB_SERVICE,
+        GATEWAY_SERVICE,
+        ORCHESTRATOR_SERVICE,
+        ORDER_SERVICE,
+        STOCK_SERVICE,
+        PAYMENT_SERVICE,
+    )
+    _wait_for_redis(ORDER_DB_SERVICE)
+    _wait_for_redis(ORCHESTRATOR_DB_SERVICE)
+    _wait_for_redis(STOCK_DB_SERVICE)
+    _wait_for_redis(PAYMENT_DB_SERVICE)
+    _wait_for_service_http(ORCHESTRATOR_SERVICE)
     _wait_for_service_http(ORDER_SERVICE)
     _wait_for_service_http(STOCK_SERVICE)
     _wait_for_service_http(PAYMENT_SERVICE)
+    _wait_for_orchestrator_transport_dependencies()
     _refresh_gateway()
     _wait_for_gateway_routes()
 
 
 def _wait_for_service_http(service: str, timeout: int = RECOVERY_WAIT) -> None:
     paths = {
-        ORDER_SERVICE:   "/status/non-existent-order",
-        STOCK_SERVICE:   "/find/non-existent-item",
+        ORDER_SERVICE: "/status/non-existent-order",
+        ORCHESTRATOR_SERVICE: "/health",
+        STOCK_SERVICE: "/find/non-existent-item",
         PAYMENT_SERVICE: "/find_user/non-existent-user",
     }
     path = paths[service]
@@ -347,6 +442,71 @@ def _wait_for_service_http(service: str, timeout: int = RECOVERY_WAIT) -> None:
             return
         time.sleep(0.5)
     raise AssertionError(f"{service} did not become ready within {timeout}s")
+
+
+def _wait_for_redis(service: str, timeout: int = RECOVERY_WAIT) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        probe = _compose(
+            "exec", "-T", service,
+            "redis-cli", "-a", REDIS_PASSWORD, "PING",
+            check=False,
+        )
+        if probe.returncode == 0 and "PONG" in probe.stdout:
+            return
+        time.sleep(0.5)
+    raise AssertionError(f"{service} did not become ready within {timeout}s")
+
+
+def _wait_for_orchestrator_transport_dependencies(timeout: int = RECOVERY_WAIT) -> None:
+    deadline = time.time() + timeout
+    probe_script = (
+        "import os\n"
+        "import redis\n"
+        "targets = [\n"
+        "    (\n"
+        "        os.environ['ORDER_REDIS_HOST'],\n"
+        "        int(os.getenv('ORDER_REDIS_PORT', '6379')),\n"
+        "        os.environ['ORDER_REDIS_PASSWORD'],\n"
+        "        int(os.getenv('ORDER_REDIS_DB', '0')),\n"
+        "    ),\n"
+        "    (\n"
+        "        os.environ['STOCK_REDIS_HOST'],\n"
+        "        int(os.getenv('STOCK_REDIS_PORT', '6379')),\n"
+        "        os.environ['STOCK_REDIS_PASSWORD'],\n"
+        "        int(os.getenv('STOCK_REDIS_DB', '0')),\n"
+        "    ),\n"
+        "    (\n"
+        "        os.environ['PAYMENT_REDIS_HOST'],\n"
+        "        int(os.getenv('PAYMENT_REDIS_PORT', '6379')),\n"
+        "        os.environ['PAYMENT_REDIS_PASSWORD'],\n"
+        "        int(os.getenv('PAYMENT_REDIS_DB', '0')),\n"
+        "    ),\n"
+        "]\n"
+        "for host, port, password, db in targets:\n"
+        "    client = redis.Redis(\n"
+        "        host=host,\n"
+        "        port=port,\n"
+        "        password=password,\n"
+        "        db=db,\n"
+        "        socket_connect_timeout=1,\n"
+        "        socket_timeout=1,\n"
+        "    )\n"
+        "    client.ping()\n"
+    )
+
+    while time.time() < deadline:
+        probe = _compose(
+            "exec", "-T", ORCHESTRATOR_SERVICE,
+            "python", "-c", probe_script,
+            check=False,
+        )
+        if probe.returncode == 0:
+            return
+        time.sleep(0.5)
+    raise AssertionError(
+        f"{ORCHESTRATOR_SERVICE} did not reconnect to order-db/stock-db/payment-db within {timeout}s"
+    )
 
 
 def _refresh_gateway() -> None:
@@ -384,6 +544,20 @@ def _get_order_status_direct(order_id: str) -> str:
     return result.stdout.strip() or "pending"
 
 
+def _wait_for_order_status_in(
+    order_id: str,
+    expected_statuses: set[str],
+    timeout: int = 30,
+) -> str | None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status = _get_order_status_direct(order_id)
+        if status in expected_statuses:
+            return status
+        time.sleep(0.3)
+    return None
+
+
 def _wait_for_checkout_direct(order_id: str, timeout: int = RECOVERY_CHECKOUT_TIMEOUT) -> str:
     """Poll Redis directly (no HTTP) until a terminal status is set or timeout."""
     terminal = {"completed", "failed"}
@@ -413,7 +587,7 @@ def _wait_for_2pc_field(
     deadline = time.time() + timeout
     while time.time() < deadline:
         result = _compose(
-            "exec", "-T", ORDER_DB_SERVICE,
+            "exec", "-T", ORCHESTRATOR_DB_SERVICE,
             "redis-cli", "-a", REDIS_PASSWORD,
             "HGET", f"order:{order_id}:2pcstate", field,
             check=False,
@@ -422,6 +596,16 @@ def _wait_for_2pc_field(
             return True
         time.sleep(0.3)
     return False
+
+
+def _get_active_2pc_tx_id(order_id: str) -> str:
+    result = _compose(
+        "exec", "-T", ORCHESTRATOR_DB_SERVICE,
+        "redis-cli", "-a", REDIS_PASSWORD,
+        "GET", f"2pc:active:{order_id}",
+        check=False,
+    )
+    return result.stdout.strip()
 
 
 class TwoPC_DockerTestCase(unittest.TestCase):
@@ -440,7 +624,7 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
 
     def test_coordinator_crash_before_decision_resolves_completed(self):
         """
-        Coordinator (order-service) crashes with DECISION_NONE while stock-service
+        Coordinator (orchestrator-service) crashes with DECISION_NONE while stock-service
         is down. After both restart: stock picks up PREPARE_STOCK from Kafka, both
         participants confirm READY, coordinator commits → completed.
         """
@@ -470,24 +654,29 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
         )
 
         # Kill coordinator mid-flight: Redis has DECISION_NONE, PAYMENT_READY, STOCK_UNKNOWN
-        _kill_service(ORDER_SERVICE)
+        _kill_service(ORCHESTRATOR_SERVICE)
 
         # Restart coordinator (recover_incomplete_2pc runs; still no decision since
-        # stock hasn't replied yet), then stock (will pick up PREPARE_STOCK from Kafka)
-        _start_service(ORDER_SERVICE)
+        # stock hasn't replied yet), then stock (will pick up PREPARE_STOCK from Redis Streams)
+        _start_service(ORCHESTRATOR_SERVICE)
         _start_service(STOCK_SERVICE)
 
         status = _wait_for_checkout_direct(order_id)
         self.assertEqual(status, "completed", f"Expected completed, got: {status}")
-        response = _wait_for_background_checkout(thread, outcome)
-        self.assertIn(response.status_code, {200, 502})
+        response = _wait_for_background_checkout(
+            thread,
+            outcome,
+            allow_request_error=True,
+        )
+        if response is not None:
+            self.assertIn(response.status_code, {200, 502})
         self.assertEqual(tu.find_item(item_id)["stock"], 3)
         self.assertEqual(tu.find_user(user_id)["credit"], 30)
         self.assertTrue(tu.find_order(order_id)["paid"])
 
     def test_coordinator_crash_before_decision_resolves_failed(self):
         """
-        Coordinator crashes with DECISION_NONE while payment-service is down.
+        Coordinator (orchestrator-service) crashes with DECISION_NONE while payment-service is down.
         User has insufficient credit. After both restart: payment processes
         PREPARE_PAYMENT, fails → coordinator sends ABORT → stock locks released → failed.
         """
@@ -516,25 +705,30 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
         )
 
         # Kill coordinator: DECISION_NONE, STOCK_READY, PAYMENT_UNKNOWN
-        _kill_service(ORDER_SERVICE)
+        _kill_service(ORCHESTRATOR_SERVICE)
 
         # Restart coordinator + payment
-        _start_service(ORDER_SERVICE)
+        _start_service(ORCHESTRATOR_SERVICE)
         _start_service(PAYMENT_SERVICE)
 
         # Payment processes PREPARE_PAYMENT → fails (insufficient credit) →
         # PAYMENT_PREPARE_FAILED → coordinator ABORTs → ABORT_STOCK sent → locks released
         status = _wait_for_checkout_direct(order_id)
         self.assertEqual(status, "failed", f"Expected failed, got: {status}")
-        response = _wait_for_background_checkout(thread, outcome)
-        self.assertIn(response.status_code, {400, 502})
+        response = _wait_for_background_checkout(
+            thread,
+            outcome,
+            allow_request_error=True,
+        )
+        if response is not None:
+            self.assertIn(response.status_code, {400, 502})
         self.assertEqual(tu.find_item(item_id)["stock"], 5)
         self.assertEqual(tu.find_user(user_id)["credit"], 5)
 
     def test_stock_service_restart_during_prepare(self):
         """
         Stock-service is down when PREPARE_STOCK arrives. No coordinator crash.
-        After stock restarts it picks up the pending command from Kafka and the
+        After stock restarts it picks up the pending command from Redis Streams and the
         transaction completes normally.
         """
         print("\nRunning test_stock_service_restart_during_prepare...")
@@ -559,7 +753,7 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
             "payment_state did not become PAYMENT_READY before stock restart",
         )
 
-        # Restart stock — picks up PREPARE_STOCK from Kafka (auto_offset_reset="earliest")
+        # Restart stock — picks up PREPARE_STOCK from Redis Streams.
         _start_service(STOCK_SERVICE)
 
         status = _wait_for_checkout_direct(order_id)
@@ -573,7 +767,7 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
     def test_payment_service_restart_during_prepare(self):
         """
         Payment-service is down when PREPARE_PAYMENT arrives. No coordinator crash.
-        After payment restarts it picks up the pending command from Kafka and the
+        After payment restarts it picks up the pending command from Redis Streams and the
         transaction completes normally.
         """
         print("\nRunning test_payment_service_restart_during_prepare...")
@@ -598,7 +792,7 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
             "stock_state did not become STOCK_READY before payment restart",
         )
 
-        # Restart payment — picks up PREPARE_PAYMENT from Kafka
+        # Restart payment — picks up PREPARE_PAYMENT from Redis Streams.
         _start_service(PAYMENT_SERVICE)
 
         status = _wait_for_checkout_direct(order_id)

@@ -17,7 +17,7 @@ Coverage:
     - duplicate checkout and duplicate command idempotency
     - stale event safety
     - oversell prevention
-    - order-service restart recovery
+    - orchestrator-service restart recovery
     - timeout recovery while stock/payment are unavailable
 
 Database stop/kill recovery coverage lives in:
@@ -72,20 +72,24 @@ CONCURRENT_USERS = 5
 SAGA_TIMEOUT_SECONDS = 30
 
 ORDER_SERVICE = "order-service"
+ORCHESTRATOR_SERVICE = "orchestrator-service"
 STOCK_SERVICE = "stock-service"
 PAYMENT_SERVICE = "payment-service"
 ORDER_DB_SERVICE = "order-db"
+ORCHESTRATOR_DB_SERVICE = "orchestrator-db"
 STOCK_DB_SERVICE = "stock-db"
 PAYMENT_DB_SERVICE = "payment-db"
 GATEWAY_SERVICE = "gateway"
 REDIS_PASSWORD = "redis"
 HTTP_SERVICES = {
     ORDER_SERVICE,
+    ORCHESTRATOR_SERVICE,
     STOCK_SERVICE,
     PAYMENT_SERVICE,
 }
 REDIS_SERVICES = {
     ORDER_DB_SERVICE,
+    ORCHESTRATOR_DB_SERVICE,
     STOCK_DB_SERVICE,
     PAYMENT_DB_SERVICE,
 }
@@ -135,10 +139,10 @@ def _start_service(service: str, timeout: int = RECOVERY_WAIT) -> None:
     else:
         raise ValueError(f"Unknown service: {service}")
 
-    # The order service depends on both stock-db and payment-db for its
-    # internal transport. A green HTTP port alone is not enough after
-    # stop/kill tests; wait until it can resolve and ping both peers again.
-    _wait_for_order_transport_dependencies(timeout=timeout)
+    # The orchestrator owns the transport and status mirroring. A green HTTP
+    # port alone is not enough after stop/kill tests; wait until it can resolve
+    # and ping its Redis dependencies again.
+    _wait_for_orchestrator_transport_dependencies(timeout=timeout)
 
 
 def _ensure_services_started() -> None:
@@ -146,26 +150,32 @@ def _ensure_services_started() -> None:
         "up",
         "-d",
         ORDER_DB_SERVICE,
+        ORCHESTRATOR_DB_SERVICE,
         STOCK_DB_SERVICE,
         PAYMENT_DB_SERVICE,
         GATEWAY_SERVICE,
+        ORCHESTRATOR_SERVICE,
         ORDER_SERVICE,
         STOCK_SERVICE,
         PAYMENT_SERVICE,
     )
     _wait_for_redis(ORDER_DB_SERVICE)
+    _wait_for_redis(ORCHESTRATOR_DB_SERVICE)
     _wait_for_redis(STOCK_DB_SERVICE)
     _wait_for_redis(PAYMENT_DB_SERVICE)
+    _wait_for_service_http(ORCHESTRATOR_SERVICE)
     _wait_for_service_http(ORDER_SERVICE)
     _wait_for_service_http(STOCK_SERVICE)
     _wait_for_service_http(PAYMENT_SERVICE)
-    _wait_for_order_transport_dependencies()
+    _wait_for_orchestrator_transport_dependencies()
     _refresh_gateway()
     _wait_for_gateway_routes()
 
 
 def _wait_for_service_http(service: str, timeout: int = RECOVERY_WAIT) -> None:
-    if service == ORDER_SERVICE:
+    if service == ORCHESTRATOR_SERVICE:
+        path = "/health"
+    elif service == ORDER_SERVICE:
         path = "/status/non-existent-order"
     elif service == STOCK_SERVICE:
         path = "/find/non-existent-item"
@@ -226,13 +236,19 @@ def _wait_for_redis(service: str, timeout: int = RECOVERY_WAIT) -> None:
     raise AssertionError(f"{service} did not become ready within {timeout}s")
 
 
-def _wait_for_order_transport_dependencies(timeout: int = RECOVERY_WAIT) -> None:
+def _wait_for_orchestrator_transport_dependencies(timeout: int = RECOVERY_WAIT) -> None:
     deadline = time.time() + timeout
     probe_script = (
         "import os\n"
         "import sys\n"
         "import redis\n"
         "targets = [\n"
+        "    (\n"
+        "        os.environ['ORDER_REDIS_HOST'],\n"
+        "        int(os.getenv('ORDER_REDIS_PORT', '6379')),\n"
+        "        os.environ['ORDER_REDIS_PASSWORD'],\n"
+        "        int(os.getenv('ORDER_REDIS_DB', '0')),\n"
+        "    ),\n"
         "    (\n"
         "        os.environ['STOCK_REDIS_HOST'],\n"
         "        int(os.getenv('STOCK_REDIS_PORT', '6379')),\n"
@@ -262,7 +278,7 @@ def _wait_for_order_transport_dependencies(timeout: int = RECOVERY_WAIT) -> None
         probe = _compose(
             "exec",
             "-T",
-            ORDER_SERVICE,
+            ORCHESTRATOR_SERVICE,
             "python",
             "-c",
             probe_script,
@@ -273,7 +289,7 @@ def _wait_for_order_transport_dependencies(timeout: int = RECOVERY_WAIT) -> None
         time.sleep(0.5)
 
     raise AssertionError(
-        f"{ORDER_SERVICE} did not reconnect to stock-db/payment-db within {timeout}s"
+        f"{ORCHESTRATOR_SERVICE} did not reconnect to order-db/stock-db/payment-db within {timeout}s"
     )
 
 
@@ -393,11 +409,14 @@ def _finish_checkout_request(
     thread: threading.Thread,
     result: dict,
     timeout: int = CHECKOUT_TIMEOUT + 15,
-) -> requests.Response:
+    allow_request_error: bool = False,
+) -> requests.Response | None:
     thread.join(timeout)
     if thread.is_alive():
         raise AssertionError("checkout request thread did not finish in time")
     if "error" in result:
+        if allow_request_error:
+            return None
         raise AssertionError(f"checkout request failed: {result['error']}")
     response = result.get("response")
     if response is None:
@@ -471,7 +490,7 @@ def _publish_to_kafka(topic: str, message: dict) -> None:
     Publishes directly into the currently configured message transport.
 
     On this branch, that means writing a msgpack payload to the appropriate
-    Redis Stream via a short Python snippet executed inside order-service.
+    Redis Stream via a short Python snippet executed inside orchestrator-service.
     """
     publish_script = (
         "import json, sys\n"
@@ -486,7 +505,7 @@ def _publish_to_kafka(topic: str, message: dict) -> None:
     _compose(
         "exec",
         "-T",
-        ORDER_SERVICE,
+        ORCHESTRATOR_SERVICE,
         "python",
         "-c",
         publish_script,
@@ -691,7 +710,7 @@ class TestSagaStaleEvents(SagaDockerTestCase):
 
 
 class TestSagaRecovery(SagaDockerTestCase):
-    def test_order_service_restart_recovers_from_reserving_stock(self):
+    def test_orchestrator_restart_recovers_from_reserving_stock(self):
         user = _create_user()
         user_id = user["user_id"]
         tu.add_credit_to_user(user_id, 100)
@@ -709,16 +728,21 @@ class TestSagaRecovery(SagaDockerTestCase):
         thread, result = _start_checkout_request(order_id)
         self.assertTrue(wait_for_status(order_id, "reserving_stock", timeout=CHECKOUT_TIMEOUT))
 
-        _kill_service(ORDER_SERVICE)
-        _start_service(ORDER_SERVICE)
+        _kill_service(ORCHESTRATOR_SERVICE)
+        _start_service(ORCHESTRATOR_SERVICE)
         _start_service(STOCK_SERVICE)
 
-        _finish_checkout_request(thread, result, timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT)
+        _finish_checkout_request(
+            thread,
+            result,
+            timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT,
+            allow_request_error=True,
+        )
         self.assertEqual(wait_for_checkout(order_id), "completed")
         self.assertEqual(tu.find_item(item_id)["stock"], 4)
         self.assertEqual(tu.find_user(user_id)["credit"], 90)
 
-    def test_order_service_restart_recovers_from_processing_payment(self):
+    def test_orchestrator_restart_recovers_from_processing_payment(self):
         user = _create_user()
         user_id = user["user_id"]
         tu.add_credit_to_user(user_id, 100)
@@ -736,16 +760,21 @@ class TestSagaRecovery(SagaDockerTestCase):
         thread, result = _start_checkout_request(order_id)
         self.assertTrue(wait_for_status(order_id, "processing_payment", timeout=CHECKOUT_TIMEOUT))
 
-        _kill_service(ORDER_SERVICE)
-        _start_service(ORDER_SERVICE)
+        _kill_service(ORCHESTRATOR_SERVICE)
+        _start_service(ORCHESTRATOR_SERVICE)
         _start_service(PAYMENT_SERVICE)
 
-        _finish_checkout_request(thread, result, timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT)
+        _finish_checkout_request(
+            thread,
+            result,
+            timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT,
+            allow_request_error=True,
+        )
         self.assertEqual(wait_for_checkout(order_id), "completed")
         self.assertEqual(tu.find_item(item_id)["stock"], 4)
         self.assertEqual(tu.find_user(user_id)["credit"], 90)
 
-    def test_order_service_restart_recovers_from_compensating(self):
+    def test_orchestrator_restart_recovers_from_compensating(self):
         user = _create_user()
         user_id = user["user_id"]
         tu.add_credit_to_user(user_id, 5)
@@ -772,12 +801,17 @@ class TestSagaRecovery(SagaDockerTestCase):
 
             self.assertTrue(wait_for_status(order_id, "compensating", timeout=CHECKOUT_TIMEOUT))
 
-            _kill_service(ORDER_SERVICE)
-            _start_service(ORDER_SERVICE, timeout=RECOVERY_WAIT)
+            _kill_service(ORCHESTRATOR_SERVICE)
+            _start_service(ORCHESTRATOR_SERVICE, timeout=RECOVERY_WAIT)
             _start_service(STOCK_SERVICE, timeout=RECOVERY_WAIT)
             _start_service(PAYMENT_SERVICE, timeout=RECOVERY_WAIT)
 
-            _finish_checkout_request(thread, result, timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT)
+            _finish_checkout_request(
+                thread,
+                result,
+                timeout=CHECKOUT_TIMEOUT + RECOVERY_WAIT,
+                allow_request_error=True,
+            )
             self.assertEqual(wait_for_checkout(order_id, timeout=CHECKOUT_TIMEOUT), "failed")
             self.assertEqual(tu.find_item(item_id)["stock"], 5)
             self.assertEqual(tu.find_user(user_id)["credit"], 5)
