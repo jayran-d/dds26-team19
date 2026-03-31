@@ -1,7 +1,7 @@
 """
-test_kafka_simple.py
+test_streams_simple.py
 
-Tests for the simple transport-backed checkout mode.
+Tests for the simple Redis Streams-backed checkout mode.
 
 Assumes:
     - TRANSACTION_MODE=simple
@@ -51,7 +51,7 @@ def wait_for_checkout(order_id: str, timeout: int = CHECKOUT_TIMEOUT) -> str:
     return "timeout"
 
 
-class TestKafkaSimple(unittest.TestCase):
+class TestStreamsSimple(unittest.TestCase):
 
     def test_checkout_success(self):
         """

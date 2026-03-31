@@ -188,12 +188,16 @@ def _orphan_recovery_worker(
             log_worker_exception(_logger, "OrchestratorStreams", "orphan recovery worker", exc)
 
 
-def _timeout_loop(publish_fn) -> None:
-    while _available and TRANSACTION_MODE == "saga":
+def _recovery_loop(publish_fn) -> None:
+    while _available:
         try:
-            saga_check_timeouts(_coord_db, publish_fn, _logger)
+            if TRANSACTION_MODE == "saga":
+                saga_check_timeouts(_coord_db, publish_fn, _logger)
+            elif TRANSACTION_MODE == "2pc":
+                from protocols.two_pc import recover_incomplete_2pc
+                recover_incomplete_2pc()
         except Exception as exc:
-            log_worker_exception(_logger, "OrchestratorStreams", "timeout loop", exc)
+            log_worker_exception(_logger, "OrchestratorStreams", "recovery loop", exc)
         time.sleep(TIMEOUT_SCAN_INTERVAL)
 
 
@@ -228,11 +232,12 @@ def init_streams(logger, coord_db: redis_module.Redis) -> None:
     if TRANSACTION_MODE == "saga":
         init_saga(_order_db)
         saga_recover(_coord_db, publish_fn, logger)
-        threading.Thread(target=_timeout_loop, args=(publish_fn,), daemon=True).start()
     elif TRANSACTION_MODE == "2pc":
         from protocols.two_pc import init_2pc, recover_incomplete_2pc
         init_2pc(_coord_db, _order_db, publish_fn, logger)
         recover_incomplete_2pc()
+
+    threading.Thread(target=_recovery_loop, args=(publish_fn,), daemon=True).start()
 
     for i in range(CONSUMER_WORKERS):
         threading.Thread(

@@ -1,16 +1,16 @@
 """
-Saga integration tests for TRANSACTION_MODE=saga.
+Saga integration tests for TRANSACTION_MODE=saga using Redis Streams.
 
 Run from the repo root with:
 
-    python3 test/test_kafka_saga.py
+    python3 test/test_streams_saga.py
 
 Assumptions:
     - Docker Compose stack is already up
     - TRANSACTION_MODE=saga
     - /orders/checkout/<order_id> waits for a terminal Saga result on this branch
-    - Internal transport may be Kafka or Redis Streams; tests inject directly
-      into the currently configured transport via compose helpers.
+    - Internal transport is Redis Streams; tests inject directly into the
+      current transport via compose helpers.
 
 Coverage:
     - happy path and normal compensation
@@ -22,7 +22,7 @@ Coverage:
 
 Database stop/kill recovery coverage lives in:
 
-    python3 test/test_kafka_saga_databases.py
+    python3 test/test_streams_saga_databases.py
 
 What this does not deterministically cover:
     - the exact "participant applied locally but crashed before reply" line-level

@@ -7,6 +7,7 @@ Coordination state lives in coord_db (orchestrator-db).
 Order status is written to order_db (order-db) so order-service can poll.
 """
 
+import json
 import uuid
 from collections import defaultdict
 
@@ -242,6 +243,17 @@ def _clear_active_tx_id(order_id: str, tx_id: str) -> None:
         pass
 
 
+def _decode_items(raw: bytes | str | None) -> list[dict]:
+    if raw is None:
+        return []
+    try:
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        return json.loads(raw)
+    except Exception:
+        return []
+
+
 def _create_if_no_active(
     order_id: str,
     tx_id: str,
@@ -353,6 +365,17 @@ def recover_incomplete_2pc() -> None:
             except Exception:
                 pass
         if decision == DECISION_NONE:
+            stock_state = _decode(_coord_db.hget(key, "stock_state"), STOCK_UNKNOWN)
+            payment_state = _decode(_coord_db.hget(key, "payment_state"), PAYMENT_UNKNOWN)
+            if stock_state == STOCK_UNKNOWN:
+                items = _decode_items(_coord_db.hget(key, "items_json"))
+                if items:
+                    _publish_stock(build_prepare_stock(tx_id, order_id, items))
+            if payment_state == PAYMENT_UNKNOWN:
+                user_id = _decode(_coord_db.hget(key, "user_id"))
+                amount = _decode(_coord_db.hget(key, "amount"))
+                if user_id and amount:
+                    _publish_payment(build_prepare_payment(tx_id, order_id, user_id, int(amount)))
             _evaluate_2pc(order_id)
         elif decision == DECISION_COMMIT:
             if _decode(_coord_db.hget(key, "stock_commit_state"), STOCK_NOT_COMMITTED) != STOCK_COMMIT_CONFIRMED:
@@ -457,6 +480,9 @@ def _2pc_start_checkout(coord_db: redis_module.Redis, logger, order_id: str, use
             "decision": DECISION_NONE,
             "stock_commit_state": STOCK_NOT_COMMITTED,
             "payment_commit_state": PAYMENT_NOT_COMMITTED,
+            "user_id": str(user_id),
+            "amount": str(int(total_cost)),
+            "items_json": json.dumps(canonical_items),
         },
     )
 

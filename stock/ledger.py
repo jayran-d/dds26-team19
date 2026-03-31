@@ -12,7 +12,7 @@ Redis key format:
 
 Local states:
     received  → command arrived, ledger entry created, business effect not yet applied
-    applied   → business effect committed to Redis, reply not yet published to Kafka
+    applied   → business effect committed to Redis, reply not yet published to the event stream
     replied   → reply event published — fully done
 
 The transition  applied → replied  is the crash-safe gap.
@@ -147,7 +147,7 @@ def mark_replied(
 ) -> bool:
     """
     Transition ledger entry to state=replied.
-    Called after the reply event has been successfully published to Kafka.
+    Called after the reply event has been successfully published to the event stream.
     """
     global _mark_replied_script
     try:

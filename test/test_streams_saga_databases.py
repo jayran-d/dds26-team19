@@ -3,7 +3,7 @@ Redis stop/kill recovery tests for TRANSACTION_MODE=saga.
 
 Run from the repo root with:
 
-    python3 test/test_kafka_saga_databases.py
+    python3 test/test_streams_saga_databases.py
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import utils as tu
-from test_kafka_saga import (
+from test_streams_saga import (
     CHECKOUT_TIMEOUT,
     ORDER_DB_SERVICE,
     PAYMENT_DB_SERVICE,

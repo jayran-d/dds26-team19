@@ -16,10 +16,10 @@ This file does NOT contain:
     - Any service business logic
 
 Topic ownership:
-    stock.commands    <- order service writes, stock service reads
-    stock.events      <- stock service writes, order service reads
-    payment.commands  <- order service writes, payment service reads
-    payment.events    <- payment service writes, order service reads
+    stock.commands    <- orchestrator service writes, stock service reads
+    stock.events      <- stock service writes, orchestrator service reads
+    payment.commands  <- orchestrator service writes, payment service reads
+    payment.events    <- payment service writes, orchestrator service reads
 """
 
 import os

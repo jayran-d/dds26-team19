@@ -6,8 +6,7 @@ This project supports three runtime modes through `env/transaction.env`:
 - `saga`
 - `2pc`
 
-The transport is Redis Streams even though some test filenames still say
-`kafka`.
+The transport is Redis Streams.
 
 ## Daily Commands
 
@@ -80,10 +79,11 @@ startup.
 | File | What it covers | Notes |
 | --- | --- | --- |
 | `test/test_microservices.py` | Basic API correctness | Good smoke test in any mode |
-| `test/test_kafka_simple.py` | `simple` mode correctness | Historical name; now Redis Streams based |
-| `test/test_kafka_saga.py` | Saga integration and recovery | Historical name; now Redis Streams based |
-| `test/test_kafka_saga_databases.py` | Saga database stop/kill recovery | Good chaos suite |
+| `test/test_streams_simple.py` | `simple` mode correctness | Redis Streams-backed simple path |
+| `test/test_streams_saga.py` | Saga integration and recovery | Redis Streams-backed Saga path |
+| `test/test_streams_saga_databases.py` | Saga database stop/kill recovery | Saga chaos suite |
 | `test/test_2pc.py` | 2PC integration and recovery | Includes duplicate-checkout protection test |
+| `test/test_2pc_databases.py` | 2PC database stop/kill recovery | 2PC database chaos suite |
 
 ## Recommended Test Matrix
 
@@ -100,7 +100,7 @@ Run:
 ```bash
 docker compose up --build -d
 python3 -m unittest test.test_microservices
-python3 -m unittest test.test_kafka_simple
+python3 -m unittest test.test_streams_simple
 ```
 
 ### `saga` mode
@@ -116,12 +116,12 @@ Run:
 ```bash
 docker compose up --build -d
 python3 -m unittest test.test_microservices
-python3 -m unittest test.test_kafka_simple
-python3 -m unittest test.test_kafka_saga
-python3 -m unittest test.test_kafka_saga_databases
+python3 -m unittest test.test_streams_simple
+python3 -m unittest test.test_streams_saga
+python3 -m unittest test.test_streams_saga_databases
 ```
 
-`test_kafka_simple.py` still matters in saga mode because it checks the basic
+`test_streams_simple.py` still matters in saga mode because it checks the basic
 user-visible checkout behavior.
 
 ### `2pc` mode
@@ -138,28 +138,16 @@ Run:
 docker compose up --build -d
 python3 -m unittest test.test_microservices
 python3 -m unittest test.test_2pc
+python3 -m unittest test.test_2pc_databases
 ```
 
-## Current Naming Reality
+## 2PC Database Recovery
 
-The `kafka` test filenames are historical. They are testing Redis Streams now.
-If you want to rename them later, a cleaner naming scheme would be:
+The repository now also includes:
 
-- `test_streams_simple.py`
-- `test_streams_saga.py`
-- `test_streams_saga_databases.py`
+- `test/test_2pc_databases.py`
 
-I did not rename them in this documentation pass to avoid unnecessary churn in
-imports and CI commands.
-
-## Missing Test Worth Adding Next
-
-The main missing suite is:
-
-- `2pc` database stop/kill recovery
-
-There is already a Saga database recovery suite. Adding the equivalent for 2PC
-would strengthen the fault-tolerance story for the interview.
+That fills the biggest remaining database-chaos gap on the 2PC side.
 
 ## Stress Testing
 

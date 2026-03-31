@@ -625,7 +625,7 @@ class Test2pcRecovery(TwoPC_DockerTestCase):
     def test_coordinator_crash_before_decision_resolves_completed(self):
         """
         Coordinator (orchestrator-service) crashes with DECISION_NONE while stock-service
-        is down. After both restart: stock picks up PREPARE_STOCK from Kafka, both
+        is down. After both restart: stock picks up PREPARE_STOCK from Redis Streams, both
         participants confirm READY, coordinator commits → completed.
         """
         print("\nRunning test_coordinator_crash_before_decision_resolves_completed...")

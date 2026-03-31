@@ -39,6 +39,8 @@ After coding the REST endpoint logic run `docker-compose up --build` in the base
 
 - Architecture guide:
   [docs/architecture_guide.md](docs/architecture_guide.md)
+- Code walkthrough:
+  [docs/code_walkthrough.md](docs/code_walkthrough.md)
 - Testing guide:
   [docs/testing_guide.md](docs/testing_guide.md)
 - Gateway assessment:

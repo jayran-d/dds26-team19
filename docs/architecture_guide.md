@@ -1,8 +1,6 @@
 # Architecture Guide
 
 This repository now uses an extracted `orchestrator-service` plus Redis Streams.
-Some filenames still contain `kafka` for historical reasons, but the current
-transport is Redis Streams, not Kafka.
 
 ## High-Level Picture
 
@@ -12,7 +10,7 @@ flowchart LR
     Gateway --> Order
     Order --> Orchestrator
     Orchestrator --> OrderDB
-    Orchestrator --> OrchDB
+    Orchestrator --> OrchestratorDB
     Orchestrator --> StockDB
     Orchestrator --> PaymentDB
     Stock --> StockDB
@@ -76,17 +74,14 @@ flowchart LR
 - `env/*.env`
   Per-service Redis connection config and `TRANSACTION_MODE`.
 
-### Legacy phase-1 files still in the tree
+### Removed phase-1 coordinator code
 
-These files are not the current checkout hot path anymore:
+The old order-owned coordinator files were removed during cleanup. The source of
+truth for distributed transaction logic is now only:
 
-- `order/streams_worker.py`
-- `order/transactions_modes/`
-- `order/checkout_notify.py`
-
-They are leftovers from the order-owned coordinator design used before the
-orchestrator extraction. They should not be treated as the current source of
-truth for checkout orchestration.
+- `orchestrator/streams_worker.py`
+- `orchestrator/protocols/saga/`
+- `orchestrator/protocols/two_pc.py`
 
 ## Data Ownership
 
@@ -173,9 +168,6 @@ the deliverable for phase 2 much more closely.
 7. Mark final status and clear the active transaction claim.
 
 ## Redis Streams Transport
-
-The code still uses historical names like `test_kafka_saga.py`, but the actual
-transport is Redis Streams.
 
 Important ideas:
 
@@ -278,13 +270,12 @@ That pattern is expected because:
 - Docker Desktop log collection is not free
 - Saga has less coordination overhead than 2PC
 
-## Naming Note
+## Test Modules
 
-The following test filenames are historically named but no longer accurate:
+The current Streams-oriented test modules are:
 
-- `test/test_kafka_simple.py`
-- `test/test_kafka_saga.py`
-- `test/test_kafka_saga_databases.py`
-
-They test Redis Streams-based behavior now. Renaming them later would improve
-clarity, but it is not required for correctness.
+- `test/test_streams_simple.py`
+- `test/test_streams_saga.py`
+- `test/test_streams_saga_databases.py`
+- `test/test_2pc.py`
+- `test/test_2pc_databases.py`
