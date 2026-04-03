@@ -1,0 +1,373 @@
+name: dds-large
+
+x-http-healthcheck: &http-healthcheck
+  test:
+    - CMD
+    - python
+    - -c
+    - import socket; s = socket.create_connection(("127.0.0.1", 5000), 2); s.close()
+  interval: 5s
+  timeout: 3s
+  retries: 20
+  start_period: 5s
+
+x-redis-healthcheck: &redis-healthcheck
+  test: ["CMD-SHELL", "redis-cli -a redis ping | grep PONG"]
+  interval: 5s
+  timeout: 5s
+  retries: 10
+  start_period: 5s
+
+x-nofile-ulimits: &nofile-ulimits
+  nofile:
+    soft: 65536
+    hard: 65536
+
+x-order-service-base: &order-service-base
+  image: order:latest
+  restart: unless-stopped
+  environment:
+    - GATEWAY_URL=http://gateway:80
+    - STOCK_REDIS_HOST=stock-db
+    - STOCK_REDIS_PORT=6379
+    - STOCK_REDIS_PASSWORD=redis
+    - STOCK_REDIS_DB=0
+    - PAYMENT_REDIS_HOST=payment-db
+    - PAYMENT_REDIS_PORT=6379
+    - PAYMENT_REDIS_PASSWORD=redis
+    - PAYMENT_REDIS_DB=0
+    - CONSUMER_WORKERS=8
+    - STREAM_BATCH_SIZE=32
+    - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
+  command: >-
+    sh -lc '
+    if [ "$$VERBOSE_LOGS" = "true" ]; then
+      exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --log-level debug --access-logfile - app:app;
+    else
+      exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --log-level info app:app;
+    fi'
+  env_file:
+    - env/order_redis.env
+    - env/transaction.env
+  ulimits: *nofile-ulimits
+  healthcheck: *http-healthcheck
+  depends_on:
+    order-db:
+      condition: service_healthy
+    stock-db:
+      condition: service_healthy
+    payment-db:
+      condition: service_healthy
+  cpus: 2.0
+
+x-stock-service-base: &stock-service-base
+  image: stock:latest
+  restart: unless-stopped
+  environment:
+    - CONSUMER_WORKERS=8
+    - STREAM_BATCH_SIZE=32
+    - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
+  command: >-
+    sh -lc '
+    if [ "$$VERBOSE_LOGS" = "true" ]; then
+      exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=debug --access-logfile - app:app;
+    else
+      exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app;
+    fi'
+  env_file:
+    - env/stock_redis.env
+    - env/transaction.env
+  ulimits: *nofile-ulimits
+  healthcheck: *http-healthcheck
+  depends_on:
+    stock-db:
+      condition: service_healthy
+  cpus: 2.0
+
+x-payment-service-base: &payment-service-base
+  image: payment:latest
+  restart: unless-stopped
+  environment:
+    - CONSUMER_WORKERS=8
+    - STREAM_BATCH_SIZE=32
+    - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
+  command: >-
+    sh -lc '
+    if [ "$$VERBOSE_LOGS" = "true" ]; then
+      exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=debug --access-logfile - app:app;
+    else
+      exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app;
+    fi'
+  env_file:
+    - env/payment_redis.env
+    - env/transaction.env
+  ulimits: *nofile-ulimits
+  healthcheck: *http-healthcheck
+  depends_on:
+    payment-db:
+      condition: service_healthy
+  cpus: 2.0
+
+x-redis-base: &redis-base
+  image: redis:7.2-bookworm
+  restart: unless-stopped
+  command: >-
+    redis-server --requirepass redis --maxmemory 512mb
+    --appendonly yes --appendfsync everysec
+    --save ""
+    --auto-aof-rewrite-min-size 256mb
+    --auto-aof-rewrite-percentage 200
+    --dir /data
+  healthcheck: *redis-healthcheck
+  cpus: 1.0
+
+services:
+  gateway:
+    image: nginx:1.25-bookworm
+    restart: unless-stopped
+    volumes:
+      - ./gateway_nginx.large.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8000:80"
+    ulimits: *nofile-ulimits
+    depends_on:
+      order-service:
+        condition: service_healthy
+      order-service-2:
+        condition: service_healthy
+      order-service-3:
+        condition: service_healthy
+      order-service-4:
+        condition: service_healthy
+      order-service-5:
+        condition: service_healthy
+      order-service-6:
+        condition: service_healthy
+      order-service-7:
+        condition: service_healthy
+      order-service-8:
+        condition: service_healthy
+      order-service-9:
+        condition: service_healthy
+      order-service-10:
+        condition: service_healthy
+      order-service-11:
+        condition: service_healthy
+      order-service-12:
+        condition: service_healthy
+      order-service-13:
+        condition: service_healthy
+      order-service-14:
+        condition: service_healthy
+      stock-service:
+        condition: service_healthy
+      stock-service-2:
+        condition: service_healthy
+      stock-service-3:
+        condition: service_healthy
+      stock-service-4:
+        condition: service_healthy
+      stock-service-5:
+        condition: service_healthy
+      stock-service-6:
+        condition: service_healthy
+      stock-service-7:
+        condition: service_healthy
+      stock-service-8:
+        condition: service_healthy
+      stock-service-9:
+        condition: service_healthy
+      stock-service-10:
+        condition: service_healthy
+      stock-service-11:
+        condition: service_healthy
+      stock-service-12:
+        condition: service_healthy
+      stock-service-13:
+        condition: service_healthy
+      stock-service-14:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
+      payment-service-2:
+        condition: service_healthy
+      payment-service-3:
+        condition: service_healthy
+      payment-service-4:
+        condition: service_healthy
+      payment-service-5:
+        condition: service_healthy
+      payment-service-6:
+        condition: service_healthy
+      payment-service-7:
+        condition: service_healthy
+      payment-service-8:
+        condition: service_healthy
+      payment-service-9:
+        condition: service_healthy
+      payment-service-10:
+        condition: service_healthy
+      payment-service-11:
+        condition: service_healthy
+      payment-service-12:
+        condition: service_healthy
+      payment-service-13:
+        condition: service_healthy
+      payment-service-14:
+        condition: service_healthy
+    cpus: 3.0
+
+  order-service:
+    <<: *order-service-base
+    build:
+      context: .
+      dockerfile: order/Dockerfile
+
+  order-service-2:
+    <<: *order-service-base
+
+  order-service-3:
+    <<: *order-service-base
+
+  order-service-4:
+    <<: *order-service-base
+
+  order-service-5:
+    <<: *order-service-base
+
+  order-service-6:
+    <<: *order-service-base
+
+  order-service-7:
+    <<: *order-service-base
+
+  order-service-8:
+    <<: *order-service-base
+
+  order-service-9:
+    <<: *order-service-base
+
+  order-service-10:
+    <<: *order-service-base
+
+  order-service-11:
+    <<: *order-service-base
+
+  order-service-12:
+    <<: *order-service-base
+
+  order-service-13:
+    <<: *order-service-base
+
+  order-service-14:
+    <<: *order-service-base
+
+  order-db:
+    <<: *redis-base
+    volumes:
+      - order-db-data:/data
+
+  stock-service:
+    <<: *stock-service-base
+    build:
+      context: .
+      dockerfile: stock/Dockerfile
+
+  stock-service-2:
+    <<: *stock-service-base
+
+  stock-service-3:
+    <<: *stock-service-base
+
+  stock-service-4:
+    <<: *stock-service-base
+
+  stock-service-5:
+    <<: *stock-service-base
+
+  stock-service-6:
+    <<: *stock-service-base
+
+  stock-service-7:
+    <<: *stock-service-base
+
+  stock-service-8:
+    <<: *stock-service-base
+
+  stock-service-9:
+    <<: *stock-service-base
+
+  stock-service-10:
+    <<: *stock-service-base
+
+  stock-service-11:
+    <<: *stock-service-base
+
+  stock-service-12:
+    <<: *stock-service-base
+
+  stock-service-13:
+    <<: *stock-service-base
+
+  stock-service-14:
+    <<: *stock-service-base
+
+  stock-db:
+    <<: *redis-base
+    volumes:
+      - stock-db-data:/data
+
+  payment-service:
+    <<: *payment-service-base
+    build:
+      context: .
+      dockerfile: payment/Dockerfile
+
+  payment-service-2:
+    <<: *payment-service-base
+
+  payment-service-3:
+    <<: *payment-service-base
+
+  payment-service-4:
+    <<: *payment-service-base
+
+  payment-service-5:
+    <<: *payment-service-base
+
+  payment-service-6:
+    <<: *payment-service-base
+
+  payment-service-7:
+    <<: *payment-service-base
+
+  payment-service-8:
+    <<: *payment-service-base
+
+  payment-service-9:
+    <<: *payment-service-base
+
+  payment-service-10:
+    <<: *payment-service-base
+
+  payment-service-11:
+    <<: *payment-service-base
+
+  payment-service-12:
+    <<: *payment-service-base
+
+  payment-service-13:
+    <<: *payment-service-base
+
+  payment-service-14:
+    <<: *payment-service-base
+
+  payment-db:
+    <<: *redis-base
+    volumes:
+      - payment-db-data:/data
+
+volumes:
+  order-db-data:
+  stock-db-data:
+  payment-db-data:
