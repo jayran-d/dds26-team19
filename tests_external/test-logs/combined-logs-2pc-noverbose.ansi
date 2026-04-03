@@ -1,0 +1,17 @@
+[1;33m[orchestrator-service] [0morchestrator-service-1  | [2026-04-03 11:19:58 +0000] [1] [INFO] Starting gunicorn 22.0.0
+[1;33m[orchestrator-service] [0morchestrator-service-1  | [2026-04-03 11:19:58 +0000] [1] [INFO] Listening at: http://0.0.0.0:5000 (1)
+[1;33m[orchestrator-service] [0morchestrator-service-1  | [2026-04-03 11:19:58 +0000] [1] [INFO] Using worker: sync
+[1;33m[orchestrator-service] [0morchestrator-service-1  | [2026-04-03 11:19:58 +0000] [9] [INFO] Booting worker with pid: 9
+[1;33m[orchestrator-service] [0morchestrator-service-1  | [2026-04-03 11:19:58 +0000] [9] [INFO] [OrchestratorStreams] 8 stock.events + 8 payment.events workers started (mode=2pc)
+[1;32m[stock-service] [0mstock-service-1         | [2026-04-03 11:19:57 +0000] [1] [INFO] Starting gunicorn 21.2.0
+[1;32m[stock-service] [0mstock-service-1         | [2026-04-03 11:19:57 +0000] [1] [INFO] Listening at: http://0.0.0.0:5000 (1)
+[1;32m[stock-service] [0mstock-service-1         | [2026-04-03 11:19:57 +0000] [1] [INFO] Using worker: sync
+[1;32m[stock-service] [0mstock-service-1         | [2026-04-03 11:19:57 +0000] [10] [INFO] Booting worker with pid: 10
+[1;32m[stock-service] [0mstock-service-1         | [2026-04-03 11:19:59 +0000] [10] [INFO] [StockStreams] 8 consumer workers started (mode=2pc)
+[1;32m[stock-service] [0mstock-service-1         | [2026-04-03 11:20:23 +0000] [10] [INFO] Item: b02ea11d-ef99-47c4-ad6c-fe235dbe9844 created
+[1;34m[payment-service] [0mpayment-service-1       | [2026-04-03 11:19:57 +0000] [1] [INFO] Starting gunicorn 21.2.0
+[1;34m[payment-service] [0mpayment-service-1       | [2026-04-03 11:19:57 +0000] [1] [INFO] Listening at: http://0.0.0.0:5000 (1)
+[1;34m[payment-service] [0mpayment-service-1       | [2026-04-03 11:19:57 +0000] [1] [INFO] Using worker: sync
+[1;34m[payment-service] [0mpayment-service-1       | [2026-04-03 11:19:57 +0000] [10] [INFO] Booting worker with pid: 10
+[1;34m[payment-service] [0mpayment-service-1       | [2026-04-03 11:19:59 +0000] [10] [INFO] [PaymentStreams] 8 consumer workers started (mode=2pc)
+[1;35m[order-service] [0morder-service-1         | [2026-04-03 11:20:04 +0000] [11] [INFO] Running on http://0.0.0.0:5000 (CTRL + C to quit)
