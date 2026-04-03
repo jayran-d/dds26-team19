@@ -5,3 +5,4 @@ __pycache__
 broker_logs.txt
 test/__pycache__
 .env
+venv
