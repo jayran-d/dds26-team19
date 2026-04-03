@@ -41,9 +41,9 @@ services:
     command: >-
       sh -lc '
       if [ "$$VERBOSE_LOGS" = "true" ]; then
-        exec hypercorn -b 0.0.0.0:5000 -w 1 --graceful-timeout 30 --log-level debug --access-logfile - app:app;
+        exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --log-level debug --access-logfile - app:app;
       else
-        exec hypercorn -b 0.0.0.0:5000 -w 1 --graceful-timeout 30 --log-level info app:app;
+        exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --log-level info app:app;
       fi'
     env_file:
       - env/order_redis.env
