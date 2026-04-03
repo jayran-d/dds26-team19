@@ -1,4 +1,4 @@
-name: dds-medium
+name: dds-large
 
 x-http-healthcheck: &http-healthcheck
   test:
@@ -47,8 +47,8 @@ x-order-service-base: &order-service-base
       exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --log-level info app:app;
     fi'
   env_file:
-    - env/order_redis.env
-    - env/transaction.env
+    - ../../env/order_redis.env
+    - ../../env/transaction.env
   ulimits: *nofile-ulimits
   healthcheck: *http-healthcheck
   depends_on:
@@ -75,8 +75,8 @@ x-stock-service-base: &stock-service-base
       exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app;
     fi'
   env_file:
-    - env/stock_redis.env
-    - env/transaction.env
+    - ../../env/stock_redis.env
+    - ../../env/transaction.env
   ulimits: *nofile-ulimits
   healthcheck: *http-healthcheck
   depends_on:
@@ -99,8 +99,8 @@ x-payment-service-base: &payment-service-base
       exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app;
     fi'
   env_file:
-    - env/payment_redis.env
-    - env/transaction.env
+    - ../../env/payment_redis.env
+    - ../../env/transaction.env
   ulimits: *nofile-ulimits
   healthcheck: *http-healthcheck
   depends_on:
@@ -119,14 +119,14 @@ x-redis-base: &redis-base
     --auto-aof-rewrite-percentage 200
     --dir /data
   healthcheck: *redis-healthcheck
-  cpus: 2.0
+  cpus: 1.0
 
 services:
   gateway:
     image: nginx:1.25-bookworm
     restart: unless-stopped
     volumes:
-      - ./gateway_nginx.medium.conf:/etc/nginx/nginx.conf:ro
+      - ../../nginx/gateway_nginx.large.conf:/etc/nginx/nginx.conf:ro
     ports:
       - "8000:80"
     ulimits: *nofile-ulimits
@@ -145,6 +145,20 @@ services:
         condition: service_healthy
       order-service-7:
         condition: service_healthy
+      order-service-8:
+        condition: service_healthy
+      order-service-9:
+        condition: service_healthy
+      order-service-10:
+        condition: service_healthy
+      order-service-11:
+        condition: service_healthy
+      order-service-12:
+        condition: service_healthy
+      order-service-13:
+        condition: service_healthy
+      order-service-14:
+        condition: service_healthy
       stock-service:
         condition: service_healthy
       stock-service-2:
@@ -158,6 +172,20 @@ services:
       stock-service-6:
         condition: service_healthy
       stock-service-7:
+        condition: service_healthy
+      stock-service-8:
+        condition: service_healthy
+      stock-service-9:
+        condition: service_healthy
+      stock-service-10:
+        condition: service_healthy
+      stock-service-11:
+        condition: service_healthy
+      stock-service-12:
+        condition: service_healthy
+      stock-service-13:
+        condition: service_healthy
+      stock-service-14:
         condition: service_healthy
       payment-service:
         condition: service_healthy
@@ -173,12 +201,26 @@ services:
         condition: service_healthy
       payment-service-7:
         condition: service_healthy
-    cpus: 2.0
+      payment-service-8:
+        condition: service_healthy
+      payment-service-9:
+        condition: service_healthy
+      payment-service-10:
+        condition: service_healthy
+      payment-service-11:
+        condition: service_healthy
+      payment-service-12:
+        condition: service_healthy
+      payment-service-13:
+        condition: service_healthy
+      payment-service-14:
+        condition: service_healthy
+    cpus: 3.0
 
   order-service:
     <<: *order-service-base
     build:
-      context: .
+      context: ../..
       dockerfile: order/Dockerfile
 
   order-service-2:
@@ -199,6 +241,27 @@ services:
   order-service-7:
     <<: *order-service-base
 
+  order-service-8:
+    <<: *order-service-base
+
+  order-service-9:
+    <<: *order-service-base
+
+  order-service-10:
+    <<: *order-service-base
+
+  order-service-11:
+    <<: *order-service-base
+
+  order-service-12:
+    <<: *order-service-base
+
+  order-service-13:
+    <<: *order-service-base
+
+  order-service-14:
+    <<: *order-service-base
+
   order-db:
     <<: *redis-base
     volumes:
@@ -207,7 +270,7 @@ services:
   stock-service:
     <<: *stock-service-base
     build:
-      context: .
+      context: ../..
       dockerfile: stock/Dockerfile
 
   stock-service-2:
@@ -228,6 +291,27 @@ services:
   stock-service-7:
     <<: *stock-service-base
 
+  stock-service-8:
+    <<: *stock-service-base
+
+  stock-service-9:
+    <<: *stock-service-base
+
+  stock-service-10:
+    <<: *stock-service-base
+
+  stock-service-11:
+    <<: *stock-service-base
+
+  stock-service-12:
+    <<: *stock-service-base
+
+  stock-service-13:
+    <<: *stock-service-base
+
+  stock-service-14:
+    <<: *stock-service-base
+
   stock-db:
     <<: *redis-base
     volumes:
@@ -236,7 +320,7 @@ services:
   payment-service:
     <<: *payment-service-base
     build:
-      context: .
+      context: ../..
       dockerfile: payment/Dockerfile
 
   payment-service-2:
@@ -255,6 +339,27 @@ services:
     <<: *payment-service-base
 
   payment-service-7:
+    <<: *payment-service-base
+
+  payment-service-8:
+    <<: *payment-service-base
+
+  payment-service-9:
+    <<: *payment-service-base
+
+  payment-service-10:
+    <<: *payment-service-base
+
+  payment-service-11:
+    <<: *payment-service-base
+
+  payment-service-12:
+    <<: *payment-service-base
+
+  payment-service-13:
+    <<: *payment-service-base
+
+  payment-service-14:
     <<: *payment-service-base
 
   payment-db:

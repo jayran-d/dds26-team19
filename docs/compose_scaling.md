@@ -2,9 +2,9 @@
 
 This repository now includes three dedicated Docker Compose layouts for the 96-core environment:
 
-- `docker-compose.small.yml`: 1 instance of each application service and 1 Redis per bounded context.
-- `docker-compose.medium.yml`: fixed 50 CPU allocation.
-- `docker-compose.large.yml`: fixed 90 CPU allocation.
+- `docker/compose/docker-compose.small.yml`: 1 instance of each application service and 1 Redis per bounded context.
+- `docker/compose/docker-compose.medium.yml`: fixed 50 CPU allocation.
+- `docker/compose/docker-compose.large.yml`: fixed 90 CPU allocation.
 
 ## CPU budgets
 
@@ -36,9 +36,9 @@ Total budget: **90 CPUs**
 
 Each scaling profile uses its own nginx config:
 
-- `gateway_nginx.small.conf`
-- `gateway_nginx.medium.conf`
-- `gateway_nginx.large.conf`
+- `nginx/gateway_nginx.small.conf`
+- `nginx/gateway_nginx.medium.conf`
+- `nginx/gateway_nginx.large.conf`
 
 The medium and large configs declare every backend replica explicitly and use Docker DNS re-resolution (`resolve` with `127.0.0.11`) so nginx does not stay pinned to a stale container IP.
 
@@ -62,4 +62,4 @@ make medium-down
 
 - Run only one profile at a time unless you also change host port mappings.
 - The first replica of each application service performs the image build; the other replicas reuse the same image tag.
-- Existing `docker-compose.yml` is left unchanged for backwards compatibility.
+- The baseline compose file is now located at `docker/compose/docker-compose.yml`.

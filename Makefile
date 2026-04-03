@@ -1,8 +1,8 @@
 COMPOSE ?= docker compose
 
-SMALL_FILE := docker-compose.small.yml
-MEDIUM_FILE := docker-compose.medium.yml
-LARGE_FILE := docker-compose.large.yml
+SMALL_FILE := docker/compose/docker-compose.small.yml
+MEDIUM_FILE := docker/compose/docker-compose.medium.yml
+LARGE_FILE := docker/compose/docker-compose.large.yml
 
 SMALL_PROJECT := dds-small
 MEDIUM_PROJECT := dds-medium
@@ -19,7 +19,7 @@ small-up:
 	$(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) up -d --build
 
 small-down:
-	$(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) down
+	$(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) down -v
 
 small-logs:
 	$(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) logs -f
@@ -34,7 +34,7 @@ medium-up:
 	$(COMPOSE) -p $(MEDIUM_PROJECT) -f $(MEDIUM_FILE) up -d --build
 
 medium-down:
-	$(COMPOSE) -p $(MEDIUM_PROJECT) -f $(MEDIUM_FILE) down
+	$(COMPOSE) -p $(MEDIUM_PROJECT) -f $(MEDIUM_FILE) down -v
 
 medium-logs:
 	$(COMPOSE) -p $(MEDIUM_PROJECT) -f $(MEDIUM_FILE) logs -f
@@ -49,7 +49,7 @@ large-up:
 	$(COMPOSE) -p $(LARGE_PROJECT) -f $(LARGE_FILE) up -d --build
 
 large-down:
-	$(COMPOSE) -p $(LARGE_PROJECT) -f $(LARGE_FILE) down
+	$(COMPOSE) -p $(LARGE_PROJECT) -f $(LARGE_FILE) down -v
 
 large-logs:
 	$(COMPOSE) -p $(LARGE_PROJECT) -f $(LARGE_FILE) logs -f
