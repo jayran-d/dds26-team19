@@ -29,8 +29,10 @@ async def create_order(session, url):
         return jsn['order_id']
 
 
-async def post_and_get_status(session, url, checkout=None):
+async def post_and_get_status(session, url, checkout=None, status_count=None):
     async with session.post(url) as resp:
+        if status_count is not None:
+            status_count[resp.status] = status_count.get(resp.status, 0) + 1
         if checkout:
             if 400 <= resp.status < 500:
                 log = f"CHECKOUT | ORDER: {checkout[0]} USER: {checkout[1]} FAIL __OUR_LOG__\n"
@@ -62,12 +64,14 @@ async def create_orders(session, item_ids, user_ids, number_of_orders):
 
 
 async def perform_checkouts(session, order_ids, orders_user_id, log_file):
+    status_count = {}
     tasks = []
     for i, order_id in enumerate(order_ids):
         url = f"{ORDER_URL}/orders/checkout/{order_id}"
         tasks.append(asyncio.ensure_future(post_and_get_status(session, url,
-                                                               checkout=(order_id, orders_user_id[i], log_file))))
+        checkout=(order_id, orders_user_id[i], log_file), status_count=status_count)))
     order_responses = await asyncio.gather(*tasks)
+    logger.info(f"Checkout status counts: {dict(sorted(status_count.items()))}")
     return order_responses
 
 
