@@ -25,6 +25,9 @@ REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
 CHECKOUT_WAIT_TIMEOUT_SECONDS = float(os.getenv("CHECKOUT_WAIT_TIMEOUT_SECONDS", "45"))
+CHECKOUT_STATUS_POLL_INTERVAL_SECONDS = float(
+    os.getenv("CHECKOUT_STATUS_POLL_INTERVAL_SECONDS", "0.2")
+)
 VERBOSE_LOGS = os.getenv("VERBOSE_LOGS", "false").lower() == "true"
 
 TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "saga")
@@ -42,6 +45,18 @@ else:
         SagaOrderStatus.PROCESSING_PAYMENT,
         SagaOrderStatus.COMPENSATING,
     }
+
+TERMINAL_SUCCESS_STATUSES = {
+    SagaOrderStatus.COMPLETED,
+    TwoPhaseOrderStatus.COMPLETED,
+}
+
+TERMINAL_FAILURE_STATUSES = {
+    SagaOrderStatus.FAILED,
+    TwoPhaseOrderStatus.FAILED,
+}
+
+TERMINAL_STATUSES = TERMINAL_SUCCESS_STATUSES | TERMINAL_FAILURE_STATUSES
 
 app = Quart("order-service")
 
@@ -130,18 +145,38 @@ async def _build_terminal_checkout_response(
     order_id: str,
     waiter: asyncio.Future,
 ) -> Response:
-    try:
-        await asyncio.wait_for(waiter, timeout=CHECKOUT_WAIT_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + CHECKOUT_WAIT_TIMEOUT_SECONDS
+    final_status: str | None = None
+
+    while loop.time() < deadline:
+        final_status = await get_order_status_async(order_id)
+        if final_status in TERMINAL_STATUSES:
+            break
+
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(waiter),
+                timeout=min(CHECKOUT_STATUS_POLL_INTERVAL_SECONDS, remaining),
+            )
+        except asyncio.TimeoutError:
+            continue
+
+    if final_status not in TERMINAL_STATUSES:
+        final_status = await get_order_status_async(order_id)
+
+    if final_status not in TERMINAL_STATUSES:
         return Response(
             "Checkout timed out before reaching a terminal state",
             status=400,
             headers={"Location": f"/orders/status/{order_id}"},
         )
 
-    final_status = await get_order_status_async(order_id) or (TwoPhaseOrderStatus.PENDING if TRANSACTION_MODE == "2pc" else SagaOrderStatus.PENDING)
-
-    if final_status in {SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED}:
+    if final_status in TERMINAL_SUCCESS_STATUSES:
         return Response(
             "Checkout successful",
             status=200,
