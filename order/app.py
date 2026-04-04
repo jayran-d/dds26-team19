@@ -7,20 +7,20 @@ import uuid
 
 import redis
 import requests
-from msgspec import msgpack, Struct
-from quart import Quart, jsonify, abort, Response
+from msgspec import Struct, msgpack
+from quart import Quart, Response, abort, jsonify
 
 from common.messages import SagaOrderStatus, TwoPhaseOrderStatus
 
-DB_ERROR_STR  = "DB error"
+DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
-GATEWAY_URL      = os.environ['GATEWAY_URL']
-ORCHESTRATOR_URL = os.environ.get('ORCHESTRATOR_URL', 'http://orchestrator-service:5000')
+GATEWAY_URL = os.environ["GATEWAY_URL"]
+ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "http://orchestrator-service:5000")
 CHECKOUT_WAIT_TIMEOUT_SECONDS = float(os.getenv("CHECKOUT_WAIT_TIMEOUT_SECONDS", "45"))
 VERBOSE_LOGS = os.getenv("VERBOSE_LOGS", "false").lower() == "true"
 
-CHECKOUT_POLL_INTERVAL = float(os.getenv("CHECKOUT_POLL_INTERVAL", "0.02"))  # 20 ms
+CHECKOUT_POLL_INTERVAL = float(os.getenv("CHECKOUT_POLL_INTERVAL", "0.02"))
 
 IN_PROGRESS_STATUSES = {
     SagaOrderStatus.RESERVING_STOCK,
@@ -32,20 +32,25 @@ IN_PROGRESS_STATUSES = {
     TwoPhaseOrderStatus.ABORTING,
 }
 
-TERMINAL_STATUSES = {
+TERMINAL_SUCCESS_STATUSES = {
     SagaOrderStatus.COMPLETED,
-    SagaOrderStatus.FAILED,
     TwoPhaseOrderStatus.COMPLETED,
+}
+
+TERMINAL_FAILURE_STATUSES = {
+    SagaOrderStatus.FAILED,
     TwoPhaseOrderStatus.FAILED,
 }
+
+TERMINAL_STATUSES = TERMINAL_SUCCESS_STATUSES | TERMINAL_FAILURE_STATUSES
 
 app = Quart("order-service")
 
 db: redis.Redis = redis.Redis(
-    host=os.environ['REDIS_HOST'],
-    port=int(os.environ['REDIS_PORT']),
-    password=os.environ['REDIS_PASSWORD'],
-    db=int(os.environ['REDIS_DB']),
+    host=os.environ["REDIS_HOST"],
+    port=int(os.environ["REDIS_PORT"]),
+    password=os.environ["REDIS_PASSWORD"],
+    db=int(os.environ["REDIS_DB"]),
     socket_connect_timeout=2,
     socket_timeout=2,
     retry_on_timeout=True,
@@ -53,7 +58,7 @@ db: redis.Redis = redis.Redis(
 )
 
 
-def close_connections():
+def close_connections() -> None:
     db.close()
 
 
@@ -72,10 +77,10 @@ def get_order_from_db(order_id: str) -> OrderValue | None:
         entry: bytes = db.get(order_id)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
-    if entry is None:
+    decoded: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
+    if decoded is None:
         abort(400, f"Order: {order_id} not found!")
-    return entry
+    return decoded
 
 
 def get_order_status(order_id: str) -> str | None:
@@ -123,11 +128,8 @@ async def get_order_and_status_async(order_id: str) -> tuple[OrderValue | None, 
 
 
 async def _poll_for_terminal_status(order_id: str) -> Response:
-    """
-    Poll order:{id}:status in order-db until a terminal state appears or timeout.
-    The orchestrator writes to this key when the saga/2pc finishes.
-    """
-    loop     = asyncio.get_event_loop()
+    """Poll shared order-db status until the orchestrator reaches a terminal state."""
+    loop = asyncio.get_running_loop()
     deadline = loop.time() + CHECKOUT_WAIT_TIMEOUT_SECONDS
 
     while True:
@@ -142,12 +144,13 @@ async def _poll_for_terminal_status(order_id: str) -> Response:
             )
         await asyncio.sleep(CHECKOUT_POLL_INTERVAL)
 
-    if status in {SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED}:
+    if status in TERMINAL_SUCCESS_STATUSES:
         return Response(
             "Checkout successful",
             status=200,
             headers={"Location": f"/orders/status/{order_id}"},
         )
+
     return Response(
         "Checkout failed",
         status=400,
@@ -156,7 +159,7 @@ async def _poll_for_terminal_status(order_id: str) -> Response:
 
 
 def _build_checkout_response_from_status(order_id: str, status: str) -> Response:
-    if status in {SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED}:
+    if status in TERMINAL_SUCCESS_STATUSES:
         return Response(
             "Checkout successful",
             status=200,
@@ -178,7 +181,7 @@ async def _resolve_uncertain_checkout_start(order_id: str) -> Response | None:
     return None
 
 
-@app.post('/create/<user_id>')
+@app.post("/create/<user_id>")
 def create_order(user_id: str):
     key = str(uuid.uuid4())
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
@@ -186,18 +189,18 @@ def create_order(user_id: str):
         db.set(key, value)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    return jsonify({'order_id': key})
+    return jsonify({"order_id": key})
 
 
-@app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
+@app.post("/batch_init/<n>/<n_items>/<n_users>/<item_price>")
 def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
-    n          = int(n)
-    n_items    = int(n_items)
-    n_users    = int(n_users)
+    n = int(n)
+    n_items = int(n_items)
+    n_users = int(n_users)
     item_price = int(item_price)
 
     def generate_entry() -> OrderValue:
-        user_id  = random.randint(0, n_users - 1)
+        user_id = random.randint(0, n_users - 1)
         item1_id = random.randint(0, n_items - 1)
         item2_id = random.randint(0, n_items - 1)
         return OrderValue(
@@ -215,26 +218,26 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     return jsonify({"msg": "Batch init for orders successful"})
 
 
-@app.get('/find/<order_id>')
+@app.get("/find/<order_id>")
 def find_order(order_id: str):
     order_entry, status = get_order_and_status(order_id)
-    return jsonify({
-        "order_id":   order_id,
-        "paid":       order_entry.paid or status in {SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED},
-        "items":      order_entry.items,
-        "user_id":    order_entry.user_id,
-        "total_cost": order_entry.total_cost,
-    })
+    return jsonify(
+        {
+            "order_id": order_id,
+            "paid": order_entry.paid or status in TERMINAL_SUCCESS_STATUSES,
+            "items": order_entry.items,
+            "user_id": order_entry.user_id,
+            "total_cost": order_entry.total_cost,
+        }
+    )
 
 
-@app.get('/status/<order_id>')
+@app.get("/status/<order_id>")
 def order_status(order_id: str):
-    get_order_from_db(order_id)  # 400 if not found
+    get_order_from_db(order_id)
     status = get_order_status(order_id)
-    return jsonify({
-        "order_id": order_id,
-        "status":   status or SagaOrderStatus.PENDING,
-    })
+    default_status = TwoPhaseOrderStatus.PENDING if os.getenv("TRANSACTION_MODE", "saga") == "2pc" else SagaOrderStatus.PENDING
+    return jsonify({"order_id": order_id, "status": status or default_status})
 
 
 def _send_get_request(url: str):
@@ -244,7 +247,7 @@ def _send_get_request(url: str):
         abort(400, REQ_ERROR_STR)
 
 
-@app.post('/addItem/<order_id>/<item_id>/<quantity>')
+@app.post("/addItem/<order_id>/<item_id>/<quantity>")
 def add_item(order_id: str, item_id: str, quantity: int):
     order_entry: OrderValue = get_order_from_db(order_id)
     item_reply = _send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
@@ -263,18 +266,17 @@ def add_item(order_id: str, item_id: str, quantity: int):
     )
 
 
-@app.post('/checkout/<order_id>')
+@app.post("/checkout/<order_id>")
 async def checkout(order_id: str):
     order_entry, status = await get_order_and_status_async(order_id)
 
-    if order_entry.paid or status in {SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED}:
+    if order_entry.paid or status in TERMINAL_SUCCESS_STATUSES:
         return Response(
             "Order already completed",
             status=200,
             headers={"Location": f"/orders/status/{order_id}"},
         )
 
-    # If already in progress, just wait for the orchestrator to finish.
     if status in IN_PROGRESS_STATUSES:
         return await _poll_for_terminal_status(order_id)
 
@@ -285,9 +287,6 @@ async def checkout(order_id: str):
         "items": order_entry.items,
     }
 
-    # Lost responses or startup timeouts are uncertain: the orchestrator may
-    # already have persisted the transaction and published work. Re-read the
-    # order status before deciding whether to retry or fail the request.
     for attempt in range(2):
         try:
             resp = await asyncio.to_thread(
@@ -343,9 +342,7 @@ async def checkout(order_id: str):
     )
 
 
-# ── Startup ────────────────────────────────────────────────────────────────────
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.logger.setLevel(logging.DEBUG if VERBOSE_LOGS else logging.INFO)
     app.run(host="0.0.0.0", port=8000, debug=VERBOSE_LOGS)
 else:
