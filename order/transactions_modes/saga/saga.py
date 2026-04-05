@@ -31,9 +31,8 @@ Design rules:
 
 import uuid
 import redis as redis_module
-from msgspec import msgpack
-
 from . import saga_record
+import checkout_notify
 from common.messages import (
     SagaOrderStatus,
     STOCK_RESERVED,
@@ -96,7 +95,7 @@ def saga_start_checkout(
 
     if not ok:
         if active_tx_id:
-            logger.info(
+            logger.debug(
                 f"[Saga] checkout already in progress for order={order_id} active_tx={active_tx_id}"
             )
             return {
@@ -110,15 +109,25 @@ def saga_start_checkout(
 
     # This pointer is redundant with the full saga record, but very convenient
     # for tests, debugging, and tracing one order through the system.
-    db.set(f"order:{order_id}:tx_id", tx_id)
-    _set_status(db, order_id, SagaOrderStatus.RESERVING_STOCK)
+    pipe = db.pipeline(transaction=False)
+    pipe.set(f"order:{order_id}:tx_id", tx_id)
+    pipe.set(f"order:{order_id}:status", SagaOrderStatus.RESERVING_STOCK)
+    pipe.execute()
 
     # Important: the Saga record was already durably written before this publish.
     # If publish fails or the service crashes now, recovery can replay RESERVE_STOCK.
     cmd = build_reserve_stock(tx_id, order_id, items)
-    publish(STOCK_COMMANDS_TOPIC, cmd)
+    try:
+        publish(STOCK_COMMANDS_TOPIC, cmd)
+    except Exception as exc:
+        logger.warning(
+            f"[Saga] initial RESERVE_STOCK publish failed for tx={tx_id} order={order_id}: {exc}"
+        )
+        # The Saga record and visible status are already durable. Recovery and
+        # timeout replay can safely re-send the first command once the
+        # transport/store comes back.
 
-    logger.info(f"[Saga] started tx={tx_id} order={order_id}")
+    logger.debug(f"[Saga] started tx={tx_id} order={order_id}")
     return {"started": True, "reason": "started", "tx_id": tx_id}
 
 
@@ -146,18 +155,19 @@ def saga_route_order(
         logger.warning(f"[Saga] malformed event: {msg}")
         return
 
-    if saga_record.is_seen(db, message_id):
+    seen, active_tx_id, record = saga_record.load_event_context(db, message_id, order_id, tx_id)
+
+    if seen:
         logger.debug(f"[Saga] duplicate message_id={message_id} — dropping")
         return
 
-    if saga_record.is_stale(db, order_id, tx_id):
+    if active_tx_id != tx_id:
         # A later checkout attempt for the same order may already own a newer
         # tx_id. Old events must be ignored so they cannot advance the wrong saga.
         logger.debug(f"[Saga] stale tx_id={tx_id} for order={order_id} — dropping")
         saga_record.mark_seen(db, message_id)
         return
 
-    record = saga_record.get(db, tx_id)
     if not record:
         logger.warning(f"[Saga] no record found for tx_id={tx_id} — dropping")
         return
@@ -202,7 +212,7 @@ def saga_on_stock_reserved(record, msg, db, publish, logger):
     amount = record["amount"]
 
     if record["state"] != SagaOrderStatus.RESERVING_STOCK:
-        logger.info(
+        logger.debug(
             f"[Saga] STOCK_RESERVED in unexpected state={record['state']} tx={tx_id}"
         )
         return
@@ -216,12 +226,13 @@ def saga_on_stock_reserved(record, msg, db, publish, logger):
         last_command_type=PROCESS_PAYMENT,
         awaiting_event_type=PAYMENT_SUCCESS,
         needs_stock_comp=True,  # stock is reserved — must release if we abort
+        record=record,
     )
     _set_status(db, order_id, SagaOrderStatus.PROCESSING_PAYMENT)
 
     cmd = build_process_payment(tx_id, order_id, user_id, amount)
     publish(PAYMENT_COMMANDS_TOPIC, cmd)
-    logger.info(f"[Saga] stock reserved → processing payment tx={tx_id}")
+    logger.debug(f"[Saga] stock reserved → processing payment tx={tx_id}")
 
 
 def saga_on_stock_reservation_failed(record, msg, db, logger):
@@ -241,14 +252,16 @@ def saga_on_stock_reservation_failed(record, msg, db, logger):
         new_state=SagaOrderStatus.FAILED,
         failure_reason=reason,
         reset_timeout=False,
+        record=record,
     )
     _set_status(db, order_id, SagaOrderStatus.FAILED)
+    checkout_notify.notify(order_id)
 
     # Terminal state reached: release the active-order claim so a later retry
     # can start a fresh transaction if the user wants to try again.
     saga_record.clear_active_tx_id(db, order_id, tx_id)
 
-    logger.info(f"[Saga] stock reservation failed tx={tx_id}: {reason}")
+    logger.debug(f"[Saga] stock reservation failed tx={tx_id}: {reason}")
 
 
 def saga_on_payment_success(record, msg, db, logger):
@@ -256,38 +269,28 @@ def saga_on_payment_success(record, msg, db, logger):
     order_id = record["order_id"]
 
     if record["state"] != SagaOrderStatus.PROCESSING_PAYMENT:
-        logger.info(
+        logger.debug(
             f"[Saga] PAYMENT_SUCCESS in unexpected state={record['state']} tx={tx_id}"
         )
         return
 
-    from app import OrderValue
-
-    raw = db.get(order_id)
-    if raw:
-        # The order row is user-facing state. We only flip it to paid after the
-        # payment success event arrives, not when the command is sent.
-        order_entry = msgpack.decode(raw, type=OrderValue)
-        updated = order_entry.__class__(
-            user_id=order_entry.user_id,
-            items=order_entry.items,
-            total_cost=order_entry.total_cost,
-            paid=True,
-        )
-        db.set(order_id, msgpack.encode(updated))
-
+    # Keep the external API truthful via order:<id>:status and derive `paid`
+    # from that at read time. Rewriting the full order blob here is expensive
+    # and does not strengthen the checkout correctness guarantee.
     saga_record.transition(
         db=db,
         tx_id=tx_id,
         new_state=SagaOrderStatus.COMPLETED,
         reset_timeout=False,
+        record=record,
     )
     _set_status(db, order_id, SagaOrderStatus.COMPLETED)
+    checkout_notify.notify(order_id)
 
     # Terminal success: free the active-order slot.
     saga_record.clear_active_tx_id(db, order_id, tx_id)
 
-    logger.info(f"[Saga] completed tx={tx_id} order={order_id}")
+    logger.debug(f"[Saga] completed tx={tx_id} order={order_id}")
 
 
 
@@ -297,7 +300,7 @@ def saga_on_payment_failed(record, msg, db, publish, logger):
     reason = msg.get("payload", {}).get("reason", "unknown")
 
     if record["state"] != SagaOrderStatus.PROCESSING_PAYMENT:
-        logger.info(
+        logger.debug(
             f"[Saga] PAYMENT_FAILED in unexpected state={record['state']} tx={tx_id}"
         )
         return
@@ -314,12 +317,13 @@ def saga_on_payment_failed(record, msg, db, publish, logger):
         last_command_type=RELEASE_STOCK,
         awaiting_event_type=STOCK_RELEASED,
         failure_reason=reason,
+        record=record,
     )
     _set_status(db, order_id, SagaOrderStatus.COMPENSATING)
 
     cmd = build_release_stock(tx_id, order_id, items)
     publish(STOCK_COMMANDS_TOPIC, cmd)
-    logger.info(f"[Saga] payment failed → compensating tx={tx_id}: {reason}")
+    logger.debug(f"[Saga] payment failed → compensating tx={tx_id}: {reason}")
 
 
 def saga_on_stock_released(record, msg, db, logger):
@@ -337,13 +341,15 @@ def saga_on_stock_released(record, msg, db, logger):
         tx_id=tx_id,
         new_state=SagaOrderStatus.FAILED,
         reset_timeout=False,
+        record=record,
     )
     _set_status(db, order_id, SagaOrderStatus.FAILED)
+    checkout_notify.notify(order_id)
 
     # Compensation finished: the order is no longer active.
     saga_record.clear_active_tx_id(db, order_id, tx_id)
 
-    logger.info(f"[Saga] compensation done → failed tx={tx_id}")
+    logger.debug(f"[Saga] compensation done → failed tx={tx_id}")
 
 
 

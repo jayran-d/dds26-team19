@@ -6,7 +6,7 @@ def set_status(logger, db, order_id: str, status: str) -> None:
     try:
         db.set(f"order:{order_id}:status", status)
     except Exception as e:
-        logger.error(f"[OrderKafka] Failed to set status {status} for {order_id}: {e}")
+        logger.error(f"[OrderRedis] Failed to set status {status} for {order_id}: {e}")
 
 
 def get_order(logger, db, order_id: str):
@@ -14,7 +14,7 @@ def get_order(logger, db, order_id: str):
     try:
         return db.get(order_id)
     except Exception as e:
-        logger.error(f"[OrderKafka] Failed to get order {order_id}: {e}")
+        logger.error(f"[OrderRedis] Failed to get order {order_id}: {e}")
         return None
 
 
@@ -24,3 +24,7 @@ def get_order(logger, db, order_id: str):
 #         return val.decode() if val else None
 #     except Exception:
 #         return None
+
+
+def _2pc_key(order_id: str) -> str:
+    return f"order:{order_id}:2pcstate"

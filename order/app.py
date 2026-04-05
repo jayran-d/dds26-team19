@@ -1,44 +1,64 @@
+import asyncio
+import atexit
 import logging
 import os
-import atexit
 import random
 import uuid
 from collections import defaultdict
-import time
 
 import redis
 import requests
 from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
+from quart import Quart, jsonify, abort, Response
 
-from kafka_worker import (
-    init_kafka,
-    close_kafka,
+from streams_worker import (
+    init_streams,
+    close_streams,
     is_available,
     start_checkout,
 )
-from common.messages import SagaOrderStatus
+import checkout_notify
+from common.messages import SagaOrderStatus, TwoPhaseOrderStatus
 
 DB_ERROR_STR  = "DB error"
 REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
-USE_KAFKA   = os.getenv("USE_KAFKA", "false").lower() == "true"
 CHECKOUT_WAIT_TIMEOUT_SECONDS = float(os.getenv("CHECKOUT_WAIT_TIMEOUT_SECONDS", "45"))
-CHECKOUT_POLL_INTERVAL_SECONDS = float(os.getenv("CHECKOUT_POLL_INTERVAL_SECONDS", "0.05"))
+CHECKOUT_STATUS_POLL_INTERVAL_SECONDS = float(
+    os.getenv("CHECKOUT_STATUS_POLL_INTERVAL_SECONDS", "0.2")
+)
+VERBOSE_LOGS = os.getenv("VERBOSE_LOGS", "false").lower() == "true"
 
-IN_PROGRESS_STATUSES = {
-    SagaOrderStatus.RESERVING_STOCK,
-    SagaOrderStatus.PROCESSING_PAYMENT,
-    SagaOrderStatus.COMPENSATING,
-}
+TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "saga")
 
-TERMINAL_STATUSES = {
+if TRANSACTION_MODE == "2pc":
+    IN_PROGRESS_STATUSES = {
+        TwoPhaseOrderStatus.PREPARING_STOCK,
+        TwoPhaseOrderStatus.PREPARING_PAYMENT,
+        TwoPhaseOrderStatus.COMMITTING,
+        TwoPhaseOrderStatus.ABORTING,
+    }
+else:
+    IN_PROGRESS_STATUSES = {
+        SagaOrderStatus.RESERVING_STOCK,
+        SagaOrderStatus.PROCESSING_PAYMENT,
+        SagaOrderStatus.COMPENSATING,
+    }
+
+TERMINAL_SUCCESS_STATUSES = {
     SagaOrderStatus.COMPLETED,
-    SagaOrderStatus.FAILED,
+    TwoPhaseOrderStatus.COMPLETED,
 }
 
-app = Flask("order-service")
+TERMINAL_FAILURE_STATUSES = {
+    SagaOrderStatus.FAILED,
+    TwoPhaseOrderStatus.FAILED,
+}
+
+TERMINAL_STATUSES = TERMINAL_SUCCESS_STATUSES | TERMINAL_FAILURE_STATUSES
+
+app = Quart("order-service")
 
 db: redis.Redis = redis.Redis(
     host=os.environ['REDIS_HOST'],
@@ -54,7 +74,7 @@ db: redis.Redis = redis.Redis(
 
 def close_connections():
     db.close()
-    close_kafka()
+    close_streams()
 
 
 atexit.register(close_connections)
@@ -74,6 +94,7 @@ def get_order_from_db(order_id: str) -> OrderValue | None:
         return abort(400, DB_ERROR_STR)
     entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
     if entry is None:
+        print( f"Order: {order_id} not found!\n", flush=True)
         abort(400, f"Order: {order_id} not found!")
     return entry
 
@@ -86,48 +107,93 @@ def get_order_status(order_id: str) -> str | None:
         return None
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
-
-def _wait_for_terminal_checkout_status(order_id: str) -> str | None:
-    """
-    Block until the Saga reaches a terminal state or the timeout expires.
-
-    This keeps the distributed transaction asynchronous internally, but gives
-    the external HTTP API a final success/failure result.
-    """
-    deadline = time.time() + CHECKOUT_WAIT_TIMEOUT_SECONDS
-
-    while time.time() < deadline:
-        status = get_order_status(order_id) or SagaOrderStatus.PENDING
-        if status in TERMINAL_STATUSES:
-            return status
-        time.sleep(CHECKOUT_POLL_INTERVAL_SECONDS)
-
-    return None
+def get_order_and_status(order_id: str) -> tuple[OrderValue | None, str | None]:
+    try:
+        raw_order, raw_status = db.mget(order_id, f"order:{order_id}:status")
+    except redis.exceptions.RedisError:
+        print(f"ERROR IN RETRIEVEING ORDER STATUS {DB_ERROR_STR}\n", flush=True)
+        return abort(400, DB_ERROR_STR)
+    order_entry: OrderValue | None = msgpack.decode(raw_order, type=OrderValue) if raw_order else None
+    if order_entry is None:
+        print(f"Order: {order_id} not found!\n", flush=True)
+        abort(400, f"Order: {order_id} not found!")
+    status = raw_status.decode() if raw_status else None
+    return order_entry, status
 
 
-def _build_terminal_checkout_response(order_id: str) -> Response:
-    final_status = _wait_for_terminal_checkout_status(order_id)
+async def get_order_status_async(order_id: str) -> str | None:
+    try:
+        val = await asyncio.to_thread(db.get, f"order:{order_id}:status")
+        return val.decode() if val else None
+    except redis.exceptions.RedisError:
+        return None
 
-    if final_status == SagaOrderStatus.COMPLETED:
+
+async def get_order_and_status_async(order_id: str) -> tuple[OrderValue | None, str | None]:
+    try:
+        raw_order, raw_status = await asyncio.to_thread(
+            db.mget,
+            order_id,
+            f"order:{order_id}:status",
+        )
+    except redis.exceptions.RedisError:
+        print(f"ERROR IN GET ORDER STATUS ASYNC {DB_ERROR_STR}\n", flush=True)
+        return abort(400, DB_ERROR_STR)
+    order_entry: OrderValue | None = msgpack.decode(raw_order, type=OrderValue) if raw_order else None
+    if order_entry is None:
+        print(f"Order: {order_id} not found!\n", flush=True)
+        abort(400, f"Order: {order_id} not found!")
+    status = raw_status.decode() if raw_status else None
+    return order_entry, status
+
+async def _build_terminal_checkout_response(
+    order_id: str,
+    waiter: asyncio.Future,
+) -> Response:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + CHECKOUT_WAIT_TIMEOUT_SECONDS
+    final_status: str | None = None
+
+    while loop.time() < deadline:
+        final_status = await get_order_status_async(order_id)
+        if final_status in TERMINAL_STATUSES:
+            break
+
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(waiter),
+                timeout=min(CHECKOUT_STATUS_POLL_INTERVAL_SECONDS, remaining),
+            )
+        except asyncio.TimeoutError:
+            continue
+
+    if final_status not in TERMINAL_STATUSES:
+        final_status = await get_order_status_async(order_id)
+
+    if final_status not in TERMINAL_STATUSES:
+        return Response(
+            "Checkout timed out before reaching a terminal state",
+            status=400,
+            headers={"Location": f"/orders/status/{order_id}"},
+        )
+
+    if final_status in TERMINAL_SUCCESS_STATUSES:
         return Response(
             "Checkout successful",
             status=200,
             headers={"Location": f"/orders/status/{order_id}"},
         )
 
-    if final_status == SagaOrderStatus.FAILED:
-        return Response(
-            "Checkout failed",
-            status=400,
-            headers={"Location": f"/orders/status/{order_id}"},
-        )
-
     return Response(
-        "Checkout timed out before reaching a terminal state",
+        "Checkout failed",
         status=400,
         headers={"Location": f"/orders/status/{order_id}"},
     )
+
 
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
@@ -168,10 +234,13 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
 
 @app.get('/find/<order_id>')
 def find_order(order_id: str):
-    order_entry: OrderValue = get_order_from_db(order_id)
+    order_entry, status = get_order_and_status(order_id)
     return jsonify({
         "order_id":   order_id,
-        "paid":       order_entry.paid,
+        # The terminal order status is the canonical external signal that
+        # checkout finished successfully. The stored order blob may still
+        # contain paid=False because we no longer rewrite it on the hot path.
+        "paid":       order_entry.paid or status in {SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED},
         "items":      order_entry.items,
         "user_id":    order_entry.user_id,
         "total_cost": order_entry.total_cost,
@@ -223,86 +292,50 @@ def add_item(order_id: str, item_id: str, quantity: int):
 
 
 @app.post('/checkout/<order_id>')
-def checkout(order_id: str):
-    """
-    Kafka path:
-        - return a terminal HTTP result after the Saga finishes
-        - duplicate concurrent requests wait for the same active Saga instead of
-          starting a second checkout
-
-    HTTP path:
-        - synchronous fallback when USE_KAFKA=false
-    """
-    order_entry: OrderValue = get_order_from_db(order_id)
-
-    status = get_order_status(order_id)
-
-    if order_entry.paid or status == SagaOrderStatus.COMPLETED:
-        return Response(
-            "Order already completed",
-            status=200,
-            headers={"Location": f"/orders/status/{order_id}"},
-        )
-
-    if USE_KAFKA and is_available():
-        # If another request already started the Saga for this order,
-        # wait for its final result instead of starting a second one.
-        if status in IN_PROGRESS_STATUSES:
-            return _build_terminal_checkout_response(order_id)
-
-        try:
-            result = start_checkout(order_id, order_entry)
-        except Exception as exc:
-            app.logger.error(f"[checkout] failed to start: {exc}")
-            abort(400, str(exc))
-
-        if isinstance(result, dict) and result.get("reason") == "already_in_progress":
-            return _build_terminal_checkout_response(order_id)
-
-        if isinstance(result, dict) and result.get("reason") == "error":
-            abort(400, "Failed to start checkout")
-
-        return _build_terminal_checkout_response(order_id)
-
-    # ── HTTP fallback ──────────────────────────────────────────────────────────
-    items_quantities: dict[str, int] = defaultdict(int)
-    for item_id, quantity in order_entry.items:
-        items_quantities[item_id] += quantity
-
-    removed_items: list[tuple[str, int]] = []
-
-    for item_id, quantity in items_quantities.items():
-        reply = _send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if reply.status_code != 200:
-            for rid, rqty in removed_items:
-                _send_post_request(f"{GATEWAY_URL}/stock/add/{rid}/{rqty}")
-            abort(400, f"Out of stock on item_id: {item_id}")
-        removed_items.append((item_id, quantity))
-
-    reply = _send_post_request(
-        f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}"
-    )
-    if reply.status_code != 200:
-        for rid, rqty in removed_items:
-            _send_post_request(f"{GATEWAY_URL}/stock/add/{rid}/{rqty}")
-        abort(400, "User out of credit")
-
-    order_entry.paid = True
+async def checkout(order_id: str):
+    waiter = checkout_notify.register_async(order_id)
     try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        order_entry, status = await get_order_and_status_async(order_id)
 
-    return Response("Checkout successful", status=200)
+        if order_entry.paid or status in {SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED}:
+            return Response(
+                "Order already completed",
+                status=200,
+                headers={"Location": f"/orders/status/{order_id}"},
+            )
 
+        if is_available():
+            # Register BEFORE reading terminal state to avoid missing a fast
+            # transition that happens between the status check and wait().
+            if status in IN_PROGRESS_STATUSES:
+                return await _build_terminal_checkout_response(order_id, waiter)
+
+            try:
+                result = await asyncio.to_thread(start_checkout, order_id, order_entry)
+            except Exception as exc:
+                print(f"[checkout] failed to start: {exc}", flush=True)
+                abort(400, str(exc))
+
+            if isinstance(result, dict) and result.get("reason") == "already_in_progress":
+                return await _build_terminal_checkout_response(order_id, waiter)
+
+            if isinstance(result, dict) and result.get("reason") == "error":
+                print(f"[checkout] failed to start", flush=True)
+                abort(400, "Failed to start checkout")
+
+            return await _build_terminal_checkout_response(order_id, waiter)
+    finally:
+        checkout_notify.unregister_async(order_id, waiter)
 
 # ── Startup ────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    init_kafka(app.logger, db)
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    app.logger.setLevel(logging.DEBUG if VERBOSE_LOGS else logging.INFO)
+    init_streams(app.logger, db)
+    app.run(host="0.0.0.0", port=8000, debug=VERBOSE_LOGS)
 else:
-    gunicorn_logger = logging.getLogger('gunicorn.error')
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
-    init_kafka(app.logger, db)
+    server_logger = logging.getLogger("hypercorn.error")
+    if server_logger.handlers:
+        app.logger.handlers = server_logger.handlers
+        app.logger.setLevel(logging.DEBUG if VERBOSE_LOGS else server_logger.level)
+    init_streams(app.logger, db)

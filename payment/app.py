@@ -4,12 +4,13 @@ import atexit
 import uuid
 
 import redis
-from kafka_worker import init_kafka, close_kafka
+from streams_worker import init_streams, close_streams
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
 DB_ERROR_STR = "DB error"
+VERBOSE_LOGS = os.getenv("VERBOSE_LOGS", "false").lower() == "true"
 
 app = Flask("payment-service")
 
@@ -27,7 +28,7 @@ db: redis.Redis = redis.Redis(
 
 def close_connections():
     db.close()
-    close_kafka()
+    close_streams()
 
 
 atexit.register(close_connections)
@@ -37,18 +38,31 @@ class UserValue(Struct):
     credit: int
 
 
+def _decode_user_entry(raw: bytes | None) -> UserValue | None:
+    if raw is None:
+        return None
+    try:
+        return UserValue(credit=int(raw))
+    except (TypeError, ValueError):
+        return msgpack.decode(raw, type=UserValue)
+
+
+def _write_user_entry(user_id: str, user_entry: UserValue) -> None:
+    db.set(user_id, str(int(user_entry.credit)))
+
+
 def get_user_from_db(user_id: str) -> UserValue | None:
     try:
         entry: bytes = db.get(user_id)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    entry: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
+    entry: UserValue | None = _decode_user_entry(entry)
     if entry is None:
         abort(400, f"User: {user_id} not found!")
     return entry
 
 
-# ── Business logic (also called directly by kafka_worker) ─────────────────────
+# ── Business logic (also called directly by streams_worker) ───────────────────
 
 def remove_credit_internal(user_id: str, amount: int) -> tuple[bool, str | None, int | None]:
     try:
@@ -59,7 +73,7 @@ def remove_credit_internal(user_id: str, amount: int) -> tuple[bool, str | None,
     if user_entry.credit < 0:
         return False, f"User: {user_id} credit cannot get reduced below zero!", None
     try:
-        db.set(user_id, msgpack.encode(user_entry))
+        _write_user_entry(user_id, user_entry)
     except redis.exceptions.RedisError:
         return False, DB_ERROR_STR, None
     return True, None, user_entry.credit
@@ -72,7 +86,7 @@ def add_credit_internal(user_id: str, amount: int) -> tuple[bool, str | None, in
         return False, getattr(exc, "description", str(exc)), None
     user_entry.credit += amount
     try:
-        db.set(user_id, msgpack.encode(user_entry))
+        _write_user_entry(user_id, user_entry)
     except redis.exceptions.RedisError:
         return False, DB_ERROR_STR, None
     return True, None, user_entry.credit
@@ -83,9 +97,8 @@ def add_credit_internal(user_id: str, amount: int) -> tuple[bool, str | None, in
 @app.post('/create_user')
 def create_user():
     key = str(uuid.uuid4())
-    value = msgpack.encode(UserValue(credit=0))
     try:
-        db.set(key, value)
+        db.set(key, "0")
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({'user_id': key})
@@ -95,8 +108,8 @@ def create_user():
 def batch_init_users(n: int, starting_money: int):
     n = int(n)
     starting_money = int(starting_money)
-    kv_pairs: dict[str, bytes] = {
-        f"{i}": msgpack.encode(UserValue(credit=starting_money)) for i in range(n)
+    kv_pairs: dict[str, str] = {
+        f"{i}": str(starting_money) for i in range(n)
     }
     try:
         db.mset(kv_pairs)
@@ -131,10 +144,11 @@ def remove_credit(user_id: str, amount: int):
 # ── Startup ────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    init_kafka(app.logger)
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    app.logger.setLevel(logging.DEBUG if VERBOSE_LOGS else logging.INFO)
+    init_streams(app.logger, db)
+    app.run(host="0.0.0.0", port=8000, debug=VERBOSE_LOGS)
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
-    init_kafka(app.logger, db)
+    app.logger.setLevel(logging.DEBUG if VERBOSE_LOGS else gunicorn_logger.level)
+    init_streams(app.logger, db)

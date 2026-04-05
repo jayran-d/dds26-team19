@@ -1,0 +1,173 @@
+name: dds-small
+
+x-http-healthcheck: &http-healthcheck
+  test:
+    - CMD
+    - python
+    - -c
+    - import socket; s = socket.create_connection(("127.0.0.1", 5000), 2); s.close()
+  interval: 5s
+  timeout: 3s
+  retries: 20
+  start_period: 5s
+
+x-redis-healthcheck: &redis-healthcheck
+  test: ["CMD-SHELL", "redis-cli -a redis ping | grep PONG"]
+  interval: 5s
+  timeout: 5s
+  retries: 10
+  start_period: 5s
+
+x-nofile-ulimits: &nofile-ulimits
+  nofile:
+    soft: 65536
+    hard: 65536
+
+x-order-service-base: &order-service-base
+  image: order:latest
+  restart: unless-stopped
+  environment:
+    - GATEWAY_URL=http://gateway:80
+    - STOCK_REDIS_HOST=stock-db
+    - STOCK_REDIS_PORT=6379
+    - STOCK_REDIS_PASSWORD=redis
+    - STOCK_REDIS_DB=0
+    - PAYMENT_REDIS_HOST=payment-db
+    - PAYMENT_REDIS_PORT=6379
+    - PAYMENT_REDIS_PASSWORD=redis
+    - PAYMENT_REDIS_DB=0
+    - CONSUMER_WORKERS=8
+    - STREAM_BATCH_SIZE=32
+    - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
+  command: >-
+    sh -lc '
+    if [ "$$VERBOSE_LOGS" = "true" ]; then
+      exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --log-level debug --access-logfile - app:app;
+    else
+      exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --log-level info app:app;
+    fi'
+  env_file:
+    - ../../env/order_redis.env
+    - ../../env/transaction.env
+  ulimits: *nofile-ulimits
+  healthcheck: *http-healthcheck
+  depends_on:
+    order-db:
+      condition: service_healthy
+    stock-db:
+      condition: service_healthy
+    payment-db:
+      condition: service_healthy
+
+x-stock-service-base: &stock-service-base
+  image: stock:latest
+  restart: unless-stopped
+  environment:
+    - CONSUMER_WORKERS=8
+    - STREAM_BATCH_SIZE=32
+    - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
+  command: >-
+    sh -lc '
+    if [ "$$VERBOSE_LOGS" = "true" ]; then
+      exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=debug --access-logfile - app:app;
+    else
+      exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app;
+    fi'
+  env_file:
+    - ../../env/stock_redis.env
+    - ../../env/transaction.env
+  ulimits: *nofile-ulimits
+  healthcheck: *http-healthcheck
+  depends_on:
+    stock-db:
+      condition: service_healthy
+
+x-payment-service-base: &payment-service-base
+  image: payment:latest
+  restart: unless-stopped
+  environment:
+    - CONSUMER_WORKERS=8
+    - STREAM_BATCH_SIZE=32
+    - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
+  command: >-
+    sh -lc '
+    if [ "$$VERBOSE_LOGS" = "true" ]; then
+      exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=debug --access-logfile - app:app;
+    else
+      exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app;
+    fi'
+  env_file:
+    - ../../env/payment_redis.env
+    - ../../env/transaction.env
+  ulimits: *nofile-ulimits
+  healthcheck: *http-healthcheck
+  depends_on:
+    payment-db:
+      condition: service_healthy
+
+x-redis-base: &redis-base
+  image: redis:7.2-bookworm
+  restart: unless-stopped
+  command: >-
+    redis-server --requirepass redis --maxmemory 512mb
+    --appendonly yes --appendfsync everysec
+    --save ""
+    --auto-aof-rewrite-min-size 256mb
+    --auto-aof-rewrite-percentage 200
+    --dir /data
+  healthcheck: *redis-healthcheck
+
+services:
+  gateway:
+    image: nginx:1.25-bookworm
+    restart: unless-stopped
+    volumes:
+      - ../../nginx/gateway_nginx.small.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8000:80"
+    ulimits: *nofile-ulimits
+    depends_on:
+      order-service:
+        condition: service_healthy
+      stock-service:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
+
+  order-service:
+    <<: *order-service-base
+    build:
+      context: ../..
+      dockerfile: order/Dockerfile
+
+  order-db:
+    <<: *redis-base
+    volumes:
+      - order-db-data:/data
+
+  stock-service:
+    <<: *stock-service-base
+    build:
+      context: ../..
+      dockerfile: stock/Dockerfile
+
+  stock-db:
+    <<: *redis-base
+    volumes:
+      - stock-db-data:/data
+
+  payment-service:
+    <<: *payment-service-base
+    build:
+      context: ../..
+      dockerfile: payment/Dockerfile
+
+  payment-db:
+    <<: *redis-base
+    volumes:
+      - payment-db-data:/data
+
+volumes:
+  order-db-data:
+  stock-db-data:
+  payment-db-data:

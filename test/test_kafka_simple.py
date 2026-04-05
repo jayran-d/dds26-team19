@@ -1,18 +1,27 @@
 """
 test_kafka_simple.py
 
-Async-aware tests for the simple Kafka checkout mode.
-Mirrors the original test_order logic but polls /status/<order_id>
-instead of expecting a synchronous result from checkout.
+Tests for the simple transport-backed checkout mode.
 
 Assumes:
-    - Services are running with USE_KAFKA=true
     - TRANSACTION_MODE=simple
     - Gateway is reachable at the URL configured in utils.py
+    - /orders/checkout/<order_id> returns only after reaching a terminal state
 """
 
 import time
 import unittest
+import sys
+from pathlib import Path
+
+TEST_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = TEST_DIR.parent
+
+if str(TEST_DIR) not in sys.path:
+    sys.path.insert(0, str(TEST_DIR))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import utils as tu
 
 
@@ -66,7 +75,7 @@ class TestKafkaSimple(unittest.TestCase):
 
         # Checkout
         checkout_response = tu.checkout_order(order_id)
-        self.assertEqual(checkout_response.status_code, 202)
+        self.assertEqual(checkout_response.status_code, 200)
 
         # Wait for completion
         status = wait_for_checkout(order_id)
@@ -106,7 +115,7 @@ class TestKafkaSimple(unittest.TestCase):
 
         # Checkout
         checkout_response = tu.checkout_order(order_id)
-        self.assertEqual(checkout_response.status_code, 202)
+        self.assertEqual(checkout_response.status_code, 400)
 
         # Wait for failure
         status = wait_for_checkout(order_id)
@@ -142,7 +151,7 @@ class TestKafkaSimple(unittest.TestCase):
 
         # Checkout
         checkout_response = tu.checkout_order(order_id)
-        self.assertEqual(checkout_response.status_code, 202)
+        self.assertEqual(checkout_response.status_code, 400)
 
         # Wait for failure
         status = wait_for_checkout(order_id)
@@ -178,7 +187,7 @@ class TestKafkaSimple(unittest.TestCase):
         tu.add_item_to_order(order_id, item_id2, 1)  # cost 20, total = 40
 
         checkout_response = tu.checkout_order(order_id)
-        self.assertEqual(checkout_response.status_code, 202)
+        self.assertEqual(checkout_response.status_code, 200)
 
         status = wait_for_checkout(order_id)
         self.assertEqual(status, "completed", f"Expected completed, got: {status}")
@@ -211,7 +220,7 @@ class TestKafkaSimple(unittest.TestCase):
         tu.add_item_to_order(order_id, item_id2, 5)  # requesting 5, only 1 available
 
         checkout_response = tu.checkout_order(order_id)
-        self.assertEqual(checkout_response.status_code, 202)
+        self.assertEqual(checkout_response.status_code, 400)
 
         status = wait_for_checkout(order_id)
         self.assertEqual(status, "failed", f"Expected failed, got: {status}")

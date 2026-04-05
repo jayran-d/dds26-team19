@@ -36,6 +36,23 @@ class LedgerState:
 # TTL for ledger entries — 24 hours is plenty for a transaction to complete.
 LEDGER_TTL_SECONDS = 86400
 
+_MARK_REPLIED_LUA = """
+local raw = redis.call('GET', KEYS[1])
+if not raw then
+    return 0
+end
+
+local entry = cjson.decode(raw)
+local now = redis.call('TIME')
+entry['local_state'] = 'replied'
+entry['updated_at_ms'] = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+
+redis.call('SET', KEYS[1], cjson.encode(entry), 'EX', tonumber(ARGV[1]))
+return 1
+"""
+
+_mark_replied_script = None
+
 
 # ── Key helper ─────────────────────────────────────────────────────────────────
 
@@ -132,16 +149,16 @@ def mark_replied(
     Transition ledger entry to state=replied.
     Called after the reply event has been successfully published to Kafka.
     """
+    global _mark_replied_script
     try:
-        key = _key(tx_id, action_type)
-        raw = db.get(key)
-        if not raw:
-            return False
-        entry = json.loads(raw)
-        entry["local_state"]   = LedgerState.REPLIED
-        entry["updated_at_ms"] = int(time.time() * 1000)
-        db.set(key, json.dumps(entry), ex=LEDGER_TTL_SECONDS)
-        return True
+        if _mark_replied_script is None:
+            _mark_replied_script = db.register_script(_MARK_REPLIED_LUA)
+        result = _mark_replied_script(
+            keys=[_key(tx_id, action_type)],
+            args=[LEDGER_TTL_SECONDS],
+            client=db,
+        )
+        return bool(result)
     except Exception:
         return False
 

@@ -1,5 +1,7 @@
 .idea
+__pycache__
 .DS_Store
 
 broker_logs.txt
 test/__pycache__
+.env

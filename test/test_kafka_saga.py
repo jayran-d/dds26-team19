@@ -7,9 +7,10 @@ Run from the repo root with:
 
 Assumptions:
     - Docker Compose stack is already up
-    - USE_KAFKA=true
     - TRANSACTION_MODE=saga
     - /orders/checkout/<order_id> waits for a terminal Saga result on this branch
+    - Internal transport may be Kafka or Redis Streams; tests inject directly
+      into the currently configured transport via compose helpers.
 
 Coverage:
     - happy path and normal compensation
@@ -40,7 +41,6 @@ import uuid
 from pathlib import Path
 
 import requests
-
 
 TEST_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TEST_DIR.parent
@@ -77,7 +77,6 @@ PAYMENT_SERVICE = "payment-service"
 ORDER_DB_SERVICE = "order-db"
 STOCK_DB_SERVICE = "stock-db"
 PAYMENT_DB_SERVICE = "payment-db"
-KAFKA_SERVICE = "kafka"
 GATEWAY_SERVICE = "gateway"
 REDIS_PASSWORD = "redis"
 HTTP_SERVICES = {
@@ -136,12 +135,16 @@ def _start_service(service: str, timeout: int = RECOVERY_WAIT) -> None:
     else:
         raise ValueError(f"Unknown service: {service}")
 
+    # The order service depends on both stock-db and payment-db for its
+    # internal transport. A green HTTP port alone is not enough after
+    # stop/kill tests; wait until it can resolve and ping both peers again.
+    _wait_for_order_transport_dependencies(timeout=timeout)
+
 
 def _ensure_services_started() -> None:
     _compose(
         "up",
         "-d",
-        KAFKA_SERVICE,
         ORDER_DB_SERVICE,
         STOCK_DB_SERVICE,
         PAYMENT_DB_SERVICE,
@@ -156,6 +159,7 @@ def _ensure_services_started() -> None:
     _wait_for_service_http(ORDER_SERVICE)
     _wait_for_service_http(STOCK_SERVICE)
     _wait_for_service_http(PAYMENT_SERVICE)
+    _wait_for_order_transport_dependencies()
     _refresh_gateway()
     _wait_for_gateway_routes()
 
@@ -220,6 +224,57 @@ def _wait_for_redis(service: str, timeout: int = RECOVERY_WAIT) -> None:
         time.sleep(0.5)
 
     raise AssertionError(f"{service} did not become ready within {timeout}s")
+
+
+def _wait_for_order_transport_dependencies(timeout: int = RECOVERY_WAIT) -> None:
+    deadline = time.time() + timeout
+    probe_script = (
+        "import os\n"
+        "import sys\n"
+        "import redis\n"
+        "targets = [\n"
+        "    (\n"
+        "        os.environ['STOCK_REDIS_HOST'],\n"
+        "        int(os.getenv('STOCK_REDIS_PORT', '6379')),\n"
+        "        os.environ['STOCK_REDIS_PASSWORD'],\n"
+        "        int(os.getenv('STOCK_REDIS_DB', '0')),\n"
+        "    ),\n"
+        "    (\n"
+        "        os.environ['PAYMENT_REDIS_HOST'],\n"
+        "        int(os.getenv('PAYMENT_REDIS_PORT', '6379')),\n"
+        "        os.environ['PAYMENT_REDIS_PASSWORD'],\n"
+        "        int(os.getenv('PAYMENT_REDIS_DB', '0')),\n"
+        "    ),\n"
+        "]\n"
+        "for host, port, password, db in targets:\n"
+        "    client = redis.Redis(\n"
+        "        host=host,\n"
+        "        port=port,\n"
+        "        password=password,\n"
+        "        db=db,\n"
+        "        socket_connect_timeout=1,\n"
+        "        socket_timeout=1,\n"
+        "    )\n"
+        "    client.ping()\n"
+    )
+
+    while time.time() < deadline:
+        probe = _compose(
+            "exec",
+            "-T",
+            ORDER_SERVICE,
+            "python",
+            "-c",
+            probe_script,
+            check=False,
+        )
+        if probe.returncode == 0:
+            return
+        time.sleep(0.5)
+
+    raise AssertionError(
+        f"{ORDER_SERVICE} did not reconnect to stock-db/payment-db within {timeout}s"
+    )
 
 
 def _wait_for_gateway_routes(timeout: int = RECOVERY_WAIT) -> None:
@@ -411,16 +466,32 @@ def _get_order_status_direct(order_id: str) -> str:
 
 
 def _publish_to_kafka(topic: str, message: dict) -> None:
+    """
+    Legacy helper name kept for test compatibility.
+    Publishes directly into the currently configured message transport.
+
+    On this branch, that means writing a msgpack payload to the appropriate
+    Redis Stream via a short Python snippet executed inside order-service.
+    """
+    publish_script = (
+        "import json, sys\n"
+        "import redis\n"
+        "from msgspec import msgpack\n"
+        "topic = sys.argv[1]\n"
+        "message = json.loads(sys.stdin.read())\n"
+        "host = 'stock-db' if topic.startswith('stock.') else 'payment-db'\n"
+        "db = redis.Redis(host=host, port=6379, password='redis', db=0)\n"
+        "db.xadd(topic, {'d': msgpack.encode(message)}, maxlen=100000, approximate=True)\n"
+    )
     _compose(
         "exec",
         "-T",
-        KAFKA_SERVICE,
-        "/opt/kafka/bin/kafka-console-producer.sh",
-        "--bootstrap-server",
-        "localhost:9092",
-        "--topic",
+        ORDER_SERVICE,
+        "python",
+        "-c",
+        publish_script,
         topic,
-        input_text=json.dumps(message) + "\n",
+        input_text=json.dumps(message),
     )
 
 
