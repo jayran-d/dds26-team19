@@ -1,10 +1,11 @@
 # DDS26 Team 19 Code Walkthrough
 
-This document is the code-level companion to [`EXAM_GUIDE.md`](EXAM_GUIDE.md).
+This document is the code-level companion to [`../README.md`](../README.md) and [`explanation_architecture.md`](explanation_architecture.md).
 
 Use the two documents differently:
 
-- `EXAM_GUIDE.md`: architecture, testing, fault injection, demo flow, what to say to the professor
+- `README.md`: public project entrypoint, architecture summary, deployment and test commands
+- `explanation_architecture.md`: high-level architecture, runtime flow, and design rationale
 - `CODE_WALKTHROUGH.md`: implementation details, important functions, file structure, how the code actually works
 
 The goal of this file is that any team member can open the codebase, follow this guide, and understand not just the design, but the actual implementation choices.

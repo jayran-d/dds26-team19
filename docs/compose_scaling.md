@@ -1,50 +1,120 @@
 # Docker Compose Scaling Profiles
 
-This repository now includes three dedicated Docker Compose layouts for the 96-core environment:
+This repository ships three Compose profiles:
 
-- `docker/compose/docker-compose.small.yml`: 1 instance of each application service and 1 Redis per bounded context.
-- `docker/compose/docker-compose.medium.yml`: fixed 50 CPU allocation.
-- `docker/compose/docker-compose.large.yml`: fixed 90 CPU allocation.
+- `docker/compose/docker-compose.small.yml`
+- `docker/compose/docker-compose.medium.yml`
+- `docker/compose/docker-compose.large.yml`
 
-## CPU budgets
+All three profiles expose the gateway on `http://localhost:8000`, keep the same bounded contexts (`order`, `orchestrator`, `stock`, `payment`), and use a dedicated Redis instance for each context.
+
+## Profile Summary
 
 ### Small
 
-Single-instance topology only. No explicit CPU limits are set in this profile.
+Single-instance local topology intended for correctness testing and development.
+
+- `gateway`: 1 replica
+- `orchestrator-service`: 1 replica
+- `order-service`: 1 replica
+- `stock-service`: 1 replica
+- `payment-service`: 1 replica
+- Redis: 4 instances
+  - `order-db`
+  - `orchestrator-db`
+  - `stock-db`
+  - `payment-db`
+
+There are no explicit `cpus:` limits in this profile.
+
+Runtime settings:
+
+- `orchestrator-service`: `CONSUMER_WORKERS=1`
+- `stock-service`: `CONSUMER_WORKERS=1`
+- `payment-service`: `CONSUMER_WORKERS=1`
+- `order-service` calls the orchestrator directly at `http://orchestrator-service:5000`
 
 ### Medium
 
-Total budget: **50 CPUs**
+Fixed **50 CPU** profile with multiple service replicas.
 
-- `gateway`: 2 CPUs
-- `order-service` replicas: 7 x 2 CPUs = 14 CPUs
-- `stock-service` replicas: 7 x 2 CPUs = 14 CPUs
-- `payment-service` replicas: 7 x 2 CPUs = 14 CPUs
-- Redis databases: 3 x 2 CPUs = 6 CPUs
+Replica layout:
+
+- `gateway`: 1 replica
+- `orchestrator-service`: 2 replicas
+- `order-service`: 6 replicas
+- `stock-service`: 7 replicas
+- `payment-service`: 7 replicas
+- Redis: 4 instances
+
+CPU allocation:
+
+- `gateway`: `1 x 2.0` = **2 CPUs**
+- `orchestrator-service`: `2 x 2.0` = **4 CPUs**
+- `order-service`: `6 x 2.0` = **12 CPUs**
+- `stock-service`: `7 x 2.0` = **14 CPUs**
+- `payment-service`: `7 x 2.0` = **14 CPUs**
+- Redis: `4 x 1.0` = **4 CPUs**
+
+Total: **50 CPUs**
+
+Runtime settings:
+
+- `orchestrator-service`: `CONSUMER_WORKERS=4`
+- `stock-service`: `CONSUMER_WORKERS=8`
+- `payment-service`: `CONSUMER_WORKERS=8`
+- `order-service` calls the orchestrator via the gateway at `http://gateway:80/orchestrator`
 
 ### Large
 
-Total budget: **90 CPUs**
+Fixed **90 CPU** profile for the highest replica count in this repo.
 
-- `gateway`: 3 CPUs
-- `order-service` replicas: 14 x 2 CPUs = 28 CPUs
-- `stock-service` replicas: 14 x 2 CPUs = 28 CPUs
-- `payment-service` replicas: 14 x 2 CPUs = 28 CPUs
-- Redis databases: 3 x 1 CPU = 3 CPUs
+Replica layout:
+
+- `gateway`: 1 replica
+- `orchestrator-service`: 3 replicas
+- `order-service`: 12 replicas
+- `stock-service`: 14 replicas
+- `payment-service`: 14 replicas
+- Redis: 4 instances
+
+CPU allocation:
+
+- `gateway`: `1 x 2.0` = **2 CPUs**
+- `orchestrator-service`: `3 x 2.0` = **6 CPUs**
+- `order-service`: `12 x 2.0` = **24 CPUs**
+- `stock-service`: `14 x 2.0` = **28 CPUs**
+- `payment-service`: `14 x 2.0` = **28 CPUs**
+- Redis: `4 x 0.5` = **2 CPUs**
+
+Total: **90 CPUs**
+
+Runtime settings:
+
+- `orchestrator-service`: `CONSUMER_WORKERS=3`
+- `stock-service`: `CONSUMER_WORKERS=8`
+- `payment-service`: `CONSUMER_WORKERS=8`
+- `order-service` calls the orchestrator via the gateway at `http://gateway:80/orchestrator`
 
 ## Gateway routing
 
-Each scaling profile uses its own nginx config:
+Each profile uses its own nginx configuration:
 
 - `nginx/gateway_nginx.small.conf`
 - `nginx/gateway_nginx.medium.conf`
 - `nginx/gateway_nginx.large.conf`
 
-The medium and large configs declare every backend replica explicitly and use Docker DNS re-resolution (`resolve` with `127.0.0.11`) so nginx does not stay pinned to a stale container IP.
+Routing behavior differs by size:
+
+- `small`: the gateway fronts the application services, while `order-service` calls the single orchestrator container directly
+- `medium`: nginx defines explicit upstream pools for replicated services, including an internal `/orchestrator/` route
+- `large`: same routing model as `medium`, with larger upstream pools
+
+The medium and large nginx configs use Docker DNS re-resolution (`resolve` with `127.0.0.11`) so upstream backends do not stay pinned to stale container IPs after restarts.
 
 ## Usage
 
-Use the `Makefile` targets:
+Start a profile with the matching `Makefile` target:
 
 ```bash
 make small-up
@@ -52,14 +122,24 @@ make medium-up
 make large-up
 ```
 
-Stop a cluster with the matching `*-down` target:
+Protocol-specific variants are also available:
 
 ```bash
-make medium-down
+make small-up-saga
+make small-up-2pc
+make medium-up-saga
+make medium-up-2pc
+make large-up-saga
+make large-up-2pc
 ```
 
-## Notes
+Stop and remove a profile with the matching `*-down` target:
 
-- Run only one profile at a time unless you also change host port mappings.
-- The first replica of each application service performs the image build; the other replicas reuse the same image tag.
-- The baseline compose file is now located at `docker/compose/docker-compose.yml`.
+```bash
+make small-down
+make medium-down
+make large-down
+```
+
+These teardown commands run `docker compose down -v`, so they remove both containers and named volumes for that profile.
+ot so much that it shifts unnecessary pressure onto the coordinator state store.
