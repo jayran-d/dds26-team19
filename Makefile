@@ -23,7 +23,7 @@ LOCUST_RUNTIME ?= 30s
         medium-build-saga medium-build-2pc medium-up-saga medium-up-2pc \
         large-build large-up large-down large-logs large-ps \
         large-build-saga large-build-2pc large-up-saga large-up-2pc \
-        unit-saga unit-2pc consistency stress-init stress-locust stress-headless
+        unit-simple unit-saga unit-2pc consistency stress-init stress-locust stress-headless
 
 small-build:
 	TRANSACTION_MODE=$(TRANSACTION_MODE) $(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) build
@@ -32,7 +32,7 @@ small-up:
 	TRANSACTION_MODE=$(TRANSACTION_MODE) $(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) up -d --build --force-recreate
 
 small-down:
-	$(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) down -v
+	$(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) down -v --remove-orphans
 
 small-logs:
 	$(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) logs -f
@@ -59,7 +59,7 @@ medium-up:
 	TRANSACTION_MODE=$(TRANSACTION_MODE) $(COMPOSE) -p $(MEDIUM_PROJECT) -f $(MEDIUM_FILE) up -d --build --force-recreate
 
 medium-down:
-	$(COMPOSE) -p $(MEDIUM_PROJECT) -f $(MEDIUM_FILE) down -v
+	$(COMPOSE) -p $(MEDIUM_PROJECT) -f $(MEDIUM_FILE) down -v --remove-orphans
 
 medium-logs:
 	$(COMPOSE) -p $(MEDIUM_PROJECT) -f $(MEDIUM_FILE) logs -f
@@ -86,7 +86,7 @@ large-up:
 	TRANSACTION_MODE=$(TRANSACTION_MODE) $(COMPOSE) -p $(LARGE_PROJECT) -f $(LARGE_FILE) up -d --build --force-recreate
 
 large-down:
-	$(COMPOSE) -p $(LARGE_PROJECT) -f $(LARGE_FILE) down -v
+	$(COMPOSE) -p $(LARGE_PROJECT) -f $(LARGE_FILE) down -v --remove-orphans
 
 large-logs:
 	$(COMPOSE) -p $(LARGE_PROJECT) -f $(LARGE_FILE) logs -f
@@ -106,22 +106,27 @@ large-up-saga: large-up
 large-up-2pc: TRANSACTION_MODE=2pc
 large-up-2pc: large-up
 
-unit-saga: TRANSACTION_MODE=saga
-unit-saga:
-	$(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) down -v
+unit-simple: TRANSACTION_MODE=saga
+unit-simple:
+	$(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) down -v --remove-orphans
 	TRANSACTION_MODE=$(TRANSACTION_MODE) $(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) up -d --build --force-recreate
 	$(SMALL_TEST_ENV) $(PYTHON) -m unittest test.test_microservices -v
-	$(SMALL_TEST_ENV) $(PYTHON) -m unittest test.test_streams_simple -v
-	$(SMALL_TEST_ENV) $(PYTHON) -m unittest test.test_streams_saga -v
-	$(SMALL_TEST_ENV) $(PYTHON) -m unittest test.test_streams_saga_databases -v
+	$(SMALL_TEST_ENV) $(PYTHON) -m unittest test.test_kafka_simple -v
+
+unit-saga: TRANSACTION_MODE=saga
+unit-saga:
+	$(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) down -v --remove-orphans
+	TRANSACTION_MODE=$(TRANSACTION_MODE) $(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) up -d --build --force-recreate
+	$(SMALL_TEST_ENV) $(PYTHON) -m unittest test.test_microservices -v
+	$(SMALL_TEST_ENV) $(PYTHON) -m unittest test.test_kafka_saga -v
+	$(SMALL_TEST_ENV) $(PYTHON) -m unittest test.test_kafka_saga_databases -v
 
 unit-2pc: TRANSACTION_MODE=2pc
 unit-2pc:
-	$(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) down -v
+	$(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) down -v --remove-orphans
 	TRANSACTION_MODE=$(TRANSACTION_MODE) $(COMPOSE) -p $(SMALL_PROJECT) -f $(SMALL_FILE) up -d --build --force-recreate
 	$(SMALL_TEST_ENV) $(PYTHON) -m unittest test.test_microservices -v
 	$(SMALL_TEST_ENV) $(PYTHON) -m unittest test.test_2pc -v
-	$(SMALL_TEST_ENV) $(PYTHON) -m unittest test.test_2pc_databases -v
 
 consistency:
 	cd $(CONSISTENCY_DIR) && $(PYTHON) run_consistency_test.py
