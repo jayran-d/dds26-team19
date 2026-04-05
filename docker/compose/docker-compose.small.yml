@@ -65,7 +65,7 @@ x-orchestrator-service-base: &orchestrator-service-base
     - PAYMENT_REDIS_PORT=6379
     - PAYMENT_REDIS_PASSWORD=redis
     - PAYMENT_REDIS_DB=0
-    - CONSUMER_WORKERS=1
+    - CONSUMER_WORKERS=8
     - STREAM_BATCH_SIZE=32
     - TRANSACTION_MODE=${TRANSACTION_MODE:-saga}
     - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
@@ -95,7 +95,7 @@ x-stock-service-base: &stock-service-base
   image: stock:latest
   restart: unless-stopped
   environment:
-    - CONSUMER_WORKERS=1
+    - CONSUMER_WORKERS=8
     - STREAM_BATCH_SIZE=32
     - TRANSACTION_MODE=${TRANSACTION_MODE:-saga}
     - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
@@ -119,7 +119,7 @@ x-payment-service-base: &payment-service-base
   image: payment:latest
   restart: unless-stopped
   environment:
-    - CONSUMER_WORKERS=1
+    - CONSUMER_WORKERS=8
     - STREAM_BATCH_SIZE=32
     - TRANSACTION_MODE=${TRANSACTION_MODE:-saga}
     - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
