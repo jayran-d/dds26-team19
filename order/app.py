@@ -94,6 +94,7 @@ def get_order_from_db(order_id: str) -> OrderValue | None:
         return abort(400, DB_ERROR_STR)
     entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
     if entry is None:
+        print( f"Order: {order_id} not found!\n", flush=True)
         abort(400, f"Order: {order_id} not found!")
     return entry
 
@@ -110,9 +111,11 @@ def get_order_and_status(order_id: str) -> tuple[OrderValue | None, str | None]:
     try:
         raw_order, raw_status = db.mget(order_id, f"order:{order_id}:status")
     except redis.exceptions.RedisError:
+        print(f"ERROR IN RETRIEVEING ORDER STATUS {DB_ERROR_STR}\n", flush=True)
         return abort(400, DB_ERROR_STR)
     order_entry: OrderValue | None = msgpack.decode(raw_order, type=OrderValue) if raw_order else None
     if order_entry is None:
+        print(f"Order: {order_id} not found!\n", flush=True)
         abort(400, f"Order: {order_id} not found!")
     status = raw_status.decode() if raw_status else None
     return order_entry, status
@@ -134,9 +137,11 @@ async def get_order_and_status_async(order_id: str) -> tuple[OrderValue | None, 
             f"order:{order_id}:status",
         )
     except redis.exceptions.RedisError:
+        print(f"ERROR IN GET ORDER STATUS ASYNC {DB_ERROR_STR}\n", flush=True)
         return abort(400, DB_ERROR_STR)
     order_entry: OrderValue | None = msgpack.decode(raw_order, type=OrderValue) if raw_order else None
     if order_entry is None:
+        print(f"Order: {order_id} not found!\n", flush=True)
         abort(400, f"Order: {order_id} not found!")
     status = raw_status.decode() if raw_status else None
     return order_entry, status
@@ -308,50 +313,19 @@ async def checkout(order_id: str):
             try:
                 result = await asyncio.to_thread(start_checkout, order_id, order_entry)
             except Exception as exc:
-                app.logger.error(f"[checkout] failed to start: {exc}")
+                print(f"[checkout] failed to start: {exc}", flush=True)
                 abort(400, str(exc))
 
             if isinstance(result, dict) and result.get("reason") == "already_in_progress":
                 return await _build_terminal_checkout_response(order_id, waiter)
 
             if isinstance(result, dict) and result.get("reason") == "error":
+                print(f"[checkout] failed to start", flush=True)
                 abort(400, "Failed to start checkout")
 
             return await _build_terminal_checkout_response(order_id, waiter)
     finally:
         checkout_notify.unregister_async(order_id, waiter)
-
-    # ── HTTP fallback ──────────────────────────────────────────────────────────
-    items_quantities: dict[str, int] = defaultdict(int)
-    for item_id, quantity in order_entry.items:
-        items_quantities[item_id] += quantity
-
-    removed_items: list[tuple[str, int]] = []
-
-    for item_id, quantity in items_quantities.items():
-        reply = _send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if reply.status_code != 200:
-            for rid, rqty in removed_items:
-                _send_post_request(f"{GATEWAY_URL}/stock/add/{rid}/{rqty}")
-            abort(400, f"Out of stock on item_id: {item_id}")
-        removed_items.append((item_id, quantity))
-
-    reply = _send_post_request(
-        f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}"
-    )
-    if reply.status_code != 200:
-        for rid, rqty in removed_items:
-            _send_post_request(f"{GATEWAY_URL}/stock/add/{rid}/{rqty}")
-        abort(400, "User out of credit")
-
-    order_entry.paid = True
-    try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-
-    return Response("Checkout successful", status=200)
-
 
 # ── Startup ────────────────────────────────────────────────────────────────────
 

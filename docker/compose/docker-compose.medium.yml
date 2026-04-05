@@ -42,9 +42,9 @@ x-order-service-base: &order-service-base
   command: >-
     sh -lc '
     if [ "$$VERBOSE_LOGS" = "true" ]; then
-      exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --log-level debug --access-logfile - app:app;
+      exec hypercorn -b 0.0.0.0:5000 -w 2 --backlog 4096 --graceful-timeout 30 --log-level debug --access-logfile - app:app;
     else
-      exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --log-level info app:app;
+      exec hypercorn -b 0.0.0.0:5000 -w 2 --backlog 4096 --graceful-timeout 30 --log-level info app:app;
     fi'
   env_file:
     - ../../env/order_redis.env
@@ -70,9 +70,9 @@ x-stock-service-base: &stock-service-base
   command: >-
     sh -lc '
     if [ "$$VERBOSE_LOGS" = "true" ]; then
-      exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=debug --access-logfile - app:app;
+      exec gunicorn -b 0.0.0.0:5000 -w 2--timeout 30 --log-level=debug --access-logfile - app:app;
     else
-      exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app;
+      exec gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app;
     fi'
   env_file:
     - ../../env/stock_redis.env
@@ -94,9 +94,9 @@ x-payment-service-base: &payment-service-base
   command: >-
     sh -lc '
     if [ "$$VERBOSE_LOGS" = "true" ]; then
-      exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=debug --access-logfile - app:app;
+      exec gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=debug --access-logfile - app:app;
     else
-      exec gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app;
+      exec gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app;
     fi'
   env_file:
     - ../../env/payment_redis.env
