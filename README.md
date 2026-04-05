@@ -173,6 +173,20 @@ make medium-down
 make large-down
 ```
 
+### 5) Non-interactive kill from host (all possible service/db targets)
+
+Small profile:
+
+```bash
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec orchestrator-service sh -lc 'kill -TERM 1'
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-service sh -lc 'kill -TERM 1'
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec payment-service sh -lc 'kill -TERM 1'
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec stock-service sh -lc 'kill -TERM 1'
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-db sh -lc 'kill -TERM 1'
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec payment-db sh -lc 'kill -TERM 1'
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec stock-db sh -lc 'kill -TERM 1'
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec orchestrator-db sh -lc 'kill -TERM 1'
+```
 ## Testing
 
 Unit and protocol tests:
