@@ -173,7 +173,7 @@ make medium-down
 make large-down
 ```
 
-### 5) Non-interactive kill from host (all possible service/db targets)
+### Non-interactive kill from host (all possible service/db targets)
 
 Small profile:
 
