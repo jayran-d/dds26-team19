@@ -213,6 +213,55 @@ Important design points:
 
 This is why a failed checkout should not lose money.
 
+Saga success/failure sequence:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as Gateway
+    participant O as Order Service
+    participant Orch as Orchestrator
+    participant Coord as "orchestrator-db"
+    participant S as Stock Service
+    participant P as Payment Service
+    participant ODB as "order-db"
+
+    C->>G: POST /orders/checkout/{order_id}
+    G->>O: Forward request
+    O->>Orch: POST /transactions/checkout
+    Orch->>Coord: Create Saga record
+    Orch->>ODB: Write reserving_stock
+    Orch->>S: RESERVE_STOCK
+    S-->>Orch: STOCK_RESERVED or STOCK_RESERVATION_FAILED
+
+    alt stock reserved
+        Orch->>Coord: Transition to processing_payment
+        Orch->>ODB: Write processing_payment
+        Orch->>P: PROCESS_PAYMENT
+        P-->>Orch: PAYMENT_SUCCESS or PAYMENT_FAILED
+        alt payment success
+            Orch->>Coord: Transition to completed
+            Orch->>ODB: Write completed
+            O->>ODB: Poll terminal status
+            O-->>C: 200 success
+        else payment failed
+            Orch->>Coord: Transition to compensating
+            Orch->>ODB: Write compensating
+            Orch->>S: RELEASE_STOCK
+            S-->>Orch: STOCK_RELEASED
+            Orch->>Coord: Transition to failed
+            Orch->>ODB: Write failed
+            O->>ODB: Poll terminal status
+            O-->>C: 400 failure
+        end
+    else stock reservation failed
+        Orch->>Coord: Transition to failed
+        Orch->>ODB: Write failed
+        O->>ODB: Poll terminal status
+        O-->>C: 400 failure
+    end
+```
+
 ## 9. Durable Saga record model
 
 Saga state is persisted in [`orchestrator/protocols/saga/saga_record.py`](orchestrator/protocols/saga/saga_record.py), not in memory.
@@ -261,6 +310,52 @@ Why this implementation is robust:
 - participant/deci­sion transitions are guarded by Lua scripts, not ad-hoc multi-step reads and writes
 - the coordinator keeps a bounded recovery set `2pc:incomplete`
 - recovery rebuilds missing prepare/commit/abort messages from durable state
+
+2PC success/failure sequence:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as Gateway
+    participant O as Order Service
+    participant Orch as Orchestrator
+    participant Coord as "orchestrator-db"
+    participant S as Stock Service
+    participant P as Payment Service
+    participant ODB as "order-db"
+
+    C->>G: POST /orders/checkout/{order_id}
+    G->>O: Forward request
+    O->>Orch: POST /transactions/checkout
+    Orch->>Coord: Create 2PC state
+    Orch->>ODB: Write preparing_stock
+    Orch->>S: PREPARE_STOCK
+    Orch->>P: PREPARE_PAYMENT
+    S-->>Orch: STOCK_PREPARED or STOCK_PREPARE_FAILED
+    P-->>Orch: PAYMENT_PREPARED or PAYMENT_PREPARE_FAILED
+
+    alt both prepared
+        Orch->>Coord: Decide COMMIT
+        Orch->>ODB: Write committing
+        Orch->>S: COMMIT_STOCK
+        Orch->>P: COMMIT_PAYMENT
+        S-->>Orch: STOCK_COMMITTED
+        P-->>Orch: PAYMENT_COMMITTED
+        Orch->>ODB: Write completed
+        O->>ODB: Poll terminal status
+        O-->>C: 200 success
+    else one prepare failed
+        Orch->>Coord: Decide ABORT
+        Orch->>ODB: Write aborting
+        Orch->>S: ABORT_STOCK
+        Orch->>P: ABORT_PAYMENT
+        S-->>Orch: STOCK_ABORTED
+        P-->>Orch: PAYMENT_ABORTED
+        Orch->>ODB: Write failed
+        O->>ODB: Poll terminal status
+        O-->>C: 400 failure
+    end
+```
 
 ## 11. Participant services: stock and payment
 
