@@ -28,7 +28,8 @@ x-order-service-base: &order-service-base
   restart: unless-stopped
   environment:
     - GATEWAY_URL=http://gateway:80
-    - ORCHESTRATOR_URL=http://orchestrator-service:5000
+    - ORCHESTRATOR_URL=http://gateway:80/orchestrator
+    - TRANSACTION_MODE=${TRANSACTION_MODE:-saga}
     - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
   command: >-
     sh -lc '
@@ -65,8 +66,9 @@ x-orchestrator-service-base: &orchestrator-service-base
     - PAYMENT_REDIS_PORT=6379
     - PAYMENT_REDIS_PASSWORD=redis
     - PAYMENT_REDIS_DB=0
-    - CONSUMER_WORKERS=8
+    - CONSUMER_WORKERS=3
     - STREAM_BATCH_SIZE=32
+    - TRANSACTION_MODE=${TRANSACTION_MODE:-saga}
     - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
   command: >-
     sh -lc '
@@ -97,6 +99,7 @@ x-stock-service-base: &stock-service-base
   environment:
     - CONSUMER_WORKERS=8
     - STREAM_BATCH_SIZE=32
+    - TRANSACTION_MODE=${TRANSACTION_MODE:-saga}
     - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
   command: >-
     sh -lc '
@@ -121,6 +124,7 @@ x-payment-service-base: &payment-service-base
   environment:
     - CONSUMER_WORKERS=8
     - STREAM_BATCH_SIZE=32
+    - TRANSACTION_MODE=${TRANSACTION_MODE:-saga}
     - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
   command: >-
     sh -lc '
@@ -164,6 +168,10 @@ services:
     depends_on:
       orchestrator-service:
         condition: service_healthy
+      orchestrator-service-2:
+        condition: service_healthy
+      orchestrator-service-3:
+        condition: service_healthy
       order-service:
         condition: service_healthy
       order-service-2:
@@ -187,10 +195,6 @@ services:
       order-service-11:
         condition: service_healthy
       order-service-12:
-        condition: service_healthy
-      order-service-13:
-        condition: service_healthy
-      order-service-14:
         condition: service_healthy
       stock-service:
         condition: service_healthy
@@ -256,6 +260,12 @@ services:
       context: ../..
       dockerfile: orchestrator/Dockerfile
 
+  orchestrator-service-2:
+    <<: *orchestrator-service-base
+
+  orchestrator-service-3:
+    <<: *orchestrator-service-base
+
   order-service:
     <<: *order-service-base
     build:
@@ -293,12 +303,6 @@ services:
     <<: *order-service-base
 
   order-service-12:
-    <<: *order-service-base
-
-  order-service-13:
-    <<: *order-service-base
-
-  order-service-14:
     <<: *order-service-base
 
   order-db:

@@ -161,25 +161,24 @@ def saga_route_order(
         return
 
     if msg_type == STOCK_RESERVED:
-        _on_stock_reserved(record, coord_db, publish, logger)
+        _on_stock_reserved(record, coord_db, publish, logger, message_id)
     elif msg_type == STOCK_RESERVATION_FAILED:
-        _on_stock_reservation_failed(record, msg, coord_db, logger)
+        _on_stock_reservation_failed(record, msg, coord_db, logger, message_id)
     elif msg_type == STOCK_RELEASED:
-        _on_stock_released(record, coord_db, logger)
+        _on_stock_released(record, coord_db, logger, message_id)
     elif msg_type == PAYMENT_SUCCESS:
-        _on_payment_success(record, coord_db, logger)
+        _on_payment_success(record, coord_db, logger, message_id)
     elif msg_type == PAYMENT_FAILED:
-        _on_payment_failed(record, msg, coord_db, publish, logger)
+        _on_payment_failed(record, msg, coord_db, publish, logger, message_id)
     else:
         logger.warning(f"[Saga] unknown event type={msg_type} — dropping")
-        return
-
-    saga_record.mark_seen(coord_db, message_id)
+        # Unknown type: mark seen so it is not re-delivered forever.
+        saga_record.mark_seen(coord_db, message_id)
 
 
 # ── Handlers ─────────────────────────────────────────────────────────────────
 
-def _on_stock_reserved(record, coord_db, publish, logger):
+def _on_stock_reserved(record, coord_db, publish, logger, message_id):
     tx_id    = record["tx_id"]
     order_id = record["order_id"]
     user_id  = record["user_id"]
@@ -196,6 +195,7 @@ def _on_stock_reserved(record, coord_db, publish, logger):
         awaiting_event_type=PAYMENT_SUCCESS,
         needs_stock_comp=True,
         record=record,
+        message_id=message_id,
     )
     _write_order_status(order_id, SagaOrderStatus.PROCESSING_PAYMENT)
 
@@ -203,7 +203,7 @@ def _on_stock_reserved(record, coord_db, publish, logger):
     logger.debug(f"[Saga] stock reserved → processing payment tx={tx_id}")
 
 
-def _on_stock_reservation_failed(record, msg, coord_db, logger):
+def _on_stock_reservation_failed(record, msg, coord_db, logger, message_id):
     tx_id    = record["tx_id"]
     order_id = record["order_id"]
     reason   = msg.get("payload", {}).get("reason", "unknown")
@@ -218,13 +218,14 @@ def _on_stock_reservation_failed(record, msg, coord_db, logger):
         failure_reason=reason,
         reset_timeout=False,
         record=record,
+        message_id=message_id,
     )
     _write_order_status(order_id, SagaOrderStatus.FAILED)
     saga_record.clear_active_tx_id(coord_db, order_id, tx_id)
     logger.debug(f"[Saga] stock reservation failed tx={tx_id}: {reason}")
 
 
-def _on_payment_success(record, coord_db, logger):
+def _on_payment_success(record, coord_db, logger, message_id):
     tx_id    = record["tx_id"]
     order_id = record["order_id"]
 
@@ -237,13 +238,14 @@ def _on_payment_success(record, coord_db, logger):
         new_state=SagaOrderStatus.COMPLETED,
         reset_timeout=False,
         record=record,
+        message_id=message_id,
     )
     _write_order_status(order_id, SagaOrderStatus.COMPLETED)
     saga_record.clear_active_tx_id(coord_db, order_id, tx_id)
     logger.debug(f"[Saga] completed tx={tx_id} order={order_id}")
 
 
-def _on_payment_failed(record, msg, coord_db, publish, logger):
+def _on_payment_failed(record, msg, coord_db, publish, logger, message_id):
     tx_id    = record["tx_id"]
     order_id = record["order_id"]
     reason   = msg.get("payload", {}).get("reason", "unknown")
@@ -260,6 +262,7 @@ def _on_payment_failed(record, msg, coord_db, publish, logger):
         awaiting_event_type=STOCK_RELEASED,
         failure_reason=reason,
         record=record,
+        message_id=message_id,
     )
     _write_order_status(order_id, SagaOrderStatus.COMPENSATING)
 
@@ -267,7 +270,7 @@ def _on_payment_failed(record, msg, coord_db, publish, logger):
     logger.debug(f"[Saga] payment failed → compensating tx={tx_id}: {reason}")
 
 
-def _on_stock_released(record, coord_db, logger):
+def _on_stock_released(record, coord_db, logger, message_id):
     tx_id    = record["tx_id"]
     order_id = record["order_id"]
 
@@ -280,6 +283,7 @@ def _on_stock_released(record, coord_db, logger):
         new_state=SagaOrderStatus.FAILED,
         reset_timeout=False,
         record=record,
+        message_id=message_id,
     )
     _write_order_status(order_id, SagaOrderStatus.FAILED)
     saga_record.clear_active_tx_id(coord_db, order_id, tx_id)

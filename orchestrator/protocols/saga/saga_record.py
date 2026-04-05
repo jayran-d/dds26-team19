@@ -142,7 +142,17 @@ def transition(
     failure_reason: str | None = None,
     reset_timeout: bool = True,
     record: dict | None = None,
+    message_id: str | None = None,
 ) -> bool:
+    """
+    Persist a Saga state transition atomically.
+
+    If *message_id* is provided the seen-dedup SET is folded into the same
+    pipeline, saving one coord_db round trip per processed event.  This is
+    safe because the transition and the mark-seen now succeed or fail together:
+    if the pipeline is rejected neither the state nor the dedup key changes, so
+    the event will be redelivered by the orphan-recovery worker and retried.
+    """
     try:
         record_obj = dict(record) if record is not None else get(db, tx_id)
         if not record_obj:
@@ -173,6 +183,9 @@ def transition(
         else:
             pipe.sadd(_incomplete_key(), tx_id)
             pipe.zadd(_timeout_index_key(), {tx_id: record_obj["timeout_at_ms"]})
+        if message_id is not None:
+            # Fold mark_seen into this pipeline — one fewer coord_db round trip.
+            pipe.set(_seen_key(message_id), "1", ex=SEEN_EVENT_TTL)
         pipe.execute()
         if record is not None:
             record.clear()

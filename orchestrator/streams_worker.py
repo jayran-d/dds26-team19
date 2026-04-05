@@ -30,6 +30,7 @@ from common.messages import (
     STOCK_COMMANDS_TOPIC,
     PAYMENT_COMMANDS_TOPIC,
 )
+from leader_lease import init_lease, is_leader, release_lease
 from protocols.saga.saga import (
     saga_route_order,
     saga_start_checkout,
@@ -201,15 +202,20 @@ def _orphan_recovery_worker(
 def _recovery_loop(publish_fn) -> None:
     while _available:
         try:
-            if TRANSACTION_MODE == "saga":
-                # Saga uses timeouts to republish the next expected command when
-                # a previous command/event exchange was interrupted by a crash.
-                saga_check_timeouts(_coord_db, publish_fn, _logger)
-            elif TRANSACTION_MODE == "2pc":
-                from protocols.two_pc import recover_incomplete_2pc
-                # 2PC recovery walks only unfinished coordinator state and
-                # re-emits prepare/commit/abort work that was not confirmed yet.
-                recover_incomplete_2pc()
+            # Only the leader runs the timeout/recovery scanner.  Non-leaders
+            # sleep and re-check so they can take over if the leader dies and
+            # the lease expires.
+            if is_leader():
+                if TRANSACTION_MODE == "saga":
+                    # Saga uses timeouts to republish the next expected command
+                    # when a previous command/event exchange was interrupted by
+                    # a crash.
+                    saga_check_timeouts(_coord_db, publish_fn, _logger)
+                elif TRANSACTION_MODE == "2pc":
+                    from protocols.two_pc import recover_incomplete_2pc
+                    # 2PC recovery walks only unfinished coordinator state and
+                    # re-emits prepare/commit/abort work not yet confirmed.
+                    recover_incomplete_2pc()
         except Exception as exc:
             log_worker_exception(_logger, "OrchestratorStreams", "recovery loop", exc)
         time.sleep(TIMEOUT_SCAN_INTERVAL)
@@ -245,16 +251,27 @@ def init_streams(logger, coord_db: redis_module.Redis) -> None:
         else:
             payment_sc.publish(stream, message)
 
+    # Acquire the leader lease before deciding whether to run startup recovery.
+    # Exactly one replica will win; others skip recovery because the winner
+    # will have already re-published any in-flight commands.
+    init_lease(coord_db, logger)
+
     if TRANSACTION_MODE == "saga":
         init_saga(_order_db)
-        # On orchestrator restart, recover all in-flight Sagas before workers
-        # start reading fresh participant events.
-        saga_recover(_coord_db, publish_fn, logger)
+        if is_leader():
+            # On orchestrator restart, recover all in-flight Sagas before
+            # workers start reading fresh participant events.
+            saga_recover(_coord_db, publish_fn, logger)
+        else:
+            logger.info("[OrchestratorStreams] not leader — skipping startup saga recovery")
     elif TRANSACTION_MODE == "2pc":
         from protocols.two_pc import init_2pc, recover_incomplete_2pc
         init_2pc(_coord_db, _order_db, publish_fn, logger)
-        # Reconstruct any unfinished 2PC transactions from durable coordinator state.
-        recover_incomplete_2pc()
+        if is_leader():
+            # Reconstruct any unfinished 2PC transactions from durable state.
+            recover_incomplete_2pc()
+        else:
+            logger.info("[OrchestratorStreams] not leader — skipping startup 2PC recovery")
 
     threading.Thread(target=_recovery_loop, args=(publish_fn,), daemon=True).start()
 
@@ -292,6 +309,7 @@ def init_streams(logger, coord_db: redis_module.Redis) -> None:
 def close_streams() -> None:
     global _available
     _available = False
+    release_lease()
 
 
 def is_available() -> bool:
