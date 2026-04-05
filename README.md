@@ -8,6 +8,16 @@ Basic project structure with Python's Flask and Redis.
 - Codebase walkthrough: [docs/codebase_walkthrough.md](docs/codebase_walkthrough.md)
 - Compose scaling guide: [docs/compose_scaling.md](docs/compose_scaling.md)
 
+## Code Walkthrough Summary
+
+This system is intentionally split into three bounded services: `order` coordinates checkout, `stock` owns inventory state, and `payment` owns account balances. That separation keeps each service authoritative over its own data and forces cross-service consistency to go through an explicit transaction protocol instead of hidden shared-state updates.
+
+The main design decision is that checkout is synchronous for the client, but asynchronous inside the system. The order service accepts the HTTP request, publishes commands over Redis Streams, and waits for terminal events from stock and payment before returning. `checkout_notify` is the small but important bridge that makes this work cleanly: background stream workers can finish a transaction and safely wake the waiting HTTP handler, so the client still sees one coherent request/response flow.
+
+Throughput is optimized in a few concrete ways that matter in the code. Each service runs multiple HTTP workers, and each service also starts multiple Redis Streams consumer threads (`CONSUMER_WORKERS`) so command and event handling can proceed in parallel instead of serially. Workers consume in batches (`STREAM_BATCH_SIZE`), the medium and large compose profiles replicate each service aggressively, and Nginx fans requests across those replicas. In the order service, stock events and payment events are processed by separate worker pools, which prevents one side of the checkout pipeline from becoming the only bottleneck.
+
+The reliability story is what makes the solution correct rather than just fast. Redis Streams consumer groups give us durable message delivery, and the stock and payment services each keep a participant `ledger` in Redis keyed by transaction and action. That ledger records whether a command was only received, already applied, or already replied to, which makes duplicate delivery safe and lets a service re-publish the correct event after a crash without reapplying the business effect. We also run dedicated orphan-recovery threads that periodically claim messages left pending by dead or stalled consumers, so work does not get stranded in the stream after a crash. On the coordinator side, the order service persists transaction progress for Saga and 2PC recovery, while timeout workers detect stalled transactions and move them toward compensation or cleanup. At the Redis layer, fault tolerance is improved by giving each bounded context its own Redis instance, persisting data on Docker volumes with AOF enabled, restarting containers automatically with health checks, and using client-side connection timeouts plus `retry_on_timeout` so transient Redis hiccups are more likely to be absorbed than surfaced as immediate failures. Together, these pieces make the system robust under retries, partial failures, and horizontal scaling, not just under the happy path.
+
 ### Project structure
 
 * `env`
