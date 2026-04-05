@@ -39,6 +39,7 @@ x-order-service-base: &order-service-base
     - CONSUMER_WORKERS=8
     - STREAM_BATCH_SIZE=32
     - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
+    - TRANSACTION_MODE=${TRANSACTION_MODE:-saga}
   command: >-
     sh -lc '
     if [ "$$VERBOSE_LOGS" = "true" ]; then
@@ -48,7 +49,6 @@ x-order-service-base: &order-service-base
     fi'
   env_file:
     - ../../env/order_redis.env
-    - ../../env/transaction.env
   ulimits: *nofile-ulimits
   healthcheck: *http-healthcheck
   depends_on:
@@ -67,6 +67,7 @@ x-stock-service-base: &stock-service-base
     - CONSUMER_WORKERS=8
     - STREAM_BATCH_SIZE=32
     - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
+    - TRANSACTION_MODE=${TRANSACTION_MODE:-saga}
   command: >-
     sh -lc '
     if [ "$$VERBOSE_LOGS" = "true" ]; then
@@ -76,7 +77,6 @@ x-stock-service-base: &stock-service-base
     fi'
   env_file:
     - ../../env/stock_redis.env
-    - ../../env/transaction.env
   ulimits: *nofile-ulimits
   healthcheck: *http-healthcheck
   depends_on:
@@ -91,6 +91,7 @@ x-payment-service-base: &payment-service-base
     - CONSUMER_WORKERS=8
     - STREAM_BATCH_SIZE=32
     - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
+    - TRANSACTION_MODE=${TRANSACTION_MODE:-saga}
   command: >-
     sh -lc '
     if [ "$$VERBOSE_LOGS" = "true" ]; then
@@ -100,7 +101,6 @@ x-payment-service-base: &payment-service-base
     fi'
   env_file:
     - ../../env/payment_redis.env
-    - ../../env/transaction.env
   ulimits: *nofile-ulimits
   healthcheck: *http-healthcheck
   depends_on:

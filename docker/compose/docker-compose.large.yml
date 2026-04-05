@@ -39,6 +39,7 @@ x-order-service-base: &order-service-base
     - CONSUMER_WORKERS=8
     - STREAM_BATCH_SIZE=32
     - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
+    - TRANSACTION_MODE=${TRANSACTION_MODE:-saga}
   command: >-
     sh -lc '
     if [ "$$VERBOSE_LOGS" = "true" ]; then
@@ -67,6 +68,7 @@ x-stock-service-base: &stock-service-base
     - CONSUMER_WORKERS=8
     - STREAM_BATCH_SIZE=32
     - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
+    - TRANSACTION_MODE=${TRANSACTION_MODE:-saga}
   command: >-
     sh -lc '
     if [ "$$VERBOSE_LOGS" = "true" ]; then
@@ -91,6 +93,7 @@ x-payment-service-base: &payment-service-base
     - CONSUMER_WORKERS=8
     - STREAM_BATCH_SIZE=32
     - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
+    - TRANSACTION_MODE=${TRANSACTION_MODE:-saga}
   command: >-
     sh -lc '
     if [ "$$VERBOSE_LOGS" = "true" ]; then
