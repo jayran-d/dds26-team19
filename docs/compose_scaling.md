@@ -44,7 +44,11 @@ The medium and large configs declare every backend replica explicitly and use Do
 
 ## Usage
 
-Use the `Makefile` targets:
+Use the profile name as the prefix: `small`, `medium`, or `large`.
+
+### Start a profile
+
+Build and start the selected profile with the default transaction mode (`saga`):
 
 ```bash
 make small-up
@@ -52,11 +56,63 @@ make medium-up
 make large-up
 ```
 
-Stop a cluster with the matching `*-down` target:
+If you want to force a specific transaction mode, use the explicit targets:
+
+```bash
+make small-up-saga
+make small-up-2pc
+
+make medium-up-saga
+make medium-up-2pc
+
+make large-up-saga
+make large-up-2pc
+```
+
+### Build images without starting containers
+
+```bash
+make small-build
+make medium-build
+make large-build
+```
+
+Or build for a specific transaction mode:
+
+```bash
+make small-build-saga
+make small-build-2pc
+```
+
+### Inspect a running profile
+
+Show running containers:
+
+```bash
+make medium-ps
+```
+
+Follow logs:
+
+```bash
+make medium-logs
+```
+
+### Stop and remove a profile
+
+Stop a cluster and remove its containers and volumes with the matching `*-down` target:
 
 ```bash
 make medium-down
 ```
+
+### Rule of thumb
+
+- Use `make <profile>-up` when you want to start working quickly with the default `saga` mode.
+- Use `make <profile>-up-2pc` when you specifically need the 2PC flow.
+- Use `make <profile>-build` if you only want fresh images without launching the stack.
+- Use `make <profile>-ps` or `make <profile>-logs` to inspect an already running stack.
+- Use `make <profile>-down` when you want to fully tear that stack down.
 
 ## Notes
 

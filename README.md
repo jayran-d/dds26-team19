@@ -3,6 +3,11 @@
 Basic project structure with Python's Flask and Redis. 
 **You are free to use any web framework in any language and any database you like for this project.**
 
+## Project docs
+
+- Codebase walkthrough: [docs/codebase_walkthrough.md](docs/codebase_walkthrough.md)
+- Compose scaling guide: [docs/compose_scaling.md](docs/compose_scaling.md)
+
 ### Project structure
 
 * `env`
@@ -34,11 +39,6 @@ After coding the REST endpoint logic run `docker-compose up --build` in the base
 (you can use the provided tests in the `\test` folder and change them as you wish). 
 
 ***Requirements:*** You need to have docker and docker-compose installed on your machine. 
-
-### Testing Guides
-
-- Saga manual testing and log-watching guide:
-  [docs/manual_saga_testing.md](/Users/dariancomp/Documents/School/MasterTUDelftComputerScience/FirstYear/Q3/Distributed%20Data%20Systems/Assignment/dds26-team19/docs/manual_saga_testing.md)
  
 K8s is also possible, but we do not require it as part of your submission. 
 
@@ -56,3 +56,160 @@ but you can find any database you want in https://artifacthub.io/ and adapt the 
 Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in the helm step to also install an ingress to the cluster. 
 
 ***Requirements:*** You need to have access to kubectl of a k8s cluster.
+
+## Container operations (docker compose)
+
+Use these commands from the repo root.
+
+### 1) Profiles and compose files
+
+- small: project `dds-small`, file `docker/compose/docker-compose.small.yml`
+- medium: project `dds-medium`, file `docker/compose/docker-compose.medium.yml`
+- large: project `dds-large`, file `docker/compose/docker-compose.large.yml`
+
+### 2) Quick status/log commands (all profiles)
+
+```bash
+make small-ps
+make medium-ps
+make large-ps
+
+make small-logs
+make medium-logs
+make large-logs
+```
+
+### 3) Shell into containers (all profiles)
+
+Small profile:
+
+```bash
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-service sh
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec payment-service sh
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec stock-service sh
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-db sh
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec payment-db sh
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec stock-db sh
+```
+
+Medium profile:
+
+```bash
+docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec order-service sh
+docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec payment-service sh
+docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec stock-service sh
+docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec order-db sh
+docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec payment-db sh
+docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec stock-db sh
+```
+
+Large profile:
+
+```bash
+docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec order-service sh
+docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec payment-service sh
+docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec stock-service sh
+docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec order-db sh
+docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec payment-db sh
+docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec stock-db sh
+```
+
+### 4) Kill from inside the container (all profiles)
+
+After shelling into any target container, run:
+
+```bash
+kill -TERM 1
+```
+
+This sends a graceful termination signal to the container's PID 1 process.
+
+### 5) Non-interactive kill from host (all possible service/db targets)
+
+Small profile:
+
+```bash
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-service sh -lc 'kill -TERM 1'
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec payment-service sh -lc 'kill -TERM 1'
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec stock-service sh -lc 'kill -TERM 1'
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-db sh -lc 'kill -TERM 1'
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec payment-db sh -lc 'kill -TERM 1'
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec stock-db sh -lc 'kill -TERM 1'
+```
+
+Medium profile:
+
+```bash
+docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec order-service sh -lc 'kill -TERM 1'
+docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec payment-service sh -lc 'kill -TERM 1'
+docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec stock-service sh -lc 'kill -TERM 1'
+docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec order-db sh -lc 'kill -TERM 1'
+docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec payment-db sh -lc 'kill -TERM 1'
+docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec stock-db sh -lc 'kill -TERM 1'
+```
+
+Large profile:
+
+```bash
+docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec order-service sh -lc 'kill -TERM 1'
+docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec payment-service sh -lc 'kill -TERM 1'
+docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec stock-service sh -lc 'kill -TERM 1'
+docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec order-db sh -lc 'kill -TERM 1'
+docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec payment-db sh -lc 'kill -TERM 1'
+docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec stock-db sh -lc 'kill -TERM 1'
+```
+
+### 6) Host-side stop/kill/restart per container (all profiles)
+
+Small profile:
+
+```bash
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml stop order-service payment-service stock-service order-db payment-db stock-db
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml kill order-service payment-service stock-service order-db payment-db stock-db
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml restart order-service payment-service stock-service order-db payment-db stock-db
+```
+
+Medium profile:
+
+```bash
+docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml stop order-service payment-service stock-service order-db payment-db stock-db
+docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml kill order-service payment-service stock-service order-db payment-db stock-db
+docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml restart order-service payment-service stock-service order-db payment-db stock-db
+```
+
+Large profile:
+
+```bash
+docker compose -p dds-large -f docker/compose/docker-compose.large.yml stop order-service payment-service stock-service order-db payment-db stock-db
+docker compose -p dds-large -f docker/compose/docker-compose.large.yml kill order-service payment-service stock-service order-db payment-db stock-db
+docker compose -p dds-large -f docker/compose/docker-compose.large.yml restart order-service payment-service stock-service order-db payment-db stock-db
+```
+
+### 7) Other general operations
+
+Start or rebuild a profile:
+
+```bash
+make small-up-saga
+make small-up-2pc
+make medium-up-saga
+make medium-up-2pc
+make large-up-saga
+make large-up-2pc
+```
+
+Tear down a profile completely (including volumes):
+
+```bash
+make small-down
+make medium-down
+make large-down
+```
+
+Tail logs for one specific container:
+
+```bash
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml logs -f order-service
+docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml logs -f payment-db
+docker compose -p dds-large -f docker/compose/docker-compose.large.yml logs -f stock-service
+```
