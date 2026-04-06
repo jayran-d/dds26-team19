@@ -16,14 +16,13 @@ The client-facing API is synchronous, but the transaction processing path is eve
 
 ## What changed in this branch
 
-The Redis layer is now highly available per bounded context:
+The branch now supports two Redis deployment modes:
 
-- `order-db`, `stock-db`, and `payment-db` each run as a primary
-- each primary has a dedicated replica container
-- a shared three-node Redis Sentinel quorum tracks primaries and performs failover
-- service code connects through Sentinel-aware clients in `common/redis_client.py`
+- the `small` profile keeps one Redis primary per bounded context
+- the default, `medium`, and `large` layouts use Redis primaries plus replicas and a shared Sentinel quorum
+- service code connects through `common/redis_client.py`, which supports both direct-host and Sentinel-aware modes
 
-That means application code no longer assumes one fixed Redis container per service. It asks Sentinel for the current primary and reconnects there after failover.
+That means the low-scale profile stays compliant with the single-instance requirement, while the larger profiles can still demonstrate Redis failover behavior.
 
 ## Runtime architecture
 
@@ -36,19 +35,18 @@ That means application code no longer assumes one fixed Redis container per serv
 
 ### Redis topology
 
-Each bounded context has its own Redis deployment:
+Each bounded context still has its own Redis store:
 
-- `order-db` + `order-db-replica`
-- `stock-db` + `stock-db-replica`
-- `payment-db` + `payment-db-replica`
+- `small`: `order-db`, `stock-db`, `payment-db`
+- default / `medium` / `large`: `order-db` + `order-db-replica`, `stock-db` + `stock-db-replica`, `payment-db` + `payment-db-replica`
 
-The Sentinels are shared across all three databases:
+The HA layouts share:
 
 - `redis-sentinel-1`
 - `redis-sentinel-2`
 - `redis-sentinel-3`
 
-Application containers use environment variables such as `REDIS_SENTINELS` and `REDIS_MASTER_NAME` to discover the current primary instead of hardcoding a single host.
+Application containers use environment variables such as `REDIS_HOST`, `REDIS_SENTINELS`, and `REDIS_MASTER_NAME` so the same code can either connect directly in `small` or resolve the current primary in the HA layouts.
 
 ### Transaction modes
 
@@ -92,7 +90,7 @@ make large-up-saga
 make large-up-2pc
 ```
 
-The small profile now keeps one `stock-service`, one `payment-service`, and three `order-service` replicas behind Nginx so the synchronous checkout path does not become the first throughput bottleneck during local runs.
+The small profile now keeps one `order-service`, one `stock-service`, one `payment-service`, and one Redis container per bounded context.
 
 Inspect them with:
 
@@ -111,7 +109,7 @@ make unit-saga
 make unit-2pc
 ```
 
-Those commands rebuild the small profile, start the HA Redis topology, and run the integration suites against it.
+Those commands rebuild the small profile, start the single-instance Redis topology, and run the integration suites against it.
 
 Useful direct smoke tests:
 
@@ -140,8 +138,6 @@ Examples for the small profile:
 ```bash
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-service sh
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-db sh
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-db-replica sh
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec redis-sentinel-1 sh
 ```
 
 ### Graceful stop from inside a container
@@ -155,12 +151,11 @@ kill -TERM 1
 ```bash
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml restart order-service
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml restart order-db
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml restart redis-sentinel-1
 ```
 
 ## Repository layout
 
-- `common/`: shared stream, message, worker-logging, and Sentinel-aware Redis client code
+- `common/`: shared stream, message, worker-logging, and Redis client code for both direct and Sentinel-aware modes
 - `docker/compose/`: baseline, small, medium, and large Compose stacks
 - `env/`: Redis and transaction-mode environment settings
 - `nginx/`: gateway configs per deployment profile

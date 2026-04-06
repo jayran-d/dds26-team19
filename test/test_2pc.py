@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import unittest
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -308,6 +309,11 @@ SENTINEL_SERVICES = {
     REDIS_SENTINEL_2,
     REDIS_SENTINEL_3,
 }
+MASTER_PREFIXES = {
+    ORDER_DB_SERVICE: "REDIS",
+    STOCK_DB_SERVICE: "STOCK_REDIS",
+    PAYMENT_DB_SERVICE: "PAYMENT_REDIS",
+}
 
 
 def _compose(*args: str, input_text: Optional[str] = None, check: bool = True) -> subprocess.CompletedProcess:
@@ -319,6 +325,16 @@ def _compose(*args: str, input_text: Optional[str] = None, check: bool = True) -
         text=True,
         input=input_text,
     )
+
+
+@lru_cache(maxsize=1)
+def _configured_services() -> set[str]:
+    result = _compose("config", "--services")
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def _service_exists(service: str) -> bool:
+    return service in _configured_services()
 
 
 def _kill_service(service: str) -> None:
@@ -347,9 +363,7 @@ def _start_service(service: str, timeout: int = RECOVERY_WAIT) -> None:
 
 
 def _ensure_services_started() -> None:
-    _compose(
-        "up",
-        "-d",
+    requested_services = [
         ORDER_DB_SERVICE,
         ORDER_DB_REPLICA_SERVICE,
         STOCK_DB_SERVICE,
@@ -363,16 +377,18 @@ def _ensure_services_started() -> None:
         ORDER_SERVICE,
         STOCK_SERVICE,
         PAYMENT_SERVICE,
+    ]
+    _compose(
+        "up",
+        "-d",
+        *[service for service in requested_services if _service_exists(service)],
     )
-    _wait_for_redis(ORDER_DB_SERVICE)
-    _wait_for_redis(ORDER_DB_REPLICA_SERVICE)
-    _wait_for_redis(STOCK_DB_SERVICE)
-    _wait_for_redis(STOCK_DB_REPLICA_SERVICE)
-    _wait_for_redis(PAYMENT_DB_SERVICE)
-    _wait_for_redis(PAYMENT_DB_REPLICA_SERVICE)
-    _wait_for_sentinel(REDIS_SENTINEL_1)
-    _wait_for_sentinel(REDIS_SENTINEL_2)
-    _wait_for_sentinel(REDIS_SENTINEL_3)
+    for service in REDIS_SERVICES:
+        if _service_exists(service):
+            _wait_for_redis(service)
+    for service in SENTINEL_SERVICES:
+        if _service_exists(service):
+            _wait_for_sentinel(service)
     _wait_for_service_http(ORDER_SERVICE)
     _wait_for_service_http(STOCK_SERVICE)
     _wait_for_service_http(PAYMENT_SERVICE)
@@ -482,7 +498,7 @@ def _wait_for_order_transport_dependencies(timeout: int = RECOVERY_WAIT) -> None
         time.sleep(0.5)
 
     raise AssertionError(
-        f"{ORDER_SERVICE} did not reconnect to Redis primaries through Sentinel within {timeout}s"
+        f"{ORDER_SERVICE} did not reconnect to its configured Redis backends within {timeout}s"
     )
 
 
@@ -543,20 +559,15 @@ def _wait_for_2pc_field(
 
 
 def _read_from_master(master_name: str, command: str, key: str, field: Optional[str] = None) -> str:
+    env_prefix = MASTER_PREFIXES[master_name]
     read_script = (
         "import sys\n"
-        "from redis.sentinel import Sentinel\n"
-        "sentinel = Sentinel([\n"
-        "    ('redis-sentinel-1', 26379),\n"
-        "    ('redis-sentinel-2', 26379),\n"
-        "    ('redis-sentinel-3', 26379),\n"
-        "], sentinel_kwargs={'socket_connect_timeout': 1, 'socket_timeout': 1})\n"
-        "db = sentinel.master_for(\n"
+        "from common.redis_client import create_redis_client\n"
+        "db = create_redis_client(\n"
         "    sys.argv[1],\n"
-        "    password='redis',\n"
-        "    db=0,\n"
         "    socket_connect_timeout=1,\n"
         "    socket_timeout=1,\n"
+        "    health_check_interval=1,\n"
         ")\n"
         "command = sys.argv[2]\n"
         "key = sys.argv[3]\n"
@@ -569,7 +580,7 @@ def _read_from_master(master_name: str, command: str, key: str, field: Optional[
         "if value is not None:\n"
         "    sys.stdout.write(value.decode() if isinstance(value, bytes) else str(value))\n"
     )
-    args = [master_name, command, key]
+    args = [env_prefix, command, key]
     if field is not None:
         args.append(field)
     result = _compose(

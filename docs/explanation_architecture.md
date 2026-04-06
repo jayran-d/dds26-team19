@@ -1,6 +1,6 @@
 # Architecture Explanation
 
-This branch keeps the original three-service business split, but the infrastructure underneath it is now more resilient because each service-local Redis database has a primary, a replica, and Sentinel-based primary discovery.
+This branch keeps the original three-service business split. The larger deployments add Redis primaries, replicas, and Sentinel-based primary discovery, while the `small` profile stays single-instance.
 
 ## 1. Bounded contexts
 
@@ -77,15 +77,14 @@ Redis Streams carry:
 
 Consumer groups, pending-entry reclaiming, and participant ledgers are what make the transport restart-safe.
 
-## 5. New HA database layer
+## 5. Redis deployment layer
 
-The important infrastructure change in this branch is the move from one Redis container per bounded context to a replicated topology:
+The important infrastructure change in this branch is that the scaled layouts use a replicated Redis topology, while `small` remains single-instance:
 
-- `order-db` and `order-db-replica`
-- `stock-db` and `stock-db-replica`
-- `payment-db` and `payment-db-replica`
+- `small`: `order-db`, `stock-db`, `payment-db`
+- default / `medium` / `large`: `order-db` + `order-db-replica`, `stock-db` + `stock-db-replica`, `payment-db` + `payment-db-replica`
 
-Three Sentinel nodes observe those primaries:
+Three Sentinel nodes observe the HA primaries:
 
 - `redis-sentinel-1`
 - `redis-sentinel-2`
@@ -99,17 +98,16 @@ Replication alone is not enough. Clients still need to know which node is curren
 - quorum-based failover
 - primary discovery for clients
 
-Application code uses `common/redis_client.py` to connect through Sentinel, so it asks for the current primary by logical name, not by one fixed container hostname.
+Application code uses `common/redis_client.py` for both modes. In `small`, it connects directly through `*_REDIS_HOST`. In the HA layouts, it asks Sentinel for the current primary by logical name instead of hardcoding one fixed container hostname.
 
 ## 6. What failover changes in practice
 
 Before this change, a service that connected to `order-db` assumed that container was the only writable node. If that process died, the client stayed pinned to a dead endpoint until the same container came back.
 
-Now the contract is different:
+Now the contract depends on the profile:
 
-- clients talk to Sentinel
-- Sentinel identifies the current primary
-- clients reconnect to the promoted primary after failover
+- `small`: clients talk directly to the single configured Redis host
+- HA layouts: clients talk to Sentinel, Sentinel identifies the current primary, and clients reconnect to the promoted primary after failover
 
 That is the reason the branch now carries:
 
@@ -181,14 +179,12 @@ It does not coordinate transactions. Its job is to expose a single entry point a
 
 The small profile is aimed at correctness and local validation:
 
-- three `order-service` replicas behind the gateway
+- one `order-service`
 - one `stock-service`
 - one `payment-service`
 - three Redis primaries
-- three Redis replicas
-- three Sentinels
 
-That small-profile exception exists because the synchronous checkout endpoint is hosted in `order`, so it is the first service that saturates during local load tests.
+It is the literal single-instance topology used by the local test targets.
 
 The medium and large profiles keep the same Redis HA pattern and scale the app-service layer horizontally behind Nginx.
 

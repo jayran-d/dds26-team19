@@ -1,6 +1,6 @@
 # Codebase Walkthrough
 
-This document explains how the current branch is put together, with emphasis on the Redis primary/replica plus Sentinel topology that now backs the normal three-service architecture.
+This document explains how the current branch is put together, with emphasis on the normal three-service architecture and the fact that the larger deployments use Redis HA while `small` stays single-instance.
 
 ## 1. System shape
 
@@ -37,11 +37,10 @@ That gives the client a single blocking request while still keeping the distribu
 
 Each bounded context has its own Redis deployment:
 
-- `order-db` primary with `order-db-replica`
-- `stock-db` primary with `stock-db-replica`
-- `payment-db` primary with `payment-db-replica`
+- `small`: `order-db`, `stock-db`, `payment-db`
+- default / `medium` / `large`: `order-db` primary with `order-db-replica`, `stock-db` primary with `stock-db-replica`, `payment-db` primary with `payment-db-replica`
 
-All three database pairs share one Sentinel quorum:
+The HA layouts share one Sentinel quorum:
 
 - `redis-sentinel-1`
 - `redis-sentinel-2`
@@ -76,7 +75,7 @@ That helper is now used by:
 - `docker/compose/docker-compose.yml`
   - baseline topology with one app instance per service plus the Redis HA layer
 - `docker/compose/docker-compose.small.yml`
-  - same logical topology, sized for local verification
+  - single-instance local verification topology
 - `docker/compose/docker-compose.medium.yml`
   - horizontal app-service scaling plus Redis HA
 - `docker/compose/docker-compose.large.yml`
@@ -102,7 +101,7 @@ The older `REDIS_HOST` variables are still present as a direct-connection fallba
 - `nginx/gateway_nginx.medium.conf`
 - `nginx/gateway_nginx.large.conf`
 
-The sized configs explicitly enumerate backend replicas so Nginx can spread traffic across them. In the small profile, that matters primarily for `order-service`, because `/orders/checkout/...` is the latency-sensitive path under load and now has three backend replicas plus a longer gateway read timeout.
+The sized configs explicitly enumerate backend replicas so Nginx can spread traffic across them. In the small profile, each upstream points to a single backend and `/orders/checkout/...` still has a longer gateway read timeout.
 
 ## 5. Shared code
 
@@ -164,11 +163,11 @@ This is the coordination core of the branch. It:
 - runs timeout and recovery loops
 - reclaims orphaned pending stream messages
 
-It also opens Sentinel-aware clients to:
+It also opens Redis clients to:
 
-- the order Redis primary
-- the stock Redis primary
-- the payment Redis primary
+- the order Redis store
+- the stock Redis store
+- the payment Redis store
 
 ### `order/transactions_modes/saga/saga.py`
 
@@ -264,7 +263,7 @@ Implements prepare, commit, and abort for the payment participant.
 - payment participant ledger entries
 - payment command/event stream state
 
-Replicas mirror the primaries and are promoted by Sentinel during failover.
+In the HA layouts, replicas mirror the primaries and are promoted by Sentinel during failover. The `small` profile keeps only the primaries.
 
 ## 10. Recovery model
 
@@ -274,7 +273,7 @@ The system relies on several layers of recovery:
 - participant ledgers in `stock` and `payment` for idempotent replay
 - coordinator-side durable transaction state in `order`
 - orphan-claim loops for pending stream messages left behind by crashed consumers
-- Redis replication plus Sentinel for primary failover per bounded context
+- direct Redis primaries in `small`, plus replication and Sentinel failover in the HA layouts
 
 This combination is what makes the branch robust under duplicate delivery, process restarts, and Redis failover.
 
@@ -290,7 +289,7 @@ Saga integration tests for the normal branch's asynchronous transport and recove
 
 ### `test/test_kafka_saga_databases.py`
 
-Database stop/kill recovery tests for Saga. These are especially relevant now that the Redis layer includes primaries, replicas, and Sentinel-driven reconnects.
+Database stop/kill recovery tests for Saga. These cover both the single-instance `small` profile and the direct-vs-HA reconnect paths exposed through `common/redis_client.py`.
 
 ### `test/test_2pc.py`
 

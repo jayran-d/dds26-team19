@@ -7,18 +7,17 @@ This repository ships four Compose layouts:
 - `docker/compose/docker-compose.medium.yml`
 - `docker/compose/docker-compose.large.yml`
 
-All four now use the same Redis high-availability pattern:
+`docker-compose.yml`, `medium`, and `large` use the Redis HA pattern:
 
 - one primary per bounded context
 - one replica per bounded context
 - one shared three-node Sentinel quorum
 
-That means every profile includes:
+The `small` profile is the literal single-instance layout:
 
-- `order-db` and `order-db-replica`
-- `stock-db` and `stock-db-replica`
-- `payment-db` and `payment-db-replica`
-- `redis-sentinel-1`, `redis-sentinel-2`, `redis-sentinel-3`
+- `order-db`
+- `stock-db`
+- `payment-db`
 
 ## 1. Baseline compose file
 
@@ -59,12 +58,10 @@ Project name:
 Topology:
 
 - 1 `gateway`
-- 3 `order-service` replicas total
+- 1 `order-service`
 - 1 `stock-service`
 - 1 `payment-service`
 - 3 Redis primaries
-- 3 Redis replicas
-- 3 Sentinels
 
 CPU limits:
 
@@ -162,7 +159,7 @@ Each sized profile has its own Nginx config:
 - `nginx/gateway_nginx.large.conf`
 
 The sized gateway configs explicitly list the backend replicas so traffic is spread across all service instances.
-The small gateway config now does the same for `order-service`, because the synchronous checkout path is the first bottleneck under load. It also gives `/orders/checkout/...` a longer upstream read timeout than the ordinary CRUD routes.
+The small gateway config keeps a single backend per service and gives `/orders/checkout/...` a longer upstream read timeout than the ordinary CRUD routes.
 
 ## 6. Profile commands
 
@@ -203,12 +200,12 @@ make medium-down
 make large-down
 ```
 
-## 7. Operational implications of the HA Redis layer
+## 7. Operational implications of the Redis layer
 
 The Compose files now do more than just launch extra containers. They also change how the application connects:
 
-- services wait for primaries, replicas, and Sentinels to become healthy
-- environment files advertise Sentinel nodes and logical master names
-- application clients connect through Sentinel instead of one fixed Redis host
+- `small`: services wait for the three primaries and connect through direct `*_REDIS_HOST` settings
+- default / `medium` / `large`: services wait for primaries, replicas, and Sentinels to become healthy
+- environment files advertise Sentinel nodes and logical master names, and `small` overrides those to direct-host mode
 
-That is why recovery testing should be done against these current Compose files, not against older single-Redis assumptions.
+That is why recovery testing should be done against the current Compose files, not against older assumptions about one fixed Redis topology for every profile.
