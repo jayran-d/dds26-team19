@@ -14,27 +14,31 @@ The system is a shopping-cart microservice application with four runtime service
 
 Each domain service owns its own Redis:
 
-- `order-db`
-- `orchestrator-db`
-- `stock-db`
-- `payment-db`
+- `order-db` + `order-db-replica`
+- `orchestrator-db` + `orchestrator-db-replica`
+- `stock-db` + `stock-db-replica`
+- `payment-db` + `payment-db-replica`
+- shared `redis-sentinel-1/2/3` monitoring all four primaries
 
-This matches the decentralized data-management requirement: there is no single shared business database.
+This still matches the decentralized data-management requirement: there is no single shared business database. Each bounded context owns one logical Redis store, but that store is now backed by a primary/replica pair instead of one container.
+
+All application code discovers the writable node through [`common/redis_client.py`](common/redis_client.py). In other words, services do not hardcode “talk to this one Redis container forever”; they ask Sentinel which replica is currently primary and reconnect there.
 
 ## 2. Where to start reading
 
 If someone on the team only has 20 minutes, read these files in this order:
 
 1. [`common/messages.py`](common/messages.py)
-2. [`order/app.py`](order/app.py)
-3. [`orchestrator/app.py`](orchestrator/app.py)
-4. [`orchestrator/streams_worker.py`](orchestrator/streams_worker.py)
-5. [`orchestrator/leader_lease.py`](orchestrator/leader_lease.py)
-6. [`orchestrator/protocols/saga/saga.py`](orchestrator/protocols/saga/saga.py)
-7. [`orchestrator/protocols/saga/saga_record.py`](orchestrator/protocols/saga/saga_record.py)
-8. [`orchestrator/protocols/two_pc.py`](orchestrator/protocols/two_pc.py)
-9. [`stock/ledger.py`](stock/ledger.py) and [`payment/ledger.py`](payment/ledger.py)
-10. [`stock/streams_worker.py`](stock/streams_worker.py) and [`payment/streams_worker.py`](payment/streams_worker.py)
+2. [`common/redis_client.py`](common/redis_client.py)
+3. [`order/app.py`](order/app.py)
+4. [`orchestrator/app.py`](orchestrator/app.py)
+5. [`orchestrator/streams_worker.py`](orchestrator/streams_worker.py)
+6. [`orchestrator/leader_lease.py`](orchestrator/leader_lease.py)
+7. [`orchestrator/protocols/saga/saga.py`](orchestrator/protocols/saga/saga.py)
+8. [`orchestrator/protocols/saga/saga_record.py`](orchestrator/protocols/saga/saga_record.py)
+9. [`orchestrator/protocols/two_pc.py`](orchestrator/protocols/two_pc.py)
+10. [`stock/ledger.py`](stock/ledger.py) and [`payment/ledger.py`](payment/ledger.py)
+11. [`stock/streams_worker.py`](stock/streams_worker.py) and [`payment/streams_worker.py`](payment/streams_worker.py)
 
 ## 3. Shared message protocol
 
@@ -59,6 +63,28 @@ Important things defined there:
 
 The important design choice is that the transport shape is centralized here, but the coordination logic is not. The protocol logic lives in the orchestrator.
 
+## 3A. Redis primary/replica and Sentinel layer
+
+The new database layer is worth understanding on its own because it changes both the runtime topology and the failure story.
+
+How it works:
+
+- every bounded context has one Redis primary and one Redis replica
+- three shared Sentinel processes monitor all four primaries
+- services use [`common/redis_client.py`](common/redis_client.py) plus `*_REDIS_SENTINELS` and `*_REDIS_MASTER_NAME` environment variables to discover the current primary
+- writes always go to the primary chosen by Sentinel, not to a fixed hostname embedded in the application code
+
+Why this helps:
+
+- killing a Redis primary no longer forces a manual config change in the clients
+- a promoted replica can become the new write target automatically
+- the service-level recovery logic can keep working even while the database role changes underneath it
+
+What it does not magically solve:
+
+- Redis replication is asynchronous, so the very latest writes can still be at risk during failover
+- that is why the project still relies on idempotent ledgers, durable order status, replayable stream work, and orchestrator recovery logic
+
 ## 4. External request flow
 
 Checkout flow, end to end:
@@ -70,7 +96,7 @@ Checkout flow, end to end:
 5. The orchestrator publishes commands to `stock.commands` and `payment.commands`.
 6. Stock/payment workers apply local business changes and publish reply events.
 7. Orchestrator event workers consume those events and advance the transaction state machine.
-8. Orchestrator writes `order:<order_id>:status` into `order-db`.
+8. Orchestrator writes `order:<order_id>:status` into the current `order-db` primary.
 9. `order-service` keeps polling that shared status until it becomes terminal, then returns `200` or `400`.
 
 Why this matters:
@@ -78,6 +104,11 @@ Why this matters:
 - the HTTP response is delayed until durable terminal state is visible in `order-db`
 - this avoids the old bug where one order replica received the HTTP request and another replica consumed the final event
 - it also matches the consistency harness better because the externally visible result follows the durable status
+
+Small-profile note:
+
+- the gateway now fronts three `order-service` replicas even in `small`
+- all three replicas still share the same logical `order-db` store through Sentinel-backed discovery
 
 The important code is:
 
@@ -128,7 +159,7 @@ It does not directly talk to stock or payment over REST.
 
 [`orchestrator/streams_worker.py#L224`](orchestrator/streams_worker.py#L224) is the real runtime:
 
-- initializes Redis connections
+- initializes Sentinel-backed Redis connections
 - ensures Redis consumer groups exist
 - starts event consumers for `stock.events` and `payment.events`
 - starts orphan recovery workers for pending stream entries
@@ -171,6 +202,7 @@ Mechanics:
 - if it wins, it is leader
 - a daemon renew loop refreshes the TTL every 5 seconds
 - if the leader dies, its lease expires and another replica takes over
+- because the lease itself lives in the `orchestrator-db` replication group, leadership also survives a database primary promotion as long as Redis remains available through Sentinel
 
 Important hardening that was added:
 
@@ -448,18 +480,24 @@ That means:
 
 The orchestrator, stock, and payment workers all follow this pattern in their `streams_worker.py` modules.
 
-## 14. Why medium/large scale better now
+## 14. Why the deployment profiles scale better now
 
-The original bottleneck was that all replicated `order-service` instances still called one orchestrator container.
+The original bottlenecks were:
+
+- all replicated `order-service` instances still called one orchestrator container
+- the small profile forced all checkout traffic through one `order-service` backend behind the gateway
+- clients were tied too closely to fixed Redis hosts instead of logical primaries
 
 The current fix is:
 
+- every bounded context now uses Sentinel-backed Redis primary discovery
+- `small` runs a three-replica `order-service` pool behind the gateway
 - medium and large run multiple orchestrator replicas
 - order-service calls the orchestrator through the gateway’s internal `/orchestrator/` upstream
 - event workers run on every orchestrator replica
 - only recovery/timeout scanning is singleton via the lease
 
-This is why medium/large throughput improved significantly.
+This is why the scaled profiles behave better under both throughput tests and injected failures.
 
 ## 15. Expected behavior under failures
 
@@ -470,6 +508,7 @@ What we want to see under that test:
 - a short throughput dip is acceptable
 - recovery should happen automatically
 - long periods of `5xx` or permanent stuck transactions are not acceptable
+- after a Redis primary failure, clients should reconnect to the promoted replica through Sentinel without editing configuration by hand
 
 What we observed during local tests:
 
@@ -477,6 +516,7 @@ What we observed during local tests:
 - the container restarts
 - another orchestrator replica can take leadership if needed
 - in-flight Saga transactions are recovered and replayed
+- killing a Redis primary causes a short failover window, then Sentinel promotes the replica and clients resume through the new primary
 - after the gateway retry changes, failover behavior is much cleaner than before
 
 Zero downtime is a stretch goal, not the minimum passing behavior.

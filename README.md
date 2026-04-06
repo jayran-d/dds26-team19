@@ -2,7 +2,7 @@
 
 This branch contains our orchestrator-based implementation of the Distributed Data Systems shopping-cart project.
 
-The system is a microservice application with decentralized data ownership, asynchronous coordination through Redis Streams, and two distributed transaction protocols:
+The system is a microservice application with decentralized data ownership, asynchronous coordination through Redis Streams, Redis primary/replica storage with Sentinel failover, and two distributed transaction protocols:
 
 - Saga
 - Two-Phase Commit
@@ -28,9 +28,10 @@ Databases:
 - `stock-db` + `stock-db-replica`
 - `payment-db` + `payment-db-replica`
 
-Each bounded context owns its own Redis replication group. There is no shared business database.
+Each bounded context owns its own Redis high-availability group. There is no shared business database.
 Services discover the current primary through the shared Redis Sentinel quorum
-(`redis-sentinel-1/2/3`), so writes can continue after a primary failure.
+(`redis-sentinel-1/2/3`), so writes can move to a promoted replica after a primary failure.
+Replication is still asynchronous, so consistency still depends on idempotency, replay, and durable recovery logic on top of the database layer.
 
 ## Architecture Summary
 
@@ -38,12 +39,14 @@ Services discover the current primary through the shared Redis Sentinel quorum
 
 Each service owns its own data and only applies its own local business changes:
 
-- orders are stored in `order-db`
-- orchestrator transaction state is stored in `orchestrator-db`
-- stock is stored in `stock-db`
-- user credit is stored in `payment-db`
+- orders are stored in the `order-db` replication group
+- orchestrator transaction state is stored in the `orchestrator-db` replication group
+- stock is stored in the `stock-db` replication group
+- user credit is stored in the `payment-db` replication group
 
 This is the central consistency challenge of the project: we coordinate transactions across service boundaries without collapsing back into one shared data store.
+
+Each replication group is still one logical store owned by one bounded context. Adding replicas improves availability, but it does not change who owns the writes.
 
 ### 2. Event-driven coordination
 
@@ -112,7 +115,10 @@ The main mechanisms are:
 - transaction records in `orchestrator-db`
 - stream orphan recovery
 - timeout-based recovery loops
+- Sentinel-based primary discovery in [common/redis_client.py](common/redis_client.py)
 - Redis primary/replica failover through Sentinel
+- AOF persistence on both primaries and replicas
+- asynchronous replication, so replay and idempotency are still required after failover
 
 This is what allows the system to recover when a service or database is killed in the middle of a transaction.
 
@@ -131,16 +137,17 @@ The lease is stored in `orchestrator-db` with TTL renewal, so another replica ca
 If you want to inspect the implementation directly, these are the best entry points:
 
 1. [common/messages.py](common/messages.py)
-2. [common/streams_client.py](common/streams_client.py)
-3. [order/app.py](order/app.py)
-4. [orchestrator/app.py](orchestrator/app.py)
-5. [orchestrator/streams_worker.py](orchestrator/streams_worker.py)
-6. [orchestrator/leader_lease.py](orchestrator/leader_lease.py)
-7. [orchestrator/protocols/saga/saga.py](orchestrator/protocols/saga/saga.py)
-8. [orchestrator/protocols/saga/saga_record.py](orchestrator/protocols/saga/saga_record.py)
-9. [orchestrator/protocols/two_pc.py](orchestrator/protocols/two_pc.py)
-10. [stock/ledger.py](stock/ledger.py)
-11. [payment/ledger.py](payment/ledger.py)
+2. [common/redis_client.py](common/redis_client.py)
+3. [common/streams_client.py](common/streams_client.py)
+4. [order/app.py](order/app.py)
+5. [orchestrator/app.py](orchestrator/app.py)
+6. [orchestrator/streams_worker.py](orchestrator/streams_worker.py)
+7. [orchestrator/leader_lease.py](orchestrator/leader_lease.py)
+8. [orchestrator/protocols/saga/saga.py](orchestrator/protocols/saga/saga.py)
+9. [orchestrator/protocols/saga/saga_record.py](orchestrator/protocols/saga/saga_record.py)
+10. [orchestrator/protocols/two_pc.py](orchestrator/protocols/two_pc.py)
+11. [stock/ledger.py](stock/ledger.py)
+12. [payment/ledger.py](payment/ledger.py)
 
 ## Deployment
 
@@ -155,6 +162,12 @@ Files:
 - [docker/compose/docker-compose.small.yml](docker/compose/docker-compose.small.yml)
 - [docker/compose/docker-compose.medium.yml](docker/compose/docker-compose.medium.yml)
 - [docker/compose/docker-compose.large.yml](docker/compose/docker-compose.large.yml)
+
+Current high-level replica layout:
+
+- `small`: 1 gateway, 1 orchestrator, 3 order-service replicas, 1 stock-service, 1 payment-service, 4 Redis primary/replica pairs, 3 Sentinels
+- `medium`: 1 gateway, 2 orchestrators, 6 order-service replicas, 7 stock-service replicas, 7 payment-service replicas, 4 Redis primary/replica pairs, 3 Sentinels
+- `large`: 1 gateway, 3 orchestrators, 12 order-service replicas, 14 stock-service replicas, 14 payment-service replicas, 4 Redis primary/replica pairs, 3 Sentinels
 
 Gateway configs:
 
@@ -181,6 +194,8 @@ Each Compose profile now includes:
 - one Redis primary and one replica for each bounded context
 - three shared Redis Sentinel processes monitoring all four primaries
 - application services configured to resolve primaries through Sentinel instead of a fixed Redis host
+- a longer-lived `/orders/checkout/` gateway path so checkout waits can survive normal protocol latency
+- in the `small` profile, a three-replica `order-service` pool to avoid forcing all stress traffic through one backend container
 
 ### Non-interactive kill from host (all possible service/db targets)
 
@@ -189,6 +204,8 @@ Small profile:
 ```bash
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec orchestrator-service sh -lc 'kill -TERM 1'
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-service sh -lc 'kill -TERM 1'
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-service-2 sh -lc 'kill -TERM 1'
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-service-3 sh -lc 'kill -TERM 1'
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec payment-service sh -lc 'kill -TERM 1'
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec stock-service sh -lc 'kill -TERM 1'
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-db sh -lc 'kill -TERM 1'
@@ -196,6 +213,8 @@ docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec paym
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec stock-db sh -lc 'kill -TERM 1'
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec orchestrator-db sh -lc 'kill -TERM 1'
 ```
+
+Replica databases can be targeted the same way, for example `order-db-replica`, `stock-db-replica`, `payment-db-replica`, and `orchestrator-db-replica`.
 ## Testing
 
 Unit and protocol tests:
