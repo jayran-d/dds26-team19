@@ -1,7 +1,5 @@
 # DDS26 Team 19 explanation current Architecture
 
-This document is the shortest path to understanding the current orchestrator branch well enough to explain it during the interview and to run the professor's tests without editing files by hand.
-
 ## 1. What this repository implements
 
 The system is a shopping-cart microservice application with four runtime services:
@@ -14,15 +12,12 @@ The system is a shopping-cart microservice application with four runtime service
 
 Each domain service owns its own Redis:
 
-- `order-db` + `order-db-replica`
-- `orchestrator-db` + `orchestrator-db-replica`
-- `stock-db` + `stock-db-replica`
-- `payment-db` + `payment-db-replica`
-- shared `redis-sentinel-1/2/3` monitoring all four primaries
+- `small`: `order-db`, `orchestrator-db`, `stock-db`, `payment-db`
+- `medium` / `large`: those same primaries plus `*-replica` containers and shared `redis-sentinel-1/2/3`
 
-This still matches the decentralized data-management requirement: there is no single shared business database. Each bounded context owns one logical Redis store, but that store is now backed by a primary/replica pair instead of one container.
+This still matches the decentralized data-management requirement: there is no single shared business database. Each bounded context owns one logical Redis store. In `small` that logical store is one container; in `medium` and `large` it is a primary/replica group.
 
-All application code discovers the writable node through [`common/redis_client.py`](common/redis_client.py). In other words, services do not hardcode “talk to this one Redis container forever”; they ask Sentinel which replica is currently primary and reconnect there.
+All application code goes through [`common/redis_client.py`](common/redis_client.py). In `small`, that helper returns a direct Redis client using `*_REDIS_HOST`. In `medium` and `large`, it asks Sentinel which replica is currently primary and reconnects there.
 
 ## 2. Where to start reading
 
@@ -63,26 +58,27 @@ Important things defined there:
 
 The important design choice is that the transport shape is centralized here, but the coordination logic is not. The protocol logic lives in the orchestrator.
 
-## 3A. Redis primary/replica and Sentinel layer
+## 3A. Redis deployment layer
 
-The new database layer is worth understanding on its own because it changes both the runtime topology and the failure story.
+The database layer is worth understanding on its own because it changes both the runtime topology and the failure story.
 
 How it works:
 
-- every bounded context has one Redis primary and one Redis replica
-- three shared Sentinel processes monitor all four primaries
-- services use [`common/redis_client.py`](common/redis_client.py) plus `*_REDIS_SENTINELS` and `*_REDIS_MASTER_NAME` environment variables to discover the current primary
-- writes always go to the primary chosen by Sentinel, not to a fixed hostname embedded in the application code
+- `small` keeps one Redis primary per bounded context
+- `medium` and `large` add one Redis replica per bounded context
+- `medium` and `large` run three shared Sentinel processes that monitor all four primaries
+- services use [`common/redis_client.py`](common/redis_client.py) in both cases: direct-host mode in `small`, Sentinel-discovery mode in the HA profiles
 
 Why this helps:
 
-- killing a Redis primary no longer forces a manual config change in the clients
-- a promoted replica can become the new write target automatically
+- `small` stays compliant with the assignment requirement for one instance of each app service, database, and queue
+- in `medium` and `large`, killing a Redis primary no longer forces a manual config change in the clients
+- in `medium` and `large`, a promoted replica can become the new write target automatically
 - the service-level recovery logic can keep working even while the database role changes underneath it
 
 What it does not magically solve:
 
-- Redis replication is asynchronous, so the very latest writes can still be at risk during failover
+- Redis replication is asynchronous in the HA profiles, so the very latest writes can still be at risk during failover
 - that is why the project still relies on idempotent ledgers, durable order status, replayable stream work, and orchestrator recovery logic
 
 ## 4. External request flow
@@ -107,8 +103,8 @@ Why this matters:
 
 Small-profile note:
 
-- the gateway now fronts three `order-service` replicas even in `small`
-- all three replicas still share the same logical `order-db` store through Sentinel-backed discovery
+- the `small` profile keeps one instance of each application service, database, and queue
+- that single `order-service` talks directly to the single `order-db` container
 
 The important code is:
 
@@ -159,7 +155,7 @@ It does not directly talk to stock or payment over REST.
 
 [`orchestrator/streams_worker.py#L224`](orchestrator/streams_worker.py#L224) is the real runtime:
 
-- initializes Sentinel-backed Redis connections
+- initializes Redis connections through [`common/redis_client.py`](common/redis_client.py)
 - ensures Redis consumer groups exist
 - starts event consumers for `stock.events` and `payment.events`
 - starts orphan recovery workers for pending stream entries
@@ -485,13 +481,12 @@ The orchestrator, stock, and payment workers all follow this pattern in their `s
 The original bottlenecks were:
 
 - all replicated `order-service` instances still called one orchestrator container
-- the small profile forced all checkout traffic through one `order-service` backend behind the gateway
 - clients were tied too closely to fixed Redis hosts instead of logical primaries
 
 The current fix is:
 
-- every bounded context now uses Sentinel-backed Redis primary discovery
-- `small` runs a three-replica `order-service` pool behind the gateway
+- every bounded context now uses the shared Redis client abstraction for direct-host or Sentinel-backed primary discovery
+- `small` stays single-instance per application service to match the low-scale deployment requirement
 - medium and large run multiple orchestrator replicas
 - order-service calls the orchestrator through the gateway’s internal `/orchestrator/` upstream
 - event workers run on every orchestrator replica

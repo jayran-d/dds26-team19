@@ -2,7 +2,7 @@
 
 This branch contains our orchestrator-based implementation of the Distributed Data Systems shopping-cart project.
 
-The system is a microservice application with decentralized data ownership, asynchronous coordination through Redis Streams, Redis primary/replica storage with Sentinel failover, and two distributed transaction protocols:
+The system is a microservice application with decentralized data ownership, asynchronous coordination through Redis Streams, and two distributed transaction protocols. The scaled profiles add Redis primary/replica storage with Sentinel failover:
 
 - Saga
 - Two-Phase Commit
@@ -23,15 +23,11 @@ Runtime services:
 
 Databases:
 
-- `order-db` + `order-db-replica`
-- `orchestrator-db` + `orchestrator-db-replica`
-- `stock-db` + `stock-db-replica`
-- `payment-db` + `payment-db-replica`
+- `small`: one Redis primary per bounded context (`order-db`, `orchestrator-db`, `stock-db`, `payment-db`)
+- `medium` / `large`: one Redis primary/replica pair per bounded context plus shared `redis-sentinel-1/2/3`
 
-Each bounded context owns its own Redis high-availability group. There is no shared business database.
-Services discover the current primary through the shared Redis Sentinel quorum
-(`redis-sentinel-1/2/3`), so writes can move to a promoted replica after a primary failure.
-Replication is still asynchronous, so consistency still depends on idempotency, replay, and durable recovery logic on top of the database layer.
+Each bounded context still owns its own Redis store. There is no shared business database.
+In `small`, services talk directly to the single Redis primary for that context. In `medium` and `large`, services discover the current primary through the shared Redis Sentinel quorum so writes can move to a promoted replica after a primary failure. Replication is still asynchronous, so consistency still depends on idempotency, replay, and durable recovery logic on top of the database layer.
 
 ## Architecture Summary
 
@@ -39,14 +35,14 @@ Replication is still asynchronous, so consistency still depends on idempotency, 
 
 Each service owns its own data and only applies its own local business changes:
 
-- orders are stored in the `order-db` replication group
-- orchestrator transaction state is stored in the `orchestrator-db` replication group
-- stock is stored in the `stock-db` replication group
-- user credit is stored in the `payment-db` replication group
+- orders are stored in the `order-db` Redis store
+- orchestrator transaction state is stored in the `orchestrator-db` Redis store
+- stock is stored in the `stock-db` Redis store
+- user credit is stored in the `payment-db` Redis store
 
 This is the central consistency challenge of the project: we coordinate transactions across service boundaries without collapsing back into one shared data store.
 
-Each replication group is still one logical store owned by one bounded context. Adding replicas improves availability, but it does not change who owns the writes.
+Each context still owns one logical store. Adding replicas in `medium` and `large` improves availability, but it does not change who owns the writes.
 
 ### 2. Event-driven coordination
 
@@ -116,9 +112,9 @@ The main mechanisms are:
 - stream orphan recovery
 - timeout-based recovery loops
 - Sentinel-based primary discovery in [common/redis_client.py](common/redis_client.py)
-- Redis primary/replica failover through Sentinel
-- AOF persistence on both primaries and replicas
-- asynchronous replication, so replay and idempotency are still required after failover
+- Redis primary/replica failover through Sentinel in `medium` and `large`
+- AOF persistence on every Redis node
+- asynchronous replication in the HA profiles, so replay and idempotency are still required after failover
 
 This is what allows the system to recover when a service or database is killed in the middle of a transaction.
 
@@ -165,7 +161,7 @@ Files:
 
 Current high-level replica layout:
 
-- `small`: 1 gateway, 1 orchestrator, 3 order-service replicas, 1 stock-service, 1 payment-service, 4 Redis primary/replica pairs, 3 Sentinels
+- `small`: 1 gateway, 1 orchestrator, 1 order-service, 1 stock-service, 1 payment-service, 4 Redis primaries
 - `medium`: 1 gateway, 2 orchestrators, 6 order-service replicas, 7 stock-service replicas, 7 payment-service replicas, 4 Redis primary/replica pairs, 3 Sentinels
 - `large`: 1 gateway, 3 orchestrators, 12 order-service replicas, 14 stock-service replicas, 14 payment-service replicas, 4 Redis primary/replica pairs, 3 Sentinels
 
@@ -191,11 +187,12 @@ make large-down
 
 Each Compose profile now includes:
 
-- one Redis primary and one replica for each bounded context
-- three shared Redis Sentinel processes monitoring all four primaries
-- application services configured to resolve primaries through Sentinel instead of a fixed Redis host
+- one Redis primary per bounded context in `small`
+- one Redis primary and one replica per bounded context in `medium` and `large`
+- three shared Redis Sentinel processes in `medium` and `large`
+- application services configured to use direct Redis hosts in `small` and Sentinel-backed discovery in `medium` / `large`
 - a longer-lived `/orders/checkout/` gateway path so checkout waits can survive normal protocol latency
-- in the `small` profile, a three-replica `order-service` pool to avoid forcing all stress traffic through one backend container
+- application-layer scaling in `medium` and `large`, while `small` stays single-instance per app service, database, and queue
 
 ### Non-interactive kill from host (all possible service/db targets)
 
@@ -204,8 +201,6 @@ Small profile:
 ```bash
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec orchestrator-service sh -lc 'kill -TERM 1'
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-service sh -lc 'kill -TERM 1'
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-service-2 sh -lc 'kill -TERM 1'
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-service-3 sh -lc 'kill -TERM 1'
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec payment-service sh -lc 'kill -TERM 1'
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec stock-service sh -lc 'kill -TERM 1'
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-db sh -lc 'kill -TERM 1'
@@ -214,7 +209,7 @@ docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec stoc
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec orchestrator-db sh -lc 'kill -TERM 1'
 ```
 
-Replica databases can be targeted the same way, for example `order-db-replica`, `stock-db-replica`, `payment-db-replica`, and `orchestrator-db-replica`.
+Replica databases only exist in the `medium` and `large` profiles.
 ## Testing
 
 Unit and protocol tests:
