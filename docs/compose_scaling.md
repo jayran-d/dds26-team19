@@ -1,62 +1,171 @@
 # Docker Compose Scaling Profiles
 
-This repository now includes three dedicated Docker Compose layouts for the 96-core environment:
+This repository ships four Compose layouts:
 
-- `docker/compose/docker-compose.small.yml`: 1 instance of each application service and 1 Redis per bounded context.
-- `docker/compose/docker-compose.medium.yml`: fixed 50 CPU allocation.
-- `docker/compose/docker-compose.large.yml`: fixed 90 CPU allocation.
+- `docker/compose/docker-compose.yml`
+- `docker/compose/docker-compose.small.yml`
+- `docker/compose/docker-compose.medium.yml`
+- `docker/compose/docker-compose.large.yml`
 
-## CPU budgets
+All four now use the same Redis high-availability pattern:
 
-### Small
+- one primary per bounded context
+- one replica per bounded context
+- one shared three-node Sentinel quorum
 
-Single-instance topology only. No explicit CPU limits are set in this profile.
+That means every profile includes:
 
-### Medium
+- `order-db` and `order-db-replica`
+- `stock-db` and `stock-db-replica`
+- `payment-db` and `payment-db-replica`
+- `redis-sentinel-1`, `redis-sentinel-2`, `redis-sentinel-3`
 
-Total budget: **50 CPUs**
+## 1. Baseline compose file
 
-- `gateway`: 2 CPUs
-- `order-service` replicas: 7 x 2 CPUs = 14 CPUs
-- `stock-service` replicas: 7 x 2 CPUs = 14 CPUs
-- `payment-service` replicas: 7 x 2 CPUs = 14 CPUs
-- Redis databases: 3 x 2 CPUs = 6 CPUs
+`docker/compose/docker-compose.yml` is the default non-profile stack.
 
-### Large
+Topology:
 
-Total budget: **90 CPUs**
+- 1 `gateway`
+- 1 `order-service`
+- 1 `stock-service`
+- 1 `payment-service`
+- 3 Redis primaries
+- 3 Redis replicas
+- 3 Sentinels
 
-- `gateway`: 3 CPUs
-- `order-service` replicas: 14 x 2 CPUs = 28 CPUs
-- `stock-service` replicas: 14 x 2 CPUs = 28 CPUs
-- `payment-service` replicas: 14 x 2 CPUs = 28 CPUs
-- Redis databases: 3 x 1 CPU = 3 CPUs
+Typical startup:
 
-## Gateway routing
+```bash
+TRANSACTION_MODE=saga docker compose -f docker/compose/docker-compose.yml up -d --build --force-recreate
+```
 
-Each scaling profile uses its own nginx config:
+Typical teardown:
+
+```bash
+docker compose -f docker/compose/docker-compose.yml down -v --remove-orphans
+```
+
+## 2. Small profile
+
+File:
+
+- `docker/compose/docker-compose.small.yml`
+
+Project name:
+
+- `dds-small`
+
+Topology:
+
+- 1 `gateway`
+- 1 `order-service`
+- 1 `stock-service`
+- 1 `payment-service`
+- 3 Redis primaries
+- 3 Redis replicas
+- 3 Sentinels
+
+CPU limits:
+
+- no explicit CPU limits are set in this profile
+
+Use this profile for:
+
+- correctness validation
+- local debugging
+- `make unit-saga`
+- `make unit-2pc`
+
+## 3. Medium profile
+
+File:
+
+- `docker/compose/docker-compose.medium.yml`
+
+Project name:
+
+- `dds-medium`
+
+Topology:
+
+- 1 `gateway`
+- 7 `order-service` replicas total
+- 7 `stock-service` replicas total
+- 7 `payment-service` replicas total
+- 3 Redis primaries
+- 3 Redis replicas
+- 3 Sentinels
+
+CPU allocation in the current file:
+
+- `gateway`: `2.0`
+- `order-service` total: `7 x 2.0 = 14.0`
+- `stock-service` total: `7 x 2.0 = 14.0`
+- `payment-service` total: `7 x 2.0 = 14.0`
+- Redis primaries total: `3 x 1.25 = 3.75`
+- Redis replicas total: `3 x 0.5 = 1.5`
+- Sentinels total: `3 x 0.25 = 0.75`
+
+Total:
+
+- `50.0 CPUs`
+
+Use this profile for:
+
+- throughput experiments that still fit into a fixed 50-CPU envelope
+
+## 4. Large profile
+
+File:
+
+- `docker/compose/docker-compose.large.yml`
+
+Project name:
+
+- `dds-large`
+
+Topology:
+
+- 1 `gateway`
+- 14 `order-service` replicas total
+- 14 `stock-service` replicas total
+- 14 `payment-service` replicas total
+- 3 Redis primaries
+- 3 Redis replicas
+- 3 Sentinels
+
+CPU allocation in the current file:
+
+- `gateway`: `3.0`
+- `order-service` total: `14 x 2.0 = 28.0`
+- `stock-service` total: `14 x 2.0 = 28.0`
+- `payment-service` total: `14 x 2.0 = 28.0`
+- Redis primaries total: `3 x 0.75 = 2.25`
+- Redis replicas total: `3 x 0.25 = 0.75`
+- Sentinels total: `3 x 0.1 = 0.3`
+
+Total:
+
+- `90.3 CPUs`
+
+Use this profile for:
+
+- high-load runs on the larger local machine budget
+
+## 5. Gateway routing
+
+Each sized profile has its own Nginx config:
 
 - `nginx/gateway_nginx.small.conf`
 - `nginx/gateway_nginx.medium.conf`
 - `nginx/gateway_nginx.large.conf`
 
-The medium and large configs declare every backend replica explicitly and use Docker DNS re-resolution (`resolve` with `127.0.0.11`) so nginx does not stay pinned to a stale container IP.
+The medium and large gateway configs explicitly list the backend replicas so traffic is spread across all service instances.
 
-## Usage
+## 6. Profile commands
 
-Use the profile name as the prefix: `small`, `medium`, or `large`.
-
-### Start a profile
-
-Build and start the selected profile with the default transaction mode (`saga`):
-
-```bash
-make small-up
-make medium-up
-make large-up
-```
-
-If you want to force a specific transaction mode, use the explicit targets:
+### Start
 
 ```bash
 make small-up-saga
@@ -69,7 +178,7 @@ make large-up-saga
 make large-up-2pc
 ```
 
-### Build images without starting containers
+### Build without starting
 
 ```bash
 make small-build
@@ -77,45 +186,28 @@ make medium-build
 make large-build
 ```
 
-Or build for a specific transaction mode:
+### Inspect
 
 ```bash
-make small-build-saga
-make small-build-2pc
-```
-
-### Inspect a running profile
-
-Show running containers:
-
-```bash
-make medium-ps
-```
-
-Follow logs:
-
-```bash
+make small-ps
 make medium-logs
+make large-ps
 ```
 
-### Stop and remove a profile
-
-Stop a cluster and remove its containers and volumes with the matching `*-down` target:
+### Tear down
 
 ```bash
+make small-down
 make medium-down
+make large-down
 ```
 
-### Rule of thumb
+## 7. Operational implications of the HA Redis layer
 
-- Use `make <profile>-up` when you want to start working quickly with the default `saga` mode.
-- Use `make <profile>-up-2pc` when you specifically need the 2PC flow.
-- Use `make <profile>-build` if you only want fresh images without launching the stack.
-- Use `make <profile>-ps` or `make <profile>-logs` to inspect an already running stack.
-- Use `make <profile>-down` when you want to fully tear that stack down.
+The Compose files now do more than just launch extra containers. They also change how the application connects:
 
-## Notes
+- services wait for primaries, replicas, and Sentinels to become healthy
+- environment files advertise Sentinel nodes and logical master names
+- application clients connect through Sentinel instead of one fixed Redis host
 
-- Run only one profile at a time unless you also change host port mappings.
-- The first replica of each application service performs the image build; the other replicas reuse the same image tag.
-- The baseline compose file is now located at `docker/compose/docker-compose.yml`.
+That is why recovery testing should be done against these current Compose files, not against older single-Redis assumptions.

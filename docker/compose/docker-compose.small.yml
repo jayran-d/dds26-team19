@@ -32,10 +32,14 @@ x-order-service-base: &order-service-base
     - STOCK_REDIS_PORT=6379
     - STOCK_REDIS_PASSWORD=redis
     - STOCK_REDIS_DB=0
+    - STOCK_REDIS_SENTINELS=redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
+    - STOCK_REDIS_MASTER_NAME=stock-db
     - PAYMENT_REDIS_HOST=payment-db
     - PAYMENT_REDIS_PORT=6379
     - PAYMENT_REDIS_PASSWORD=redis
     - PAYMENT_REDIS_DB=0
+    - PAYMENT_REDIS_SENTINELS=redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
+    - PAYMENT_REDIS_MASTER_NAME=payment-db
     - CONSUMER_WORKERS=8
     - STREAM_BATCH_SIZE=32
     - TRANSACTION_MODE=${TRANSACTION_MODE:-saga}
@@ -54,9 +58,21 @@ x-order-service-base: &order-service-base
   depends_on:
     order-db:
       condition: service_healthy
+    order-db-replica:
+      condition: service_healthy
     stock-db:
       condition: service_healthy
+    stock-db-replica:
+      condition: service_healthy
     payment-db:
+      condition: service_healthy
+    payment-db-replica:
+      condition: service_healthy
+    redis-sentinel-1:
+      condition: service_healthy
+    redis-sentinel-2:
+      condition: service_healthy
+    redis-sentinel-3:
       condition: service_healthy
 
 x-stock-service-base: &stock-service-base
@@ -81,6 +97,14 @@ x-stock-service-base: &stock-service-base
   depends_on:
     stock-db:
       condition: service_healthy
+    stock-db-replica:
+      condition: service_healthy
+    redis-sentinel-1:
+      condition: service_healthy
+    redis-sentinel-2:
+      condition: service_healthy
+    redis-sentinel-3:
+      condition: service_healthy
 
 x-payment-service-base: &payment-service-base
   image: payment:latest
@@ -104,10 +128,22 @@ x-payment-service-base: &payment-service-base
   depends_on:
     payment-db:
       condition: service_healthy
+    payment-db-replica:
+      condition: service_healthy
+    redis-sentinel-1:
+      condition: service_healthy
+    redis-sentinel-2:
+      condition: service_healthy
+    redis-sentinel-3:
+      condition: service_healthy
 
-x-redis-base: &redis-base
+x-redis-server-base: &redis-server-base
   image: redis:7.2-bookworm
   restart: unless-stopped
+  healthcheck: *redis-healthcheck
+
+x-redis-primary-base: &redis-primary-base
+  <<: *redis-server-base
   command: >-
     redis-server --requirepass redis --maxmemory 512mb
     --appendonly yes --appendfsync everysec
@@ -115,7 +151,67 @@ x-redis-base: &redis-base
     --auto-aof-rewrite-min-size 256mb
     --auto-aof-rewrite-percentage 200
     --dir /data
-  healthcheck: *redis-healthcheck
+
+x-redis-replica-base: &redis-replica-base
+  <<: *redis-server-base
+  command: >-
+    sh -lc '
+    exec redis-server
+    --requirepass redis
+    --masterauth redis
+    --replicaof "$$REDIS_PRIMARY_HOST" 6379
+    --maxmemory 512mb
+    --appendonly yes
+    --appendfsync everysec
+    --save ""
+    --auto-aof-rewrite-min-size 256mb
+    --auto-aof-rewrite-percentage 200
+    --dir /data'
+
+x-redis-sentinel-base: &redis-sentinel-base
+  image: redis:7.2-bookworm
+  restart: unless-stopped
+  command: >-
+    sh -lc '
+    printf "%s\n"
+    "port 26379"
+    "bind 0.0.0.0"
+    "protected-mode no"
+    "dir /tmp"
+    "sentinel resolve-hostnames yes"
+    "sentinel announce-hostnames yes"
+    "sentinel monitor order-db order-db 6379 2"
+    "sentinel auth-pass order-db redis"
+    "sentinel down-after-milliseconds order-db 5000"
+    "sentinel failover-timeout order-db 15000"
+    "sentinel parallel-syncs order-db 1"
+    "sentinel monitor stock-db stock-db 6379 2"
+    "sentinel auth-pass stock-db redis"
+    "sentinel down-after-milliseconds stock-db 5000"
+    "sentinel failover-timeout stock-db 15000"
+    "sentinel parallel-syncs stock-db 1"
+    "sentinel monitor payment-db payment-db 6379 2"
+    "sentinel auth-pass payment-db redis"
+    "sentinel down-after-milliseconds payment-db 5000"
+    "sentinel failover-timeout payment-db 15000"
+    "sentinel parallel-syncs payment-db 1"
+    >/tmp/sentinel.conf &&
+    exec redis-server /tmp/sentinel.conf --sentinel'
+  healthcheck:
+    test: ["CMD-SHELL", "redis-cli -p 26379 ping | grep PONG"]
+  depends_on:
+    order-db:
+      condition: service_healthy
+    order-db-replica:
+      condition: service_healthy
+    stock-db:
+      condition: service_healthy
+    stock-db-replica:
+      condition: service_healthy
+    payment-db:
+      condition: service_healthy
+    payment-db-replica:
+      condition: service_healthy
 
 services:
   gateway:
@@ -141,9 +237,16 @@ services:
       dockerfile: order/Dockerfile
 
   order-db:
-    <<: *redis-base
+    <<: *redis-primary-base
     volumes:
       - order-db-data:/data
+
+  order-db-replica:
+    <<: *redis-replica-base
+    environment:
+      - REDIS_PRIMARY_HOST=order-db
+    volumes:
+      - order-db-replica-data:/data
 
   stock-service:
     <<: *stock-service-base
@@ -152,9 +255,16 @@ services:
       dockerfile: stock/Dockerfile
 
   stock-db:
-    <<: *redis-base
+    <<: *redis-primary-base
     volumes:
       - stock-db-data:/data
+
+  stock-db-replica:
+    <<: *redis-replica-base
+    environment:
+      - REDIS_PRIMARY_HOST=stock-db
+    volumes:
+      - stock-db-replica-data:/data
 
   payment-service:
     <<: *payment-service-base
@@ -163,11 +273,30 @@ services:
       dockerfile: payment/Dockerfile
 
   payment-db:
-    <<: *redis-base
+    <<: *redis-primary-base
     volumes:
       - payment-db-data:/data
 
+  payment-db-replica:
+    <<: *redis-replica-base
+    environment:
+      - REDIS_PRIMARY_HOST=payment-db
+    volumes:
+      - payment-db-replica-data:/data
+
+  redis-sentinel-1:
+    <<: *redis-sentinel-base
+
+  redis-sentinel-2:
+    <<: *redis-sentinel-base
+
+  redis-sentinel-3:
+    <<: *redis-sentinel-base
+
 volumes:
   order-db-data:
+  order-db-replica-data:
   stock-db-data:
+  stock-db-replica-data:
   payment-db-data:
+  payment-db-replica-data:

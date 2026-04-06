@@ -11,6 +11,7 @@ import requests
 from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
 
+from common.redis_client import create_redis_client
 from streams_worker import (
     init_streams,
     close_streams,
@@ -60,14 +61,10 @@ TERMINAL_STATUSES = TERMINAL_SUCCESS_STATUSES | TERMINAL_FAILURE_STATUSES
 
 app = Quart("order-service")
 
-db: redis.Redis = redis.Redis(
-    host=os.environ['REDIS_HOST'],
-    port=int(os.environ['REDIS_PORT']),
-    password=os.environ['REDIS_PASSWORD'],
-    db=int(os.environ['REDIS_DB']),
+db: redis.Redis = create_redis_client(
+    "REDIS",
     socket_connect_timeout=2,
     socket_timeout=2,
-    retry_on_timeout=True,
     health_check_interval=30,
 )
 

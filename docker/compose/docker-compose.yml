@@ -31,10 +31,14 @@ services:
       - STOCK_REDIS_PORT=6379
       - STOCK_REDIS_PASSWORD=redis
       - STOCK_REDIS_DB=0
+      - STOCK_REDIS_SENTINELS=redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
+      - STOCK_REDIS_MASTER_NAME=stock-db
       - PAYMENT_REDIS_HOST=payment-db
       - PAYMENT_REDIS_PORT=6379
       - PAYMENT_REDIS_PASSWORD=redis
       - PAYMENT_REDIS_DB=0
+      - PAYMENT_REDIS_SENTINELS=redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
+      - PAYMENT_REDIS_MASTER_NAME=payment-db
       - CONSUMER_WORKERS=8
       - STREAM_BATCH_SIZE=32
       - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
@@ -65,9 +69,21 @@ services:
     depends_on:
       order-db:
         condition: service_healthy
+      order-db-replica:
+        condition: service_healthy
       stock-db:
         condition: service_healthy
+      stock-db-replica:
+        condition: service_healthy
       payment-db:
+        condition: service_healthy
+      payment-db-replica:
+        condition: service_healthy
+      redis-sentinel-1:
+        condition: service_healthy
+      redis-sentinel-2:
+        condition: service_healthy
+      redis-sentinel-3:
         condition: service_healthy
 
   order-db:
@@ -82,6 +98,33 @@ services:
       --dir /data
     volumes:
       - order-db-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a redis ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  order-db-replica:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    command: >-
+      sh -lc '
+      exec redis-server
+      --requirepass redis
+      --masterauth redis
+      --replicaof "$$REDIS_PRIMARY_HOST" 6379
+      --maxmemory 512mb
+      --appendonly yes
+      --appendfsync everysec
+      --save ""
+      --auto-aof-rewrite-min-size 256mb
+      --auto-aof-rewrite-percentage 200
+      --dir /data'
+    environment:
+      - REDIS_PRIMARY_HOST=order-db
+    volumes:
+      - order-db-replica-data:/data
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a redis ping | grep PONG"]
       interval: 5s
@@ -126,6 +169,14 @@ services:
     depends_on:
       stock-db:
         condition: service_healthy
+      stock-db-replica:
+        condition: service_healthy
+      redis-sentinel-1:
+        condition: service_healthy
+      redis-sentinel-2:
+        condition: service_healthy
+      redis-sentinel-3:
+        condition: service_healthy
 
   stock-db:
     image: redis:7.2-bookworm
@@ -139,6 +190,33 @@ services:
       --dir /data
     volumes:
       - stock-db-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a redis ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  stock-db-replica:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    command: >-
+      sh -lc '
+      exec redis-server
+      --requirepass redis
+      --masterauth redis
+      --replicaof "$$REDIS_PRIMARY_HOST" 6379
+      --maxmemory 512mb
+      --appendonly yes
+      --appendfsync everysec
+      --save ""
+      --auto-aof-rewrite-min-size 256mb
+      --auto-aof-rewrite-percentage 200
+      --dir /data'
+    environment:
+      - REDIS_PRIMARY_HOST=stock-db
+    volumes:
+      - stock-db-replica-data:/data
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a redis ping | grep PONG"]
       interval: 5s
@@ -183,6 +261,14 @@ services:
     depends_on:
       payment-db:
         condition: service_healthy
+      payment-db-replica:
+        condition: service_healthy
+      redis-sentinel-1:
+        condition: service_healthy
+      redis-sentinel-2:
+        condition: service_healthy
+      redis-sentinel-3:
+        condition: service_healthy
 
   payment-db:
     image: redis:7.2-bookworm
@@ -203,7 +289,184 @@ services:
       retries: 10
       start_period: 5s
 
+  payment-db-replica:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    command: >-
+      sh -lc '
+      exec redis-server
+      --requirepass redis
+      --masterauth redis
+      --replicaof "$$REDIS_PRIMARY_HOST" 6379
+      --maxmemory 512mb
+      --appendonly yes
+      --appendfsync everysec
+      --save ""
+      --auto-aof-rewrite-min-size 256mb
+      --auto-aof-rewrite-percentage 200
+      --dir /data'
+    environment:
+      - REDIS_PRIMARY_HOST=payment-db
+    volumes:
+      - payment-db-replica-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a redis ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  redis-sentinel-1:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    command: >-
+      sh -lc '
+      printf "%s\n"
+      "port 26379"
+      "bind 0.0.0.0"
+      "protected-mode no"
+      "dir /tmp"
+      "sentinel resolve-hostnames yes"
+      "sentinel announce-hostnames yes"
+      "sentinel monitor order-db order-db 6379 2"
+      "sentinel auth-pass order-db redis"
+      "sentinel down-after-milliseconds order-db 5000"
+      "sentinel failover-timeout order-db 15000"
+      "sentinel parallel-syncs order-db 1"
+      "sentinel monitor stock-db stock-db 6379 2"
+      "sentinel auth-pass stock-db redis"
+      "sentinel down-after-milliseconds stock-db 5000"
+      "sentinel failover-timeout stock-db 15000"
+      "sentinel parallel-syncs stock-db 1"
+      "sentinel monitor payment-db payment-db 6379 2"
+      "sentinel auth-pass payment-db redis"
+      "sentinel down-after-milliseconds payment-db 5000"
+      "sentinel failover-timeout payment-db 15000"
+      "sentinel parallel-syncs payment-db 1"
+      >/tmp/sentinel.conf &&
+      exec redis-server /tmp/sentinel.conf --sentinel'
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 26379 ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    depends_on:
+      order-db:
+        condition: service_healthy
+      order-db-replica:
+        condition: service_healthy
+      stock-db:
+        condition: service_healthy
+      stock-db-replica:
+        condition: service_healthy
+      payment-db:
+        condition: service_healthy
+      payment-db-replica:
+        condition: service_healthy
+
+  redis-sentinel-2:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    command: >-
+      sh -lc '
+      printf "%s\n"
+      "port 26379"
+      "bind 0.0.0.0"
+      "protected-mode no"
+      "dir /tmp"
+      "sentinel resolve-hostnames yes"
+      "sentinel announce-hostnames yes"
+      "sentinel monitor order-db order-db 6379 2"
+      "sentinel auth-pass order-db redis"
+      "sentinel down-after-milliseconds order-db 5000"
+      "sentinel failover-timeout order-db 15000"
+      "sentinel parallel-syncs order-db 1"
+      "sentinel monitor stock-db stock-db 6379 2"
+      "sentinel auth-pass stock-db redis"
+      "sentinel down-after-milliseconds stock-db 5000"
+      "sentinel failover-timeout stock-db 15000"
+      "sentinel parallel-syncs stock-db 1"
+      "sentinel monitor payment-db payment-db 6379 2"
+      "sentinel auth-pass payment-db redis"
+      "sentinel down-after-milliseconds payment-db 5000"
+      "sentinel failover-timeout payment-db 15000"
+      "sentinel parallel-syncs payment-db 1"
+      >/tmp/sentinel.conf &&
+      exec redis-server /tmp/sentinel.conf --sentinel'
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 26379 ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    depends_on:
+      order-db:
+        condition: service_healthy
+      order-db-replica:
+        condition: service_healthy
+      stock-db:
+        condition: service_healthy
+      stock-db-replica:
+        condition: service_healthy
+      payment-db:
+        condition: service_healthy
+      payment-db-replica:
+        condition: service_healthy
+
+  redis-sentinel-3:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    command: >-
+      sh -lc '
+      printf "%s\n"
+      "port 26379"
+      "bind 0.0.0.0"
+      "protected-mode no"
+      "dir /tmp"
+      "sentinel resolve-hostnames yes"
+      "sentinel announce-hostnames yes"
+      "sentinel monitor order-db order-db 6379 2"
+      "sentinel auth-pass order-db redis"
+      "sentinel down-after-milliseconds order-db 5000"
+      "sentinel failover-timeout order-db 15000"
+      "sentinel parallel-syncs order-db 1"
+      "sentinel monitor stock-db stock-db 6379 2"
+      "sentinel auth-pass stock-db redis"
+      "sentinel down-after-milliseconds stock-db 5000"
+      "sentinel failover-timeout stock-db 15000"
+      "sentinel parallel-syncs stock-db 1"
+      "sentinel monitor payment-db payment-db 6379 2"
+      "sentinel auth-pass payment-db redis"
+      "sentinel down-after-milliseconds payment-db 5000"
+      "sentinel failover-timeout payment-db 15000"
+      "sentinel parallel-syncs payment-db 1"
+      >/tmp/sentinel.conf &&
+      exec redis-server /tmp/sentinel.conf --sentinel'
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 26379 ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    depends_on:
+      order-db:
+        condition: service_healthy
+      order-db-replica:
+        condition: service_healthy
+      stock-db:
+        condition: service_healthy
+      stock-db-replica:
+        condition: service_healthy
+      payment-db:
+        condition: service_healthy
+      payment-db-replica:
+        condition: service_healthy
+
 volumes:
   order-db-data:
+  order-db-replica-data:
   stock-db-data:
+  stock-db-replica-data:
   payment-db-data:
+  payment-db-replica-data:
