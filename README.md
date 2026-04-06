@@ -92,6 +92,8 @@ make large-up-saga
 make large-up-2pc
 ```
 
+The small profile now keeps one `stock-service`, one `payment-service`, and three `order-service` replicas behind Nginx so the synchronous checkout path does not become the first throughput bottleneck during local runs.
+
 Inspect them with:
 
 ```bash

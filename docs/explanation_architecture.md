@@ -181,10 +181,14 @@ It does not coordinate transactions. Its job is to expose a single entry point a
 
 The small profile is aimed at correctness and local validation:
 
-- one app instance per business service
+- three `order-service` replicas behind the gateway
+- one `stock-service`
+- one `payment-service`
 - three Redis primaries
 - three Redis replicas
 - three Sentinels
+
+That small-profile exception exists because the synchronous checkout endpoint is hosted in `order`, so it is the first service that saturates during local load tests.
 
 The medium and large profiles keep the same Redis HA pattern and scale the app-service layer horizontally behind Nginx.
 

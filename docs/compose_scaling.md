@@ -59,7 +59,7 @@ Project name:
 Topology:
 
 - 1 `gateway`
-- 1 `order-service`
+- 3 `order-service` replicas total
 - 1 `stock-service`
 - 1 `payment-service`
 - 3 Redis primaries
@@ -161,7 +161,8 @@ Each sized profile has its own Nginx config:
 - `nginx/gateway_nginx.medium.conf`
 - `nginx/gateway_nginx.large.conf`
 
-The medium and large gateway configs explicitly list the backend replicas so traffic is spread across all service instances.
+The sized gateway configs explicitly list the backend replicas so traffic is spread across all service instances.
+The small gateway config now does the same for `order-service`, because the synchronous checkout path is the first bottleneck under load. It also gives `/orders/checkout/...` a longer upstream read timeout than the ordinary CRUD routes.
 
 ## 6. Profile commands
 

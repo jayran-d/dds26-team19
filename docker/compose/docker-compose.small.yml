@@ -47,9 +47,9 @@ x-order-service-base: &order-service-base
   command: >-
     sh -lc '
     if [ "$$VERBOSE_LOGS" = "true" ]; then
-      exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --log-level debug --access-logfile - app:app;
+      exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --keep-alive 75 --log-level debug --access-logfile - app:app;
     else
-      exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --log-level info app:app;
+      exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --keep-alive 75 --log-level info app:app;
     fi'
   env_file:
     - ../../env/order_redis.env
@@ -225,6 +225,10 @@ services:
     depends_on:
       order-service:
         condition: service_healthy
+      order-service-2:
+        condition: service_healthy
+      order-service-3:
+        condition: service_healthy
       stock-service:
         condition: service_healthy
       payment-service:
@@ -235,6 +239,12 @@ services:
     build:
       context: ../..
       dockerfile: order/Dockerfile
+
+  order-service-2:
+    <<: *order-service-base
+
+  order-service-3:
+    <<: *order-service-base
 
   order-db:
     <<: *redis-primary-base

@@ -102,7 +102,7 @@ The older `REDIS_HOST` variables are still present as a direct-connection fallba
 - `nginx/gateway_nginx.medium.conf`
 - `nginx/gateway_nginx.large.conf`
 
-The medium and large configs explicitly enumerate the backend replicas so Nginx can spread traffic across them.
+The sized configs explicitly enumerate backend replicas so Nginx can spread traffic across them. In the small profile, that matters primarily for `order-service`, because `/orders/checkout/...` is the latency-sensitive path under load and now has three backend replicas plus a longer gateway read timeout.
 
 ## 5. Shared code
 
