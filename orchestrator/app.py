@@ -19,6 +19,7 @@ import os
 import redis
 from flask import Flask, request, jsonify, abort
 
+from common.redis_client import create_redis_client
 from streams_worker import init_streams, close_streams, is_available, start_checkout
 
 VERBOSE_LOGS = os.getenv("VERBOSE_LOGS", "false").lower() == "true"
@@ -26,14 +27,10 @@ VERBOSE_LOGS = os.getenv("VERBOSE_LOGS", "false").lower() == "true"
 app = Flask("orchestrator-service")
 
 # Orchestrator's own Redis (coord_db): saga records, 2pc state, etc.
-coord_db: redis.Redis = redis.Redis(
-    host=os.environ['REDIS_HOST'],
-    port=int(os.environ.get('REDIS_PORT', 6379)),
-    password=os.environ['REDIS_PASSWORD'],
-    db=int(os.environ.get('REDIS_DB', 0)),
+coord_db: redis.Redis = create_redis_client(
+    "REDIS",
     socket_connect_timeout=2,
     socket_timeout=2,
-    retry_on_timeout=True,
     health_check_interval=30,
 )
 

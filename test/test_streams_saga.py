@@ -79,6 +79,13 @@ ORDER_DB_SERVICE = "order-db"
 ORCHESTRATOR_DB_SERVICE = "orchestrator-db"
 STOCK_DB_SERVICE = "stock-db"
 PAYMENT_DB_SERVICE = "payment-db"
+ORDER_DB_REPLICA_SERVICE = "order-db-replica"
+ORCHESTRATOR_DB_REPLICA_SERVICE = "orchestrator-db-replica"
+STOCK_DB_REPLICA_SERVICE = "stock-db-replica"
+PAYMENT_DB_REPLICA_SERVICE = "payment-db-replica"
+REDIS_SENTINEL_1 = "redis-sentinel-1"
+REDIS_SENTINEL_2 = "redis-sentinel-2"
+REDIS_SENTINEL_3 = "redis-sentinel-3"
 GATEWAY_SERVICE = "gateway"
 REDIS_PASSWORD = "redis"
 HTTP_SERVICES = {
@@ -92,6 +99,15 @@ REDIS_SERVICES = {
     ORCHESTRATOR_DB_SERVICE,
     STOCK_DB_SERVICE,
     PAYMENT_DB_SERVICE,
+    ORDER_DB_REPLICA_SERVICE,
+    ORCHESTRATOR_DB_REPLICA_SERVICE,
+    STOCK_DB_REPLICA_SERVICE,
+    PAYMENT_DB_REPLICA_SERVICE,
+}
+SENTINEL_SERVICES = {
+    REDIS_SENTINEL_1,
+    REDIS_SENTINEL_2,
+    REDIS_SENTINEL_3,
 }
 
 
@@ -136,6 +152,8 @@ def _start_service(service: str, timeout: int = RECOVERY_WAIT) -> None:
         _refresh_gateway()
     elif service in REDIS_SERVICES:
         _wait_for_redis(service, timeout=timeout)
+    elif service in SENTINEL_SERVICES:
+        _wait_for_sentinel(service, timeout=timeout)
     else:
         raise ValueError(f"Unknown service: {service}")
 
@@ -150,9 +168,16 @@ def _ensure_services_started() -> None:
         "up",
         "-d",
         ORDER_DB_SERVICE,
+        ORDER_DB_REPLICA_SERVICE,
         ORCHESTRATOR_DB_SERVICE,
+        ORCHESTRATOR_DB_REPLICA_SERVICE,
         STOCK_DB_SERVICE,
+        STOCK_DB_REPLICA_SERVICE,
         PAYMENT_DB_SERVICE,
+        PAYMENT_DB_REPLICA_SERVICE,
+        REDIS_SENTINEL_1,
+        REDIS_SENTINEL_2,
+        REDIS_SENTINEL_3,
         GATEWAY_SERVICE,
         ORCHESTRATOR_SERVICE,
         ORDER_SERVICE,
@@ -160,9 +185,16 @@ def _ensure_services_started() -> None:
         PAYMENT_SERVICE,
     )
     _wait_for_redis(ORDER_DB_SERVICE)
+    _wait_for_redis(ORDER_DB_REPLICA_SERVICE)
     _wait_for_redis(ORCHESTRATOR_DB_SERVICE)
+    _wait_for_redis(ORCHESTRATOR_DB_REPLICA_SERVICE)
     _wait_for_redis(STOCK_DB_SERVICE)
+    _wait_for_redis(STOCK_DB_REPLICA_SERVICE)
     _wait_for_redis(PAYMENT_DB_SERVICE)
+    _wait_for_redis(PAYMENT_DB_REPLICA_SERVICE)
+    _wait_for_sentinel(REDIS_SENTINEL_1)
+    _wait_for_sentinel(REDIS_SENTINEL_2)
+    _wait_for_sentinel(REDIS_SENTINEL_3)
     _wait_for_service_http(ORCHESTRATOR_SERVICE)
     _wait_for_service_http(ORDER_SERVICE)
     _wait_for_service_http(STOCK_SERVICE)
@@ -236,42 +268,33 @@ def _wait_for_redis(service: str, timeout: int = RECOVERY_WAIT) -> None:
     raise AssertionError(f"{service} did not become ready within {timeout}s")
 
 
+def _wait_for_sentinel(service: str, timeout: int = RECOVERY_WAIT) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        probe = _compose(
+            "exec",
+            "-T",
+            service,
+            "redis-cli",
+            "-p",
+            "26379",
+            "PING",
+            check=False,
+        )
+        if probe.returncode == 0 and "PONG" in probe.stdout:
+            return
+        time.sleep(0.5)
+
+    raise AssertionError(f"{service} did not become ready within {timeout}s")
+
+
 def _wait_for_orchestrator_transport_dependencies(timeout: int = RECOVERY_WAIT) -> None:
     deadline = time.time() + timeout
     probe_script = (
-        "import os\n"
-        "import sys\n"
-        "import redis\n"
-        "targets = [\n"
-        "    (\n"
-        "        os.environ['ORDER_REDIS_HOST'],\n"
-        "        int(os.getenv('ORDER_REDIS_PORT', '6379')),\n"
-        "        os.environ['ORDER_REDIS_PASSWORD'],\n"
-        "        int(os.getenv('ORDER_REDIS_DB', '0')),\n"
-        "    ),\n"
-        "    (\n"
-        "        os.environ['STOCK_REDIS_HOST'],\n"
-        "        int(os.getenv('STOCK_REDIS_PORT', '6379')),\n"
-        "        os.environ['STOCK_REDIS_PASSWORD'],\n"
-        "        int(os.getenv('STOCK_REDIS_DB', '0')),\n"
-        "    ),\n"
-        "    (\n"
-        "        os.environ['PAYMENT_REDIS_HOST'],\n"
-        "        int(os.getenv('PAYMENT_REDIS_PORT', '6379')),\n"
-        "        os.environ['PAYMENT_REDIS_PASSWORD'],\n"
-        "        int(os.getenv('PAYMENT_REDIS_DB', '0')),\n"
-        "    ),\n"
-        "]\n"
-        "for host, port, password, db in targets:\n"
-        "    client = redis.Redis(\n"
-        "        host=host,\n"
-        "        port=port,\n"
-        "        password=password,\n"
-        "        db=db,\n"
-        "        socket_connect_timeout=1,\n"
-        "        socket_timeout=1,\n"
-        "    )\n"
-        "    client.ping()\n"
+        "from common.redis_client import create_redis_client\n"
+        "create_redis_client('ORDER_REDIS', socket_connect_timeout=1, socket_timeout=1, health_check_interval=1).ping()\n"
+        "create_redis_client('STOCK_REDIS', socket_connect_timeout=1, socket_timeout=1, health_check_interval=1).ping()\n"
+        "create_redis_client('PAYMENT_REDIS', socket_connect_timeout=1, socket_timeout=1, health_check_interval=1).ping()\n"
     )
 
     while time.time() < deadline:
@@ -291,6 +314,48 @@ def _wait_for_orchestrator_transport_dependencies(timeout: int = RECOVERY_WAIT) 
     raise AssertionError(
         f"{ORCHESTRATOR_SERVICE} did not reconnect to order-db/stock-db/payment-db within {timeout}s"
     )
+
+
+def _read_from_master(master_name: str, command: str, key: str, field: str | None = None) -> str:
+    read_script = (
+        "import sys\n"
+        "from redis.sentinel import Sentinel\n"
+        "sentinel = Sentinel([\n"
+        "    ('redis-sentinel-1', 26379),\n"
+        "    ('redis-sentinel-2', 26379),\n"
+        "    ('redis-sentinel-3', 26379),\n"
+        "], sentinel_kwargs={'socket_connect_timeout': 1, 'socket_timeout': 1})\n"
+        "db = sentinel.master_for(\n"
+        "    sys.argv[1],\n"
+        "    password='redis',\n"
+        "    db=0,\n"
+        "    socket_connect_timeout=1,\n"
+        "    socket_timeout=1,\n"
+        ")\n"
+        "command = sys.argv[2]\n"
+        "key = sys.argv[3]\n"
+        "if command == 'get':\n"
+        "    value = db.get(key)\n"
+        "elif command == 'hget':\n"
+        "    value = db.hget(key, sys.argv[4])\n"
+        "else:\n"
+        "    raise SystemExit(f'unsupported command: {command}')\n"
+        "if value is not None:\n"
+        "    sys.stdout.write(value.decode() if isinstance(value, bytes) else str(value))\n"
+    )
+    args = [master_name, command, key]
+    if field is not None:
+        args.append(field)
+    result = _compose(
+        "exec",
+        "-T",
+        ORDER_SERVICE,
+        "python",
+        "-c",
+        read_script,
+        *args,
+    )
+    return result.stdout.strip()
 
 
 def _wait_for_gateway_routes(timeout: int = RECOVERY_WAIT) -> None:
@@ -453,34 +518,14 @@ def _create_order(user_id: str) -> dict:
 
 
 def _get_order_tx_id(order_id: str) -> str:
-    result = _compose(
-        "exec",
-        "-T",
-        ORDER_DB_SERVICE,
-        "redis-cli",
-        "-a",
-        REDIS_PASSWORD,
-        "GET",
-        f"order:{order_id}:tx_id",
-    )
-    tx_id = result.stdout.strip()
+    tx_id = _read_from_master("order-db", "get", f"order:{order_id}:tx_id")
     if not tx_id:
         raise AssertionError(f"No tx_id stored for order {order_id}")
     return tx_id
 
 
 def _get_order_status_direct(order_id: str) -> str:
-    result = _compose(
-        "exec",
-        "-T",
-        ORDER_DB_SERVICE,
-        "redis-cli",
-        "-a",
-        REDIS_PASSWORD,
-        "GET",
-        f"order:{order_id}:status",
-    )
-    status = result.stdout.strip()
+    status = _read_from_master("order-db", "get", f"order:{order_id}:status")
     return status or "pending"
 
 
@@ -494,12 +539,23 @@ def _publish_to_kafka(topic: str, message: dict) -> None:
     """
     publish_script = (
         "import json, sys\n"
-        "import redis\n"
+        "from redis.sentinel import Sentinel\n"
         "from msgspec import msgpack\n"
         "topic = sys.argv[1]\n"
         "message = json.loads(sys.stdin.read())\n"
-        "host = 'stock-db' if topic.startswith('stock.') else 'payment-db'\n"
-        "db = redis.Redis(host=host, port=6379, password='redis', db=0)\n"
+        "master_name = 'stock-db' if topic.startswith('stock.') else 'payment-db'\n"
+        "sentinel = Sentinel([\n"
+        "    ('redis-sentinel-1', 26379),\n"
+        "    ('redis-sentinel-2', 26379),\n"
+        "    ('redis-sentinel-3', 26379),\n"
+        "], sentinel_kwargs={'socket_connect_timeout': 1, 'socket_timeout': 1})\n"
+        "db = sentinel.master_for(\n"
+        "    master_name,\n"
+        "    password='redis',\n"
+        "    db=0,\n"
+        "    socket_connect_timeout=1,\n"
+        "    socket_timeout=1,\n"
+        ")\n"
         "db.xadd(topic, {'d': msgpack.encode(message)}, maxlen=100000, approximate=True)\n"
     )
     _compose(

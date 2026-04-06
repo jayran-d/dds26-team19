@@ -11,6 +11,7 @@ from msgspec import Struct, msgpack
 from quart import Quart, Response, abort, jsonify
 
 from common.messages import SagaOrderStatus, TwoPhaseOrderStatus
+from common.redis_client import create_redis_client
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -46,14 +47,10 @@ TERMINAL_STATUSES = TERMINAL_SUCCESS_STATUSES | TERMINAL_FAILURE_STATUSES
 
 app = Quart("order-service")
 
-db: redis.Redis = redis.Redis(
-    host=os.environ["REDIS_HOST"],
-    port=int(os.environ["REDIS_PORT"]),
-    password=os.environ["REDIS_PASSWORD"],
-    db=int(os.environ["REDIS_DB"]),
+db: redis.Redis = create_redis_client(
+    "REDIS",
     socket_connect_timeout=2,
     socket_timeout=2,
-    retry_on_timeout=True,
     health_check_interval=30,
 )
 

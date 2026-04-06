@@ -6,7 +6,7 @@ This repository ships three Compose profiles:
 - `docker/compose/docker-compose.medium.yml`
 - `docker/compose/docker-compose.large.yml`
 
-All three profiles expose the gateway on `http://localhost:8000`, keep the same bounded contexts (`order`, `orchestrator`, `stock`, `payment`), and use a dedicated Redis instance for each context.
+All three profiles expose the gateway on `http://localhost:8000`, keep the same bounded contexts (`order`, `orchestrator`, `stock`, `payment`), and use a dedicated Redis primary/replica pair for each context plus a shared three-node Sentinel quorum.
 
 ## Profile Summary
 
@@ -19,11 +19,12 @@ Single-instance local topology intended for correctness testing and development.
 - `order-service`: 1 replica
 - `stock-service`: 1 replica
 - `payment-service`: 1 replica
-- Redis: 4 instances
-  - `order-db`
-  - `orchestrator-db`
-  - `stock-db`
-  - `payment-db`
+- Redis: 8 data nodes + 3 Sentinel nodes
+  - `order-db` / `order-db-replica`
+  - `orchestrator-db` / `orchestrator-db-replica`
+  - `stock-db` / `stock-db-replica`
+  - `payment-db` / `payment-db-replica`
+  - `redis-sentinel-1/2/3`
 
 There are no explicit `cpus:` limits in this profile.
 
@@ -45,7 +46,7 @@ Replica layout:
 - `order-service`: 6 replicas
 - `stock-service`: 7 replicas
 - `payment-service`: 7 replicas
-- Redis: 4 instances
+- Redis: 8 data nodes + 3 Sentinel nodes
 
 CPU allocation:
 
@@ -76,7 +77,7 @@ Replica layout:
 - `order-service`: 12 replicas
 - `stock-service`: 14 replicas
 - `payment-service`: 14 replicas
-- Redis: 4 instances
+- Redis: 8 data nodes + 3 Sentinel nodes
 
 CPU allocation:
 
@@ -109,6 +110,10 @@ Routing behavior differs by size:
 - `small`: the gateway fronts the application services, while `order-service` calls the single orchestrator container directly
 - `medium`: nginx defines explicit upstream pools for replicated services, including an internal `/orchestrator/` route
 - `large`: same routing model as `medium`, with larger upstream pools
+
+Across all three profiles, Redis clients talk to Sentinel and resolve the
+current primary for each bounded context dynamically. That means a database
+container kill no longer requires clients to reconnect to a hardcoded Redis host.
 
 The medium and large nginx configs use Docker DNS re-resolution (`resolve` with `127.0.0.11`) so upstream backends do not stay pinned to stale container IPs after restarts.
 

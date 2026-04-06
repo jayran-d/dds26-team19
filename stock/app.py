@@ -8,20 +8,17 @@ from streams_worker import init_streams, close_streams
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+from common.redis_client import create_redis_client
 
 DB_ERROR_STR = "DB error"
 VERBOSE_LOGS = os.getenv("VERBOSE_LOGS", "false").lower() == "true"
 
 app = Flask("stock-service")
 
-db: redis.Redis = redis.Redis(
-    host=os.environ['REDIS_HOST'],
-    port=int(os.environ['REDIS_PORT']),
-    password=os.environ['REDIS_PASSWORD'],
-    db=int(os.environ['REDIS_DB']),
+db: redis.Redis = create_redis_client(
+    "REDIS",
     socket_connect_timeout=2,
     socket_timeout=2,
-    retry_on_timeout=True,
     health_check_interval=30,
 )
 

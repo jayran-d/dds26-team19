@@ -23,12 +23,14 @@ Runtime services:
 
 Databases:
 
-- `order-db`
-- `orchestrator-db`
-- `stock-db`
-- `payment-db`
+- `order-db` + `order-db-replica`
+- `orchestrator-db` + `orchestrator-db-replica`
+- `stock-db` + `stock-db-replica`
+- `payment-db` + `payment-db-replica`
 
-Each service owns its own Redis database. There is no shared business database.
+Each bounded context owns its own Redis replication group. There is no shared business database.
+Services discover the current primary through the shared Redis Sentinel quorum
+(`redis-sentinel-1/2/3`), so writes can continue after a primary failure.
 
 ## Architecture Summary
 
@@ -110,6 +112,7 @@ The main mechanisms are:
 - transaction records in `orchestrator-db`
 - stream orphan recovery
 - timeout-based recovery loops
+- Redis primary/replica failover through Sentinel
 
 This is what allows the system to recover when a service or database is killed in the middle of a transaction.
 
@@ -172,6 +175,12 @@ make small-down
 make medium-down
 make large-down
 ```
+
+Each Compose profile now includes:
+
+- one Redis primary and one replica for each bounded context
+- three shared Redis Sentinel processes monitoring all four primaries
+- application services configured to resolve primaries through Sentinel instead of a fixed Redis host
 
 ### Non-interactive kill from host (all possible service/db targets)
 
