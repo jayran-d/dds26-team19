@@ -18,7 +18,7 @@ REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ["GATEWAY_URL"]
 ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "http://orchestrator-service:5000")
-CHECKOUT_WAIT_TIMEOUT_SECONDS = float(os.getenv("CHECKOUT_WAIT_TIMEOUT_SECONDS", "45"))
+CHECKOUT_WAIT_TIMEOUT_SECONDS = float(os.getenv("CHECKOUT_WAIT_TIMEOUT_SECONDS", "15"))
 VERBOSE_LOGS = os.getenv("VERBOSE_LOGS", "false").lower() == "true"
 
 CHECKOUT_POLL_INTERVAL = float(os.getenv("CHECKOUT_POLL_INTERVAL", "0.02"))

@@ -120,7 +120,7 @@ The `/orders/checkout` route has a dedicated longer read timeout in every profil
 
 In `small`, Redis clients talk directly to the single configured primary host for each bounded context. In `medium` and `large`, Redis clients talk to Sentinel and resolve the current primary dynamically. That means a database promotion in the HA profiles no longer requires clients to reconnect to a hardcoded Redis host.
 
-The medium and large nginx configs use Docker DNS re-resolution (`resolve` with `127.0.0.11`) so upstream backends do not stay pinned to stale container IPs after restarts.
+The gateway still uses Docker DNS for its initial service-name lookups. In `medium`, the replicated application containers are pinned to stable IP addresses inside the Compose network so nginx does not stay stranded on dead backend addresses after the replicas are stopped and recreated during failure testing.
 
 ## Usage
 
