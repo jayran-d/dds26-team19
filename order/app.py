@@ -21,14 +21,14 @@ from streams_worker import (
 import checkout_notify
 from common.messages import SagaOrderStatus, TwoPhaseOrderStatus
 
-DB_ERROR_STR  = "DB error"
+DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
-CHECKOUT_WAIT_TIMEOUT_SECONDS = float(os.getenv("CHECKOUT_WAIT_TIMEOUT_SECONDS", "45"))
+CHECKOUT_WAIT_TIMEOUT_SECONDS = float(
+    os.getenv("CHECKOUT_WAIT_TIMEOUT_SECONDS", "15"))
 CHECKOUT_STATUS_POLL_INTERVAL_SECONDS = float(
-    os.getenv("CHECKOUT_STATUS_POLL_INTERVAL_SECONDS", "0.2")
-)
+    os.getenv("CHECKOUT_STATUS_POLL_INTERVAL_SECONDS", "0.2"))
 VERBOSE_LOGS = os.getenv("VERBOSE_LOGS", "false").lower() == "true"
 
 TRANSACTION_MODE = os.getenv("TRANSACTION_MODE", "saga")
@@ -89,9 +89,10 @@ def get_order_from_db(order_id: str) -> OrderValue | None:
         entry: bytes = db.get(order_id)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
+    entry: OrderValue | None = msgpack.decode(
+        entry, type=OrderValue) if entry else None
     if entry is None:
-        print( f"Order: {order_id} not found!\n", flush=True)
+        print(f"Order: {order_id} not found!\n", flush=True)
         abort(400, f"Order: {order_id} not found!")
     return entry
 
@@ -104,13 +105,16 @@ def get_order_status(order_id: str) -> str | None:
         return None
 
 
-def get_order_and_status(order_id: str) -> tuple[OrderValue | None, str | None]:
+def get_order_and_status(
+        order_id: str) -> tuple[OrderValue | None, str | None]:
     try:
         raw_order, raw_status = db.mget(order_id, f"order:{order_id}:status")
     except redis.exceptions.RedisError:
-        print(f"ERROR IN RETRIEVEING ORDER STATUS {DB_ERROR_STR}\n", flush=True)
+        print(f"ERROR IN RETRIEVEING ORDER STATUS {DB_ERROR_STR}\n",
+              flush=True)
         return abort(400, DB_ERROR_STR)
-    order_entry: OrderValue | None = msgpack.decode(raw_order, type=OrderValue) if raw_order else None
+    order_entry: OrderValue | None = msgpack.decode(
+        raw_order, type=OrderValue) if raw_order else None
     if order_entry is None:
         print(f"Order: {order_id} not found!\n", flush=True)
         abort(400, f"Order: {order_id} not found!")
@@ -126,7 +130,8 @@ async def get_order_status_async(order_id: str) -> str | None:
         return None
 
 
-async def get_order_and_status_async(order_id: str) -> tuple[OrderValue | None, str | None]:
+async def get_order_and_status_async(
+        order_id: str) -> tuple[OrderValue | None, str | None]:
     try:
         raw_order, raw_status = await asyncio.to_thread(
             db.mget,
@@ -136,12 +141,14 @@ async def get_order_and_status_async(order_id: str) -> tuple[OrderValue | None, 
     except redis.exceptions.RedisError:
         print(f"ERROR IN GET ORDER STATUS ASYNC {DB_ERROR_STR}\n", flush=True)
         return abort(400, DB_ERROR_STR)
-    order_entry: OrderValue | None = msgpack.decode(raw_order, type=OrderValue) if raw_order else None
+    order_entry: OrderValue | None = msgpack.decode(
+        raw_order, type=OrderValue) if raw_order else None
     if order_entry is None:
         print(f"Order: {order_id} not found!\n", flush=True)
         abort(400, f"Order: {order_id} not found!")
     status = raw_status.decode() if raw_status else None
     return order_entry, status
+
 
 async def _build_terminal_checkout_response(
     order_id: str,
@@ -195,7 +202,8 @@ async def _build_terminal_checkout_response(
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
     key = str(uuid.uuid4())
-    value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
+    value = msgpack.encode(
+        OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
     try:
         db.set(key, value)
     except redis.exceptions.RedisError:
@@ -205,13 +213,13 @@ def create_order(user_id: str):
 
 @app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
 def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
-    n          = int(n)
-    n_items    = int(n_items)
-    n_users    = int(n_users)
+    n = int(n)
+    n_items = int(n_items)
+    n_users = int(n_users)
     item_price = int(item_price)
 
     def generate_entry() -> OrderValue:
-        user_id  = random.randint(0, n_users - 1)
+        user_id = random.randint(0, n_users - 1)
         item1_id = random.randint(0, n_items - 1)
         item2_id = random.randint(0, n_items - 1)
         return OrderValue(
@@ -221,7 +229,10 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
             total_cost=2 * item_price,
         )
 
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry()) for i in range(n)}
+    kv_pairs: dict[str, bytes] = {
+        f"{i}": msgpack.encode(generate_entry())
+        for i in range(n)
+    }
     try:
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
@@ -233,13 +244,14 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
 def find_order(order_id: str):
     order_entry, status = get_order_and_status(order_id)
     return jsonify({
-        "order_id":   order_id,
+        "order_id": order_id,
         # The terminal order status is the canonical external signal that
         # checkout finished successfully. The stored order blob may still
         # contain paid=False because we no longer rewrite it on the hot path.
-        "paid":       order_entry.paid or status in {SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED},
-        "items":      order_entry.items,
-        "user_id":    order_entry.user_id,
+        "paid": order_entry.paid or status
+        in {SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED},
+        "items": order_entry.items,
+        "user_id": order_entry.user_id,
         "total_cost": order_entry.total_cost,
     })
 
@@ -251,7 +263,7 @@ def order_status(order_id: str):
     status = get_order_status(order_id)
     return jsonify({
         "order_id": order_id,
-        "status":   status or SagaOrderStatus.PENDING,
+        "status": status or SagaOrderStatus.PENDING,
     })
 
 
@@ -294,7 +306,9 @@ async def checkout(order_id: str):
     try:
         order_entry, status = await get_order_and_status_async(order_id)
 
-        if order_entry.paid or status in {SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED}:
+        if order_entry.paid or status in {
+                SagaOrderStatus.COMPLETED, TwoPhaseOrderStatus.COMPLETED
+        }:
             return Response(
                 "Order already completed",
                 status=200,
@@ -305,24 +319,38 @@ async def checkout(order_id: str):
             # Register BEFORE reading terminal state to avoid missing a fast
             # transition that happens between the status check and wait().
             if status in IN_PROGRESS_STATUSES:
-                return await _build_terminal_checkout_response(order_id, waiter)
+                return await _build_terminal_checkout_response(
+                    order_id, waiter)
 
             try:
-                result = await asyncio.to_thread(start_checkout, order_id, order_entry)
+                result = await asyncio.to_thread(start_checkout, order_id,
+                                                 order_entry)
             except Exception as exc:
                 print(f"[checkout] failed to start: {exc}", flush=True)
-                abort(400, str(exc))
+                return Response(
+                    "Checkout failed",
+                    status=400,
+                    headers={"Location": f"/orders/status/{order_id}"},
+                )
 
-            if isinstance(result, dict) and result.get("reason") == "already_in_progress":
-                return await _build_terminal_checkout_response(order_id, waiter)
+            if isinstance(
+                    result,
+                    dict) and result.get("reason") == "already_in_progress":
+                return await _build_terminal_checkout_response(
+                    order_id, waiter)
 
             if isinstance(result, dict) and result.get("reason") == "error":
                 print(f"[checkout] failed to start", flush=True)
-                abort(400, "Failed to start checkout")
+                return Response(
+                    "Checkout failed",
+                    status=400,
+                    headers={"Location": f"/orders/status/{order_id}"},
+                )
 
             return await _build_terminal_checkout_response(order_id, waiter)
     finally:
         checkout_notify.unregister_async(order_id, waiter)
+
 
 # ── Startup ────────────────────────────────────────────────────────────────────
 
@@ -334,5 +362,6 @@ else:
     server_logger = logging.getLogger("hypercorn.error")
     if server_logger.handlers:
         app.logger.handlers = server_logger.handlers
-        app.logger.setLevel(logging.DEBUG if VERBOSE_LOGS else server_logger.level)
+        app.logger.setLevel(
+            logging.DEBUG if VERBOSE_LOGS else server_logger.level)
     init_streams(app.logger, db)
