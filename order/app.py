@@ -11,7 +11,7 @@ from msgspec import Struct, msgpack
 from quart import Quart, Response, abort, jsonify
 
 from common.messages import SagaOrderStatus, TwoPhaseOrderStatus
-
+#nothing
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
