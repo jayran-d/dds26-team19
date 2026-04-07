@@ -28,14 +28,19 @@ x-order-service-base: &order-service-base
   restart: unless-stopped
   environment:
     - GATEWAY_URL=http://gateway:80
+    - REDIS_SENTINELS=
     - STOCK_REDIS_HOST=stock-db
     - STOCK_REDIS_PORT=6379
     - STOCK_REDIS_PASSWORD=redis
     - STOCK_REDIS_DB=0
+    - STOCK_REDIS_SENTINELS=
+    - STOCK_REDIS_MASTER_NAME=stock-db
     - PAYMENT_REDIS_HOST=payment-db
     - PAYMENT_REDIS_PORT=6379
     - PAYMENT_REDIS_PASSWORD=redis
     - PAYMENT_REDIS_DB=0
+    - PAYMENT_REDIS_SENTINELS=
+    - PAYMENT_REDIS_MASTER_NAME=payment-db
     - CONSUMER_WORKERS=8
     - STREAM_BATCH_SIZE=32
     - TRANSACTION_MODE=${TRANSACTION_MODE:-saga}
@@ -43,9 +48,9 @@ x-order-service-base: &order-service-base
   command: >-
     sh -lc '
     if [ "$$VERBOSE_LOGS" = "true" ]; then
-      exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --log-level debug --access-logfile - app:app;
+      exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --keep-alive 75 --log-level debug --access-logfile - app:app;
     else
-      exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --log-level info app:app;
+      exec hypercorn -b 0.0.0.0:5000 -w 1 --backlog 4096 --graceful-timeout 30 --keep-alive 75 --log-level info app:app;
     fi'
   env_file:
     - ../../env/order_redis.env
@@ -63,6 +68,7 @@ x-stock-service-base: &stock-service-base
   image: stock:latest
   restart: unless-stopped
   environment:
+    - REDIS_SENTINELS=
     - CONSUMER_WORKERS=8
     - STREAM_BATCH_SIZE=32
     - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
@@ -86,6 +92,7 @@ x-payment-service-base: &payment-service-base
   image: payment:latest
   restart: unless-stopped
   environment:
+    - REDIS_SENTINELS=
     - CONSUMER_WORKERS=8
     - STREAM_BATCH_SIZE=32
     - VERBOSE_LOGS=${VERBOSE_LOGS:-false}
@@ -105,9 +112,13 @@ x-payment-service-base: &payment-service-base
     payment-db:
       condition: service_healthy
 
-x-redis-base: &redis-base
+x-redis-server-base: &redis-server-base
   image: redis:7.2-bookworm
   restart: unless-stopped
+  healthcheck: *redis-healthcheck
+
+x-redis-primary-base: &redis-primary-base
+  <<: *redis-server-base
   command: >-
     redis-server --requirepass redis --maxmemory 512mb
     --appendonly yes --appendfsync everysec
@@ -115,7 +126,6 @@ x-redis-base: &redis-base
     --auto-aof-rewrite-min-size 256mb
     --auto-aof-rewrite-percentage 200
     --dir /data
-  healthcheck: *redis-healthcheck
 
 services:
   gateway:
@@ -141,7 +151,7 @@ services:
       dockerfile: order/Dockerfile
 
   order-db:
-    <<: *redis-base
+    <<: *redis-primary-base
     volumes:
       - order-db-data:/data
 
@@ -152,7 +162,7 @@ services:
       dockerfile: stock/Dockerfile
 
   stock-db:
-    <<: *redis-base
+    <<: *redis-primary-base
     volumes:
       - stock-db-data:/data
 
@@ -163,7 +173,7 @@ services:
       dockerfile: payment/Dockerfile
 
   payment-db:
-    <<: *redis-base
+    <<: *redis-primary-base
     volumes:
       - payment-db-data:/data
 

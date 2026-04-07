@@ -23,6 +23,7 @@ import time
 
 import redis as redis_module
 
+from common.redis_client import create_redis_client
 from common.streams_client import StreamsClient
 from common.worker_logging import log_worker_exception
 from common.messages import (
@@ -58,27 +59,19 @@ _logger = None
 
 
 def _make_stock_db() -> redis_module.Redis:
-    return redis_module.Redis(
-        host=os.environ['STOCK_REDIS_HOST'],
-        port=int(os.environ.get('STOCK_REDIS_PORT', 6379)),
-        password=os.environ['STOCK_REDIS_PASSWORD'],
-        db=int(os.environ.get('STOCK_REDIS_DB', 0)),
+    return create_redis_client(
+        "STOCK_REDIS",
         socket_connect_timeout=5,
         socket_timeout=5,
-        retry_on_timeout=True,
         health_check_interval=30,
     )
 
 
 def _make_payment_db() -> redis_module.Redis:
-    return redis_module.Redis(
-        host=os.environ['PAYMENT_REDIS_HOST'],
-        port=int(os.environ.get('PAYMENT_REDIS_PORT', 6379)),
-        password=os.environ['PAYMENT_REDIS_PASSWORD'],
-        db=int(os.environ.get('PAYMENT_REDIS_DB', 0)),
+    return create_redis_client(
+        "PAYMENT_REDIS",
         socket_connect_timeout=5,
         socket_timeout=5,
-        retry_on_timeout=True,
         health_check_interval=30,
     )
 

@@ -1,225 +1,169 @@
-# Distributed Data Systems Project Template
+# Distributed Data Systems Checkout System
 
-Basic project structure with Python's Flask and Redis. 
-**You are free to use any web framework in any language and any database you like for this project.**
+This repository contains the "normal" three-service version of the project:
+
+- `order` owns orders and coordinates checkout
+- `stock` owns inventory
+- `payment` owns user balances
+
+The client-facing API is synchronous, but the transaction processing path is event-driven. `order` publishes commands over Redis Streams, `stock` and `payment` reply with events, and the selected transaction coordinator inside `order` drives the workflow to a terminal state.
 
 ## Project docs
 
 - Codebase walkthrough: [docs/codebase_walkthrough.md](docs/codebase_walkthrough.md)
+- Architecture explanation: [docs/explanation_architecture.md](docs/explanation_architecture.md)
 - Compose scaling guide: [docs/compose_scaling.md](docs/compose_scaling.md)
 
-## Code Walkthrough Summary
+## What changed in this branch
 
-This system is intentionally split into three bounded services: `order` coordinates checkout, `stock` owns inventory state, and `payment` owns account balances. That separation keeps each service authoritative over its own data and forces cross-service consistency to go through an explicit transaction protocol instead of hidden shared-state updates.
+The branch now supports two Redis deployment modes:
 
-The main design decision is that checkout is synchronous for the client, but asynchronous inside the system. The order service accepts the HTTP request, publishes commands over Redis Streams, and waits for terminal events from stock and payment before returning. `checkout_notify` is the small but important bridge that makes this work cleanly: background stream workers can finish a transaction and safely wake the waiting HTTP handler, so the client still sees one coherent request/response flow.
+- the `small` profile keeps one Redis primary per bounded context
+- the default, `medium`, and `large` layouts use Redis primaries plus replicas and a shared Sentinel quorum
+- service code connects through `common/redis_client.py`, which supports both direct-host and Sentinel-aware modes
 
-Throughput is optimized in a few concrete ways that matter in the code. Each service runs multiple HTTP workers, and each service also starts multiple Redis Streams consumer threads (`CONSUMER_WORKERS`) so command and event handling can proceed in parallel instead of serially. Workers consume in batches (`STREAM_BATCH_SIZE`), the medium and large compose profiles replicate each service aggressively, and Nginx fans requests across those replicas. In the order service, stock events and payment events are processed by separate worker pools, which prevents one side of the checkout pipeline from becoming the only bottleneck.
+That means the low-scale profile stays compliant with the single-instance requirement, while the larger profiles can still demonstrate Redis failover behavior.
 
-The reliability story is what makes the solution correct rather than just fast. Redis Streams consumer groups give us durable message delivery, and the stock and payment services each keep a participant `ledger` in Redis keyed by transaction and action. That ledger records whether a command was only received, already applied, or already replied to, which makes duplicate delivery safe and lets a service re-publish the correct event after a crash without reapplying the business effect. We also run dedicated orphan-recovery threads that periodically claim messages left pending by dead or stalled consumers, so work does not get stranded in the stream after a crash. On the coordinator side, the order service persists transaction progress for Saga and 2PC recovery, while timeout workers detect stalled transactions and move them toward compensation or cleanup. At the Redis layer, fault tolerance is improved by giving each bounded context its own Redis instance, persisting data on Docker volumes with AOF enabled, restarting containers automatically with health checks, and using client-side connection timeouts plus `retry_on_timeout` so transient Redis hiccups are more likely to be absorbed than surfaced as immediate failures. Together, these pieces make the system robust under retries, partial failures, and horizontal scaling, not just under the happy path.
+## Runtime architecture
 
-### Project structure
+### Business services
 
-* `env`
-    Folder containing the Redis env variables for the docker-compose deployment
-    
-* `helm-config` 
-   Helm chart values for Redis and ingress-nginx
-        
-* `k8s`
-    Folder containing the kubernetes deployments, apps and services for the ingress, order, payment and stock services.
-    
-* `order`
-    Folder containing the order application logic and dockerfile. 
-    
-* `payment`
-    Folder containing the payment application logic and dockerfile. 
+- `order/app.py` exposes the order API and synchronous checkout endpoint
+- `order/streams_worker.py` runs the Saga or 2PC coordinator over Redis Streams
+- `stock/app.py` and `payment/app.py` expose their local business APIs
+- `stock/streams_worker.py` and `payment/streams_worker.py` act as transaction participants
 
-* `stock`
-    Folder containing the stock application logic and dockerfile. 
+### Redis topology
 
-* `test`
-    Folder containing some basic correctness tests for the entire system. (Feel free to enhance them)
+Each bounded context still has its own Redis store:
 
-### Deployment types:
+- `small`: `order-db`, `stock-db`, `payment-db`
+- default / `medium` / `large`: `order-db` + `order-db-replica`, `stock-db` + `stock-db-replica`, `payment-db` + `payment-db-replica`
 
-#### docker-compose (local development)
+The HA layouts share:
 
-After coding the REST endpoint logic run `docker-compose up --build` in the base folder to test if your logic is correct
-(you can use the provided tests in the `\test` folder and change them as you wish). 
+- `redis-sentinel-1`
+- `redis-sentinel-2`
+- `redis-sentinel-3`
 
-***Requirements:*** You need to have docker and docker-compose installed on your machine. 
- 
-K8s is also possible, but we do not require it as part of your submission. 
+Application containers use environment variables such as `REDIS_HOST`, `REDIS_SENTINELS`, and `REDIS_MASTER_NAME` so the same code can either connect directly in `small` or resolve the current primary in the HA layouts.
 
-#### minikube (local k8s cluster)
+### Transaction modes
 
-This setup is for local k8s testing to see if your k8s config works before deploying to the cloud. 
-First deploy your database using helm by running the `deploy-charts-minicube.sh` file (in this example the DB is Redis 
-but you can find any database you want in https://artifacthub.io/ and adapt the script). Then adapt the k8s configuration files in the
-`\k8s` folder to mach your system and then run `kubectl apply -f .` in the k8s folder. 
+The repository supports two transaction modes:
 
-***Requirements:*** You need to have minikube (with ingress enabled) and helm installed on your machine.
+- `saga`
+- `2pc`
 
-#### kubernetes cluster (managed k8s cluster in the cloud)
+The active mode is controlled by `TRANSACTION_MODE`, and the same deployment topology supports both modes.
 
-Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in the helm step to also install an ingress to the cluster. 
+## Local development
 
-***Requirements:*** You need to have access to kubectl of a k8s cluster.
+### Default stack
 
-## Container operations (docker compose)
+The baseline stack is defined in `docker/compose/docker-compose.yml`.
 
-Use these commands from the repo root.
+Start it with:
 
-### 1) Profiles and compose files
+```bash
+TRANSACTION_MODE=saga docker compose -f docker/compose/docker-compose.yml up -d --build --force-recreate
+```
 
-- small: project `dds-small`, file `docker/compose/docker-compose.small.yml`
-- medium: project `dds-medium`, file `docker/compose/docker-compose.medium.yml`
-- large: project `dds-large`, file `docker/compose/docker-compose.large.yml`
+Stop it with:
 
-### 2) Quick status/log commands (all profiles)
+```bash
+docker compose -f docker/compose/docker-compose.yml down -v --remove-orphans
+```
+
+### Sized profiles
+
+Use the provided make targets for the small, medium, and large profiles:
+
+```bash
+make small-up-saga
+make small-up-2pc
+
+make medium-up-saga
+make medium-up-2pc
+
+make large-up-saga
+make large-up-2pc
+```
+
+The small profile now keeps one `order-service`, one `stock-service`, one `payment-service`, and one Redis container per bounded context.
+
+Inspect them with:
 
 ```bash
 make small-ps
-make medium-ps
-make large-ps
-
-make small-logs
 make medium-logs
-make large-logs
+make large-down
 ```
 
-### 3) Shell into containers (all profiles)
+## Testing
 
-Small profile:
+The main local verification targets are:
+
+```bash
+make unit-saga
+make unit-2pc
+```
+
+Those commands rebuild the small profile, start the single-instance Redis topology, and run the integration suites against it.
+
+Useful direct smoke tests:
+
+```bash
+python3 -m unittest test.test_microservices -v
+python3 -m unittest test.test_kafka_saga -v
+python3 -m unittest test.test_kafka_saga_databases -v
+python3 -m unittest test.test_2pc -v
+```
+
+## Operational notes
+
+### Gateway
+
+Nginx is the public entry point and listens on `localhost:8000`. Profile-specific gateway configs live in:
+
+- `nginx/gateway_nginx.conf`
+- `nginx/gateway_nginx.small.conf`
+- `nginx/gateway_nginx.medium.conf`
+- `nginx/gateway_nginx.large.conf`
+
+### Shell access
+
+Examples for the small profile:
 
 ```bash
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-service sh
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec payment-service sh
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec stock-service sh
 docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-db sh
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec payment-db sh
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec stock-db sh
 ```
 
-Medium profile:
-
-```bash
-docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec order-service sh
-docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec payment-service sh
-docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec stock-service sh
-docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec order-db sh
-docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec payment-db sh
-docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec stock-db sh
-```
-
-Large profile:
-
-```bash
-docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec order-service sh
-docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec payment-service sh
-docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec stock-service sh
-docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec order-db sh
-docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec payment-db sh
-docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec stock-db sh
-```
-
-### 4) Kill from inside the container (all profiles)
-
-After shelling into any target container, run:
+### Graceful stop from inside a container
 
 ```bash
 kill -TERM 1
 ```
 
-This sends a graceful termination signal to the container's PID 1 process.
-
-### 5) Non-interactive kill from host (all possible service/db targets)
-
-Small profile:
+### Host-side restart examples
 
 ```bash
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-service sh -lc 'kill -TERM 1'
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec payment-service sh -lc 'kill -TERM 1'
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec stock-service sh -lc 'kill -TERM 1'
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec order-db sh -lc 'kill -TERM 1'
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec payment-db sh -lc 'kill -TERM 1'
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml exec stock-db sh -lc 'kill -TERM 1'
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml restart order-service
+docker compose -p dds-small -f docker/compose/docker-compose.small.yml restart order-db
 ```
 
-Medium profile:
+## Repository layout
 
-```bash
-docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec order-service sh -lc 'kill -TERM 1'
-docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec payment-service sh -lc 'kill -TERM 1'
-docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec stock-service sh -lc 'kill -TERM 1'
-docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec order-db sh -lc 'kill -TERM 1'
-docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec payment-db sh -lc 'kill -TERM 1'
-docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml exec stock-db sh -lc 'kill -TERM 1'
-```
+- `common/`: shared stream, message, worker-logging, and Redis client code for both direct and Sentinel-aware modes
+- `docker/compose/`: baseline, small, medium, and large Compose stacks
+- `env/`: Redis and transaction-mode environment settings
+- `nginx/`: gateway configs per deployment profile
+- `order/`: API, coordinator, and transaction implementations
+- `payment/`: payment API and participant logic
+- `stock/`: inventory API and participant logic
+- `test/`: local integration and recovery test suites
 
-Large profile:
+## Kubernetes
 
-```bash
-docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec order-service sh -lc 'kill -TERM 1'
-docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec payment-service sh -lc 'kill -TERM 1'
-docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec stock-service sh -lc 'kill -TERM 1'
-docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec order-db sh -lc 'kill -TERM 1'
-docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec payment-db sh -lc 'kill -TERM 1'
-docker compose -p dds-large -f docker/compose/docker-compose.large.yml exec stock-db sh -lc 'kill -TERM 1'
-```
-
-### 6) Host-side stop/kill/restart per container (all profiles)
-
-Small profile:
-
-```bash
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml stop order-service payment-service stock-service order-db payment-db stock-db
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml kill order-service payment-service stock-service order-db payment-db stock-db
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml restart order-service payment-service stock-service order-db payment-db stock-db
-```
-
-Medium profile:
-
-```bash
-docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml stop order-service payment-service stock-service order-db payment-db stock-db
-docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml kill order-service payment-service stock-service order-db payment-db stock-db
-docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml restart order-service payment-service stock-service order-db payment-db stock-db
-```
-
-Large profile:
-
-```bash
-docker compose -p dds-large -f docker/compose/docker-compose.large.yml stop order-service payment-service stock-service order-db payment-db stock-db
-docker compose -p dds-large -f docker/compose/docker-compose.large.yml kill order-service payment-service stock-service order-db payment-db stock-db
-docker compose -p dds-large -f docker/compose/docker-compose.large.yml restart order-service payment-service stock-service order-db payment-db stock-db
-```
-
-### 7) Other general operations
-
-Start or rebuild a profile:
-
-```bash
-make small-up-saga
-make small-up-2pc
-make medium-up-saga
-make medium-up-2pc
-make large-up-saga
-make large-up-2pc
-```
-
-Tear down a profile completely (including volumes):
-
-```bash
-make small-down
-make medium-down
-make large-down
-```
-
-Tail logs for one specific container:
-
-```bash
-docker compose -p dds-small -f docker/compose/docker-compose.small.yml logs -f order-service
-docker compose -p dds-medium -f docker/compose/docker-compose.medium.yml logs -f payment-db
-docker compose -p dds-large -f docker/compose/docker-compose.large.yml logs -f stock-service
-```
+The repository still contains `helm-config/` and `k8s/` assets for cluster deployment experiments, but the actively maintained local development and testing path in this branch is Docker Compose.
