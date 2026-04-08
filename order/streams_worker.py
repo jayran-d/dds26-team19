@@ -20,6 +20,7 @@ Architecture:
 import os
 import threading
 import time
+import uuid
 
 import redis as redis_module
 
@@ -46,8 +47,19 @@ STREAM_BATCH_SIZE = int(os.getenv("STREAM_BATCH_SIZE", "32"))
 TIMEOUT_SCAN_INTERVAL = 5
 ORPHAN_CLAIM_INTERVAL = 30
 ORPHAN_MIN_IDLE_MS = 30_000
+CONTROL_LEASE_KEY = f"order:streams:{TRANSACTION_MODE}:timeout-leader"
+CONTROL_LEASE_TTL_SECONDS = int(os.getenv("ORDER_CONTROL_LEASE_TTL_SECONDS", "15"))
+RECOVERY_LOCK_KEY = f"order:streams:{TRANSACTION_MODE}:startup-recovery"
+RECOVERY_LOCK_TTL_SECONDS = int(os.getenv("ORDER_RECOVERY_LOCK_TTL_SECONDS", "60"))
 
 ORDER_GROUP = "order-service"
+
+_REFRESH_LEASE_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+end
+return 0
+"""
 
 _order_db: redis_module.Redis | None = None
 _stock_db: redis_module.Redis | None = None
@@ -56,6 +68,8 @@ _stock_sc: StreamsClient | None = None
 _payment_sc: StreamsClient | None = None
 _available = False
 _logger = None
+_control_owner_id: str | None = None
+_refresh_lease_script = None
 
 
 def _make_stock_db() -> redis_module.Redis:
@@ -178,17 +192,73 @@ def _orphan_recovery_worker(
 
 def _timeout_loop(publish_fn) -> None:
     while _available and TRANSACTION_MODE == "saga":
-        try:
-            saga_check_timeouts(_order_db, publish_fn, _logger)
-        except Exception as exc:
-            log_worker_exception(_logger, "OrderStreams", "timeout loop", exc)
+        if _hold_control_lease():
+            try:
+                saga_check_timeouts(_order_db, publish_fn, _logger)
+            except Exception as exc:
+                log_worker_exception(_logger, "OrderStreams", "timeout loop", exc)
         time.sleep(TIMEOUT_SCAN_INTERVAL)
+
+
+def _get_control_owner_id() -> str:
+    global _control_owner_id
+    if _control_owner_id is None:
+        _control_owner_id = f"{os.getpid()}:{uuid.uuid4()}"
+    return _control_owner_id
+
+
+def _get_refresh_lease_script(db: redis_module.Redis):
+    global _refresh_lease_script
+    if _refresh_lease_script is None:
+        _refresh_lease_script = db.register_script(_REFRESH_LEASE_LUA)
+    return _refresh_lease_script
+
+
+def _hold_control_lease() -> bool:
+    if _order_db is None:
+        return False
+
+    owner_id = _get_control_owner_id()
+
+    try:
+        if _order_db.set(CONTROL_LEASE_KEY, owner_id, nx=True, ex=CONTROL_LEASE_TTL_SECONDS):
+            return True
+        script = _get_refresh_lease_script(_order_db)
+        result = script(
+            keys=[CONTROL_LEASE_KEY],
+            args=[owner_id, CONTROL_LEASE_TTL_SECONDS],
+            client=_order_db,
+        )
+        return bool(result)
+    except Exception as exc:
+        log_worker_exception(_logger, "OrderStreams", "timeout lease", exc)
+        return False
+
+
+def _run_startup_recovery_once(label: str, recover_fn) -> None:
+    if _order_db is None:
+        return
+
+    owner_id = _get_control_owner_id()
+
+    try:
+        claimed = _order_db.set(RECOVERY_LOCK_KEY, owner_id, nx=True, ex=RECOVERY_LOCK_TTL_SECONDS)
+    except Exception as exc:
+        log_worker_exception(_logger, "OrderStreams", f"{label} lock", exc)
+        return
+
+    if not claimed:
+        _logger.debug(f"[OrderStreams] {label} already claimed by another worker; skipping duplicate replay")
+        return
+
+    recover_fn()
 
 
 def init_streams(logger, order_db: redis_module.Redis) -> None:
     """
     Initialise Redis Streams consumers and start background worker threads.
-    Called once at gunicorn startup.
+    Called in each HTTP worker on startup. Control-plane replay and timeout
+    scanning are leased through Redis so they only run once cluster-wide.
     """
     global _order_db, _stock_db, _payment_db, _stock_sc, _payment_sc, _available, _logger
 
@@ -218,12 +288,15 @@ def init_streams(logger, order_db: redis_module.Redis) -> None:
             payment_sc.publish(stream, message)
 
     if TRANSACTION_MODE == "saga":
-        saga_recover(_order_db, publish_fn, logger)
+        _run_startup_recovery_once(
+            "Saga startup recovery",
+            lambda: saga_recover(_order_db, publish_fn, logger),
+        )
         threading.Thread(target=_timeout_loop, args=(publish_fn,), daemon=True).start()
     elif TRANSACTION_MODE == "2pc":
         from transactions_modes.two_pc import init_2pc, recover_incomplete_2pc
         init_2pc(_order_db, publish_fn, logger)
-        recover_incomplete_2pc()
+        _run_startup_recovery_once("2PC startup recovery", recover_incomplete_2pc)
 
     # Start stock.events consumer workers (share stock_sc; pool is thread-safe)
     for i in range(CONSUMER_WORKERS):

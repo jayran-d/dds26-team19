@@ -338,7 +338,10 @@ def _service_exists(service: str) -> bool:
 
 
 def _kill_service(service: str) -> None:
-    _compose("kill", service)
+    # Compose services use restart=unless-stopped, so `kill` immediately
+    # restarts the container. `stop -t 0` gives us the same abrupt stop while
+    # keeping the container down until the test explicitly starts it again.
+    _compose("stop", "-t", "0", service)
     time.sleep(1)
 
 
